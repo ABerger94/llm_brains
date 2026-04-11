@@ -1,0 +1,22 @@
+import { localStorageService } from '../services/localStorage';
+
+export const BeliefStore = localStorageService.entities.BeliefStore;
+export const PipelineRun = localStorageService.entities.PipelineRun;
+export const MindBiography = localStorageService.entities.MindBiography;
+export const WorldModel = localStorageService.entities.WorldModel;
+export const CuriosityItem = localStorageService.entities.CuriosityItem;
+export const GoalItem = localStorageService.entities.GoalItem;
+export const TemporalEvent = localStorageService.entities.TemporalEvent;
+export const FeedbackItem = localStorageService.entities.FeedbackItem;
+export const TrainingRun = localStorageService.entities.TrainingRun;
+export const DreamRun = localStorageService.entities.DreamRun;
+export const EmergenceEvent = localStorageService.entities.EmergenceEvent;
+export const LongTermMemory = localStorageService.entities.LongTermMemory;
+export const Dataset = localStorageService.entities.Dataset;
+export const ScheduledTask = localStorageService.entities.ScheduledTask;
+export const ConversationMessage = localStorageService.entities.ConversationMessage;
+export const SelfLedgerRevision = localStorageService.entities.SelfLedgerRevision;
+export const BeliefTension = localStorageService.entities.BeliefTension;
+export const UserModelSnapshot = localStorageService.entities.UserModelSnapshot;
+export const ConsolidationDigest = localStorageService.entities.ConsolidationDigest;
+export const ExecutionLog = localStorageService.entities.ExecutionLog;

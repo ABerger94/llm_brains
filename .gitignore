@@ -1,0 +1,8 @@
+node_modules
+dist
+.data
+.dev-backend-port
+.dev-backend-port.hf
+.env
+.env.local
+*.log

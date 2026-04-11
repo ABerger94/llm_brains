@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * Theme: neutral / white accent on cool blue‑indigo surfaces.
+ */
+@layer base {
+  :root {
+    --background: 232 28% 6%;
+    --foreground: 210 40% 98%;
+    --card: 232 24% 9%;
+    --card-foreground: 210 40% 98%;
+    --popover: 232 26% 10%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 210 40% 98%;
+    --primary-foreground: 232 28% 8%;
+    --secondary: 232 22% 16%;
+    --secondary-foreground: 210 35% 96%;
+    --muted: 232 18% 14%;
+    --muted-foreground: 220 14% 58%;
+    --accent: 232 20% 16%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 232 16% 19%;
+    --input: 232 16% 19%;
+    --ring: 220 14% 72%;
+    --radius: 0.75rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background font-sans text-foreground;
+    margin: 0;
+    min-height: 100vh;
+    min-height: 100dvh;
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+
+  #root {
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: hsl(232 28% 8%);
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(232 22% 26%);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(232 18% 34%);
+}

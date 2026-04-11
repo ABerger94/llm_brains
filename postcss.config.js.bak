@@ -1,0 +1,7 @@
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};</content>
+<parameter name="filePath">f:\Alek\YourBrain\postcss.config.js
