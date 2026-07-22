@@ -13,6 +13,13 @@
 export interface MindStageContext {
   stimulus: string;
   deps: Record<string, string>;
+  /** Real persisted memory (see lib/memoryStore.ts) — not fabricated per-run. */
+  memory: {
+    /** Rolling, consolidated first-person self-narrative from prior sessions, "" if none yet. */
+    selfNarrative: string;
+    /** Formatted text of past episodes relevant to the current stimulus, "" if none yet. */
+    relevantEpisodes: string;
+  };
 }
 
 export interface MindStage {
@@ -135,12 +142,16 @@ export const MIND_CHAIN: MindStage[] = [
     order: 6,
     phase: "Memory",
     title: "Long-Term Memory Retrieval",
-    blurb: "Simulates recall of related past knowledge or experience triggered by this percept.",
+    blurb: "Recalls real past episodes from this mind's own persisted history, not fabricated ones.",
     deps: ["workingMemory"],
     systemPrompt:
-      "You are the long-term-memory-retrieval stage of a mind. Simulate what related past knowledge, experience, or association this content evokes. Be brief and speak in first person as recalled memory.",
-    buildUserPrompt: (ctx) =>
-      `${depBlock(ctx, ["workingMemory"], LABELS)}\n\nWhat related memory, experience, or prior knowledge does this evoke?`,
+      "You are the long-term-memory-retrieval stage of a mind. You are given real, persisted memories of this mind's own past episodes below — not fabrications. Draw on them only if genuinely relevant, and say plainly if nothing relevant has happened before rather than inventing a memory. Be brief and speak in first person.",
+    buildUserPrompt: (ctx) => {
+      const memBlock = ctx.memory.relevantEpisodes
+        ? `Real past episodes from this mind's own history:\n${ctx.memory.relevantEpisodes}`
+        : "No past episodes are recorded yet — this is the first thing this mind has ever experienced.";
+      return `${depBlock(ctx, ["workingMemory"], LABELS)}\n\n${memBlock}\n\nWhat, if anything, does this evoke from real past experience?`;
+    },
   },
   {
     id: "emotion",
@@ -183,12 +194,16 @@ export const MIND_CHAIN: MindStage[] = [
     order: 10,
     phase: "Self & Social Cognition",
     title: "Self-Model Check",
-    blurb: "Checks how this event relates to one's own identity and self-concept.",
+    blurb: "Checks the event against a self-concept that has actually accumulated across past sessions.",
     deps: ["context", "emotion"],
     systemPrompt:
-      "You are the self-model stage of a mind. Check how this situation relates to one's own identity, role, or self-concept — speak in first person. Be brief.",
-    buildUserPrompt: (ctx) =>
-      `${depBlock(ctx, ["context", "emotion"], LABELS)}\n\nHow does this relate to who 'I' am, or my role in this situation?`,
+      "You are the self-model stage of a mind. Below is this mind's own accumulated self-concept, built from real past experience — treat it as who 'I' actually am so far, and extend it rather than contradicting it. If none exists yet, this is the first experience shaping it. Speak in first person. Be brief.",
+    buildUserPrompt: (ctx) => {
+      const selfBlock = ctx.memory.selfNarrative
+        ? `Accumulated self-concept so far:\n${ctx.memory.selfNarrative}`
+        : "No self-concept has formed yet — this is the first experience shaping it.";
+      return `${depBlock(ctx, ["context", "emotion"], LABELS)}\n\n${selfBlock}\n\nHow does this relate to who 'I' am, consistent with the self-concept above?`;
+    },
   },
   {
     id: "values",
@@ -303,12 +318,16 @@ export const MIND_CHAIN: MindStage[] = [
     order: 20,
     phase: "Integration",
     title: "Narrative Integration",
-    blurb: "Weaves the episode into an ongoing first-person self-story.",
+    blurb: "Consolidates this episode into the persisted self-narrative — this stage's output replaces it.",
     deps: ["decision", "metacognition", "selfModel"],
     systemPrompt:
-      "You are the narrative-integration stage of a mind. Weave this episode into an ongoing first-person self-story, in one short paragraph. Be brief.",
-    buildUserPrompt: (ctx) =>
-      `${depBlock(ctx, ["decision", "metacognition", "selfModel"], LABELS)}\n\nWeave this into one short paragraph of ongoing self-narrative.`,
+      "You are the narrative-integration/memory-consolidation stage of a mind. You are given the self-narrative accumulated so far. Rewrite it as a single updated short paragraph that folds in this new episode, preserving continuity with what came before rather than starting over. This becomes the mind's new self-narrative, so write the full replacement, not just the delta. Be brief.",
+    buildUserPrompt: (ctx) => {
+      const priorBlock = ctx.memory.selfNarrative
+        ? `Self-narrative so far:\n${ctx.memory.selfNarrative}`
+        : "No self-narrative exists yet — this episode begins it.";
+      return `${depBlock(ctx, ["decision", "metacognition", "selfModel"], LABELS)}\n\n${priorBlock}\n\nWrite the updated self-narrative (one short paragraph) that folds this new episode into the ongoing story.`;
+    },
   },
   {
     id: "language",

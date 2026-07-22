@@ -20,6 +20,21 @@ calls once the page loads.
   not the full transcript — so prompts stay short enough for a 1B-3B model's
   context window. `lib/useMindChain.ts` runs them in order, streaming tokens
   into the UI as each stage completes.
+- **Persistent memory**: `lib/memoryStore.ts` keeps this from being a
+  stateless one-shot chain. It's backed by `localStorage`, so it survives
+  reloads and persists across sessions in the same browser:
+  - Every completed run consolidates into a rolling first-person
+    **self-narrative** (stage 20, Narrative Integration, rewrites it in full
+    each time — consolidation, not concatenation) and appends a compact
+    **episode** (stimulus, emotion, decision, conscious output) to episodic
+    memory, capped at the most recent 40.
+  - The next run's **Long-Term Memory Retrieval** (stage 6) and **Self-Model
+    Check** (stage 10) are given this real history as context instead of
+    hallucinating a plausible-sounding memory from nothing — retrieval uses
+    simple keyword overlap between the new stimulus and past episodes,
+    falling back to the most recent ones if nothing matches.
+  - The `MemoryPanel` at the top of the page shows the current self-concept
+    and episode list, with a "Forget everything" control that clears it.
 - **UI**: `app/page.tsx` renders the 22 stages grouped into 7 phases
   (Perception → Memory → Affect & Salience → Self & Social Cognition →
   Imagination & Goals → Reasoning & Decision → Integration), plus a

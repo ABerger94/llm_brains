@@ -9,6 +9,7 @@ import { LoadProgress } from "@/components/LoadProgress";
 import { StimulusInput } from "@/components/StimulusInput";
 import { StageCard } from "@/components/StageCard";
 import { ConsciousOutput } from "@/components/ConsciousOutput";
+import { MemoryPanel } from "@/components/MemoryPanel";
 
 export default function Home() {
   const {
@@ -21,6 +22,9 @@ export default function Home() {
     error,
     run,
     stop,
+    episodes,
+    selfNarrative,
+    forgetEverything,
   } = useMindChain();
 
   const [webgpuOk, setWebgpuOk] = useState<boolean | null>(null);
@@ -44,9 +48,13 @@ export default function Home() {
         <p className="mt-1 text-sm text-neutral-400">
           A small language model, running entirely on your device, walks a stimulus through 22
           chained prompts modeling perception, memory, emotion, reasoning, and conscious
-          broadcast — no server, no API calls.
+          broadcast — no server, no API calls. Every run consolidates into a persisted
+          self-narrative and episodic memory, so this mind actually accumulates a past instead
+          of resetting each time.
         </p>
       </header>
+
+      <MemoryPanel selfNarrative={selfNarrative} episodes={episodes} onForget={forgetEverything} />
 
       {webgpuOk === false && (
         <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
