@@ -112,10 +112,15 @@ export function retrieveRelevantEpisodes(stimulus: string, limit = 3): string {
 
   scored.sort((a, b) => b.score - a.score || b.ep.timestamp - a.ep.timestamp);
   const relevant = scored.filter((s) => s.score > 0).slice(0, limit);
-  const chosen = relevant.length > 0 ? relevant.map((s) => s.ep) : episodes.slice(-limit).reverse();
+  // No genuine overlap: return nothing rather than forcing in unrelated past
+  // episodes just because *something* exists in storage — a small model
+  // will blend whatever it's given, and an unrelated memory ("committed to
+  // a plan with metrics and deadlines") bleeding into an unrelated new
+  // stimulus produces incoherent mashups, not continuity.
+  if (relevant.length === 0) return "";
 
-  return chosen
-    .map((ep) => {
+  return relevant
+    .map(({ ep }) => {
       const when = timeAgo(ep.timestamp);
       return `- (${when}) Faced "${ep.stimulus}" — felt ${ep.emotion || "unclear"} — decided: ${ep.decision}`;
     })

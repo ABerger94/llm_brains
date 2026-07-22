@@ -35,6 +35,8 @@ export interface MindStage {
   buildUserPrompt: (ctx: MindStageContext) => string;
   /** Overrides the default sampling temperature (0.8) for stages prone to rambling. */
   temperature?: number;
+  /** Overrides the default token budget (120) — small models ramble to fill whatever room they're given. */
+  maxTokens?: number;
 }
 
 /**
@@ -45,7 +47,7 @@ export interface MindStage {
  * inherit — and compound — those habits from earlier ones.
  */
 const STYLE_GUARD =
-  "Style rules: write plain prose only — no markdown, no **bold**, no bullet points or numbered lists, no headings. Never reference internal labels like 'Trajectory 1/2', stage names, or say things like 'as decided above' — state things directly, in the terms of the actual situation. Avoid generic self-help or therapy-speak ('acknowledging the complexities of my psyche', 'I will shift my perspective'); use plain, concrete, specific language a real person would actually think.";
+  "Style rules: write plain prose only — no markdown, no **bold**, no bullet points or numbered lists, no headings. Never reference internal labels like 'Trajectory 1/2', stage names, or say things like 'as decided above' — state things directly, in the terms of the actual situation. Avoid generic self-help or therapy-speak ('acknowledging the complexities of my psyche', 'I will shift my perspective'); use plain, concrete, specific language a real person would actually think. Write short, direct sentences — do not chain many ideas into one run-on sentence with repeated 'and'. Stick only to what is actually relevant here; do not pad with unrelated material to fill space.";
 
 /** Strips markdown artifacts a small model emits despite instructions (defense in depth). */
 export function sanitizeStageText(text: string): string {
@@ -221,12 +223,12 @@ const MIND_CHAIN_DEFS: MindStage[] = [
     blurb: "Checks the event against a self-concept that has actually accumulated across past sessions.",
     deps: ["context", "emotion"],
     systemPrompt:
-      "You are the self-model stage of a mind. Below is this mind's own accumulated self-concept, built from real past experience — treat it as who 'I' actually am so far, and extend it rather than contradicting it. If none exists yet, this is the first experience shaping it. Speak in first person. Be brief.",
+      "You are the self-model stage of a mind. Below is this mind's own accumulated self-concept, built from real past experience — treat it as who 'I' actually am so far. If the current situation genuinely connects to it, extend it; if it doesn't, don't force a connection — it's fine for this to just be a new facet rather than tying back to unrelated past material. If none exists yet, this is the first experience shaping it. Speak in first person. Be brief.",
     buildUserPrompt: (ctx) => {
       const selfBlock = ctx.memory.selfNarrative
         ? `Accumulated self-concept so far:\n${ctx.memory.selfNarrative}`
         : "No self-concept has formed yet — this is the first experience shaping it.";
-      return `${depBlock(ctx, ["context", "emotion"], LABELS)}\n\n${selfBlock}\n\nHow does this relate to who 'I' am, consistent with the self-concept above?`;
+      return `${depBlock(ctx, ["context", "emotion"], LABELS)}\n\n${selfBlock}\n\nHow does this relate to who 'I' am? Only tie it to the self-concept above if it genuinely connects.`;
     },
   },
   {
@@ -345,12 +347,12 @@ const MIND_CHAIN_DEFS: MindStage[] = [
     blurb: "Consolidates this episode into the persisted self-narrative — this stage's output replaces it.",
     deps: ["decision", "metacognition", "selfModel"],
     systemPrompt:
-      "You are the narrative-integration/memory-consolidation stage of a mind. You are given the self-narrative accumulated so far. Rewrite it as a single updated short paragraph that folds in this new episode, preserving continuity with what came before rather than starting over. This becomes the mind's new self-narrative, so write the full replacement, not just the delta. Be brief and concrete about what actually happened — don't drift into abstract musing about your own psyche.",
+      "You are the narrative-integration/memory-consolidation stage of a mind. You are given the self-narrative accumulated so far. Update it to include this new episode. If the new episode genuinely relates to what came before, blend them; if it's an unrelated new topic, it's fine to briefly note it as a separate, newer thread rather than forcing a false connection — don't invent links that aren't there. This becomes the mind's new self-narrative, so write the full replacement, not just the delta. Be brief and concrete about what actually happened — don't drift into abstract musing about your own psyche.",
     buildUserPrompt: (ctx) => {
       const priorBlock = ctx.memory.selfNarrative
         ? `Self-narrative so far:\n${ctx.memory.selfNarrative}`
         : "No self-narrative exists yet — this episode begins it.";
-      return `${depBlock(ctx, ["decision", "metacognition", "selfModel"], LABELS)}\n\n${priorBlock}\n\nWrite the updated self-narrative (one short paragraph) that folds this new episode into the ongoing story.`;
+      return `${depBlock(ctx, ["decision", "metacognition", "selfModel"], LABELS)}\n\n${priorBlock}\n\nWrite the updated self-narrative (one short paragraph) that folds this new episode into the ongoing story, without forcing a connection if there isn't one.`;
     },
     temperature: 0.6,
   },
@@ -382,9 +384,41 @@ const MIND_CHAIN_DEFS: MindStage[] = [
   },
 ];
 
+/**
+ * Small models ramble to fill whatever token budget they're given, so each
+ * stage gets a tight budget sized to how much it actually needs to say —
+ * short for single-fact stages, a bit more for the ones synthesizing several
+ * inputs (reasoning, narrative), tightest for the final inner-speech stage.
+ */
+const MAX_TOKENS_BY_STAGE: Record<string, number> = {
+  perception: 70,
+  attention: 70,
+  patternRecognition: 60,
+  percept: 70,
+  workingMemory: 90,
+  longTermMemory: 90,
+  emotion: 50,
+  salience: 60,
+  context: 80,
+  selfModel: 90,
+  values: 70,
+  theoryOfMind: 70,
+  imagination: 100,
+  goals: 70,
+  impulseCheck: 70,
+  reasoning: 130,
+  decision: 60,
+  planning: 90,
+  metacognition: 80,
+  narrative: 140,
+  language: 45,
+  consciousOutput: 80,
+};
+
 export const MIND_CHAIN: MindStage[] = MIND_CHAIN_DEFS.map((stage) => ({
   ...stage,
   systemPrompt: `${stage.systemPrompt} ${STYLE_GUARD}`,
+  maxTokens: stage.maxTokens ?? MAX_TOKENS_BY_STAGE[stage.id] ?? 90,
 }));
 
 export const STAGE_LABELS = LABELS;

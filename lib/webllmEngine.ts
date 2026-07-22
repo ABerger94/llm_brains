@@ -95,7 +95,7 @@ export async function runStage(
       { role: "user", content: userPrompt },
     ],
     temperature: options.temperature ?? 0.8,
-    max_tokens: options.maxTokens ?? 220,
+    max_tokens: options.maxTokens ?? 120,
     stream: true,
   });
 

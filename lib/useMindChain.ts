@@ -105,6 +105,7 @@ export function useMindChain() {
         const rawText = await runStage(engineRef.current, stage.systemPrompt, userPrompt, {
           signal,
           temperature: stage.temperature,
+          maxTokens: stage.maxTokens,
           onToken: (partial) => {
             const clean = sanitizeStageText(partial);
             setStages((prev) =>
