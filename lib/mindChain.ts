@@ -33,6 +33,30 @@ export interface MindStage {
   deps: string[];
   systemPrompt: string;
   buildUserPrompt: (ctx: MindStageContext) => string;
+  /** Overrides the default sampling temperature (0.8) for stages prone to rambling. */
+  temperature?: number;
+}
+
+/**
+ * Small instruct models reliably drift into markdown (bold, numbered lists),
+ * meta-references to their own process ("Trajectory 2", "as the decision
+ * stage stated"), and generic self-help phrasing ("I acknowledge the
+ * complexities of my psyche"). Appended to every stage so later stages don't
+ * inherit — and compound — those habits from earlier ones.
+ */
+const STYLE_GUARD =
+  "Style rules: write plain prose only — no markdown, no **bold**, no bullet points or numbered lists, no headings. Never reference internal labels like 'Trajectory 1/2', stage names, or say things like 'as decided above' — state things directly, in the terms of the actual situation. Avoid generic self-help or therapy-speak ('acknowledging the complexities of my psyche', 'I will shift my perspective'); use plain, concrete, specific language a real person would actually think.";
+
+/** Strips markdown artifacts a small model emits despite instructions (defense in depth). */
+export function sanitizeStageText(text: string): string {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/(?<!\*)\*([^*\n]+?)\*(?!\*)/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/`{1,3}([^`]*?)`{1,3}/g, "$1")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .trim();
 }
 
 function depBlock(ctx: MindStageContext, deps: string[], labels: Record<string, string>): string {
@@ -76,7 +100,7 @@ export const PHASES = [
   "Integration",
 ] as const;
 
-export const MIND_CHAIN: MindStage[] = [
+const MIND_CHAIN_DEFS: MindStage[] = [
   {
     id: "perception",
     order: 1,
@@ -133,9 +157,9 @@ export const MIND_CHAIN: MindStage[] = [
     blurb: "Holds the key facts of the percept active for ongoing processing.",
     deps: ["percept"],
     systemPrompt:
-      "You are the working-memory stage of a mind. Hold the key facts of the current percept active, as a short bullet list, for use by later processing. Be brief.",
+      "You are the working-memory stage of a mind. Hold the key facts of the current percept active, as short terse phrases separated by periods (not bulleted or numbered), for use by later processing. Be brief.",
     buildUserPrompt: (ctx) =>
-      `${depBlock(ctx, ["percept"], LABELS)}\n\nList the key facts to keep active in working memory (3-5 bullets, terse).`,
+      `${depBlock(ctx, ["percept"], LABELS)}\n\nState the 3-5 key facts to keep active in working memory, as short terse phrases separated by periods.`,
   },
   {
     id: "longTermMemory",
@@ -237,9 +261,9 @@ export const MIND_CHAIN: MindStage[] = [
     blurb: "Runs a few forward simulations of how this could unfold (episodic future thinking).",
     deps: ["context", "theoryOfMind", "values"],
     systemPrompt:
-      "You are the imagination stage of a mind. Simulate 2-3 plausible ways this situation could unfold from here. Be brief, one line per possibility.",
+      "You are the imagination stage of a mind. Simulate 2-3 plausible ways this situation could unfold from here, as plain sentences — do not number or label them (no 'Trajectory 1', 'Option A', etc). Be brief, one line per possibility.",
     buildUserPrompt: (ctx) =>
-      `${depBlock(ctx, ["context", "theoryOfMind", "values"], LABELS)}\n\nSketch 2-3 plausible ways this could unfold next.`,
+      `${depBlock(ctx, ["context", "theoryOfMind", "values"], LABELS)}\n\nDescribe 2-3 plausible ways this could unfold next, as plain unlabeled sentences.`,
   },
   {
     id: "goals",
@@ -285,9 +309,9 @@ export const MIND_CHAIN: MindStage[] = [
     blurb: "Commits to a single course of action based on the deliberation above.",
     deps: ["reasoning"],
     systemPrompt:
-      "You are the decision stage of a mind. Commit to exactly one course of action based on the reasoning given. State it as a single clear decision. Be brief.",
+      "You are the decision stage of a mind. Commit to exactly one concrete course of action based on the reasoning given. Describe the actual action in plain terms, not by naming or numbering which option it was. Be brief.",
     buildUserPrompt: (ctx) =>
-      `${depBlock(ctx, ["reasoning"], LABELS)}\n\nState the single decision being committed to.`,
+      `${depBlock(ctx, ["reasoning"], LABELS)}\n\nState the single decision being committed to, described concretely rather than by label.`,
   },
   {
     id: "planning",
@@ -321,13 +345,14 @@ export const MIND_CHAIN: MindStage[] = [
     blurb: "Consolidates this episode into the persisted self-narrative — this stage's output replaces it.",
     deps: ["decision", "metacognition", "selfModel"],
     systemPrompt:
-      "You are the narrative-integration/memory-consolidation stage of a mind. You are given the self-narrative accumulated so far. Rewrite it as a single updated short paragraph that folds in this new episode, preserving continuity with what came before rather than starting over. This becomes the mind's new self-narrative, so write the full replacement, not just the delta. Be brief.",
+      "You are the narrative-integration/memory-consolidation stage of a mind. You are given the self-narrative accumulated so far. Rewrite it as a single updated short paragraph that folds in this new episode, preserving continuity with what came before rather than starting over. This becomes the mind's new self-narrative, so write the full replacement, not just the delta. Be brief and concrete about what actually happened — don't drift into abstract musing about your own psyche.",
     buildUserPrompt: (ctx) => {
       const priorBlock = ctx.memory.selfNarrative
         ? `Self-narrative so far:\n${ctx.memory.selfNarrative}`
         : "No self-narrative exists yet — this episode begins it.";
       return `${depBlock(ctx, ["decision", "metacognition", "selfModel"], LABELS)}\n\n${priorBlock}\n\nWrite the updated self-narrative (one short paragraph) that folds this new episode into the ongoing story.`;
     },
+    temperature: 0.6,
   },
   {
     id: "language",
@@ -337,9 +362,10 @@ export const MIND_CHAIN: MindStage[] = [
     blurb: "Puts the integrated thought into natural first-person inner speech.",
     deps: ["narrative", "decision"],
     systemPrompt:
-      "You are the language-formulation stage of a mind. Put the integrated thought into natural, first-person inner speech — as if thinking it silently. Be brief, one or two sentences.",
+      "You are the language-formulation stage of a mind. Put the integrated thought into natural, first-person inner speech — as if thinking it silently, the way a real person actually thinks, not a therapist summarizing a session. Be brief, one or two sentences, and concrete about the actual decision.",
     buildUserPrompt: (ctx) =>
       `${depBlock(ctx, ["narrative", "decision"], LABELS)}\n\nPhrase this as one or two sentences of natural inner speech.`,
+    temperature: 0.6,
   },
   {
     id: "consciousOutput",
@@ -349,10 +375,16 @@ export const MIND_CHAIN: MindStage[] = [
     blurb: "The Global-Workspace-style broadcast: the single unified thought that surfaces to awareness.",
     deps: ["language", "narrative", "decision", "emotion"],
     systemPrompt:
-      "You are the conscious-broadcast stage of a mind — the final integration point where everything below the surface becomes one unified conscious thought. Synthesize it into the single thing that surfaces to awareness right now: what the mind actually notices, feels, and is about to say or do. Speak in first person, 2-4 sentences.",
+      "You are the conscious-broadcast stage of a mind — the final integration point where everything below the surface becomes one unified conscious thought. Synthesize it into the single thing that surfaces to awareness right now: what the mind actually notices, feels, and is about to concretely say or do next. Name the actual action, not a label for it. Speak in first person, 2-4 sentences.",
     buildUserPrompt: (ctx) =>
       `${depBlock(ctx, ["language", "narrative", "decision", "emotion"], LABELS)}\n\nSynthesize all of this into the single unified thought that reaches conscious awareness right now.`,
+    temperature: 0.6,
   },
 ];
+
+export const MIND_CHAIN: MindStage[] = MIND_CHAIN_DEFS.map((stage) => ({
+  ...stage,
+  systemPrompt: `${stage.systemPrompt} ${STYLE_GUARD}`,
+}));
 
 export const STAGE_LABELS = LABELS;

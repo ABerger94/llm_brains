@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { InitProgressReport, MLCEngineInterface } from "@mlc-ai/web-llm";
-import { MIND_CHAIN } from "./mindChain";
+import { MIND_CHAIN, sanitizeStageText } from "./mindChain";
 import { loadEngine, runStage } from "./webllmEngine";
 import {
   addEpisode,
@@ -102,15 +102,18 @@ export function useMindChain() {
 
         const userPrompt = stage.buildUserPrompt({ stimulus, deps, memory });
 
-        const text = await runStage(engineRef.current, stage.systemPrompt, userPrompt, {
+        const rawText = await runStage(engineRef.current, stage.systemPrompt, userPrompt, {
           signal,
+          temperature: stage.temperature,
           onToken: (partial) => {
+            const clean = sanitizeStageText(partial);
             setStages((prev) =>
-              prev.map((s) => (s.id === stage.id ? { ...s, text: partial } : s)),
+              prev.map((s) => (s.id === stage.id ? { ...s, text: clean } : s)),
             );
           },
         });
 
+        const text = sanitizeStageText(rawText);
         results[stage.id] = text;
         setStages((prev) =>
           prev.map((s) => (s.id === stage.id ? { ...s, status: "done", text } : s)),
