@@ -13,6 +13,8 @@ export interface ModelOption {
   label: string;
   approxSizeMB: number;
   description: string;
+  /** iOS Safari kills the tab (no catchable error) well before desktop browsers hit real limits. */
+  riskyOnMobile?: boolean;
 }
 
 // Model ids match @mlc-ai/web-llm's prebuilt config (prebuiltAppConfig).
@@ -34,6 +36,7 @@ export const AVAILABLE_MODELS: ModelOption[] = [
     label: "Llama 3.2 3B Instruct",
     approxSizeMB: 2100,
     description: "Best quality of the three, larger download.",
+    riskyOnMobile: true,
   },
 ];
 

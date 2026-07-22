@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { MIND_CHAIN, PHASES } from "@/lib/mindChain";
 import { useMindChain } from "@/lib/useMindChain";
 import { isWebGPUAvailable, AVAILABLE_MODELS } from "@/lib/webllmEngine";
+import { isLikelyMobile } from "@/lib/device";
 import { ModelPicker } from "@/components/ModelPicker";
 import { LoadProgress } from "@/components/LoadProgress";
 import { StimulusInput } from "@/components/StimulusInput";
@@ -29,10 +30,30 @@ export default function Home() {
 
   const [webgpuOk, setWebgpuOk] = useState<boolean | null>(null);
   const [selectedModel, setSelectedModel] = useState<string>(AVAILABLE_MODELS[0].id);
+  const [mobile, setMobile] = useState(false);
+  const [confirmingRiskyLoad, setConfirmingRiskyLoad] = useState(false);
 
   useEffect(() => {
     setWebgpuOk(isWebGPUAvailable());
+    setMobile(isLikelyMobile());
   }, []);
+
+  const selectedModelInfo = AVAILABLE_MODELS.find((m) => m.id === selectedModel);
+  const needsRiskConfirm = mobile && !!selectedModelInfo?.riskyOnMobile;
+
+  function handleSelectModel(id: string) {
+    setSelectedModel(id);
+    setConfirmingRiskyLoad(false);
+  }
+
+  function handleLoadClick() {
+    if (needsRiskConfirm && !confirmingRiskyLoad) {
+      setConfirmingRiskyLoad(true);
+      return;
+    }
+    setConfirmingRiskyLoad(false);
+    prepareModel(selectedModel);
+  }
 
   const stageById = useMemo(() => {
     const map = new Map(stages.map((s) => [s.id, s]));
@@ -70,16 +91,24 @@ export default function Home() {
         <ModelPicker
           selectedId={selectedModel}
           disabled={engineStatus === "loading" || isRunning}
-          onSelect={setSelectedModel}
+          onSelect={handleSelectModel}
         />
         {engineStatus !== "ready" || modelId !== selectedModel ? (
           <button
             type="button"
             disabled={engineStatus === "loading" || webgpuOk === false}
-            onClick={() => prepareModel(selectedModel)}
-            className="self-start rounded-lg border border-edge bg-panel px-4 py-2 text-sm font-medium text-neutral-100 hover:border-neutral-500 disabled:cursor-not-allowed disabled:opacity-40"
+            onClick={handleLoadClick}
+            className={`self-start rounded-lg border px-4 py-2 text-sm font-medium hover:border-neutral-500 disabled:cursor-not-allowed disabled:opacity-40 ${
+              confirmingRiskyLoad
+                ? "border-amber-500/60 bg-amber-500/10 text-amber-200"
+                : "border-edge bg-panel text-neutral-100"
+            }`}
           >
-            {engineStatus === "loading" ? "Downloading…" : "Download & load model"}
+            {engineStatus === "loading"
+              ? "Downloading…"
+              : confirmingRiskyLoad
+                ? "Tap again to load anyway (may crash the tab)"
+                : "Download & load model"}
           </button>
         ) : null}
         <LoadProgress status={engineStatus} progress={loadProgress} />
