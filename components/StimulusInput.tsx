@@ -50,7 +50,7 @@ export function StimulusInput({ disabled, isRunning, onRun, onStop }: Props) {
             onClick={() => onRun(text.trim())}
             className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-bg disabled:cursor-not-allowed disabled:opacity-40"
           >
-            Run 22-stage mind chain
+            Run 22-module pipeline
           </button>
         ) : (
           <button

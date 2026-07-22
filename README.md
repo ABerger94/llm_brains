@@ -1,11 +1,13 @@
 # Mind Chain
 
 A small LLM, run entirely inside your browser, walks a single stimulus through
-a 22-stage chain of prompts modeling a rough cognitive architecture —
-perception, attention, memory, emotion, self-model, imagination, reasoning,
-decision, and a final "conscious broadcast." Nothing you type, and nothing
-the model generates, ever leaves your device: there is no backend and no API
-calls once the page loads.
+a 22-module cognitive pipeline where each module is mapped to a real
+brain-region equivalent (Perception → primary sensory cortices, Emotion →
+amygdala/insula, Integration → Global Workspace/Phi under Integrated
+Information Theory, and so on), ending in **Voice** — the mind's actual
+first-person response. Nothing you type, and nothing the model generates,
+ever leaves your device: there is no backend and no API calls once the page
+loads.
 
 ## How it works
 
@@ -14,31 +16,58 @@ calls once the page loads.
   via WebGPU. The weights download once from Hugging Face and are cached by
   the browser's Cache API — later visits (including as an installed PWA) load
   from cache.
-- **The chain**: `lib/mindChain.ts` defines the 22 stages. Each stage is a
-  small, focused prompt that only sees the original stimulus plus the
-  specific earlier stage outputs it depends on (see each stage's `deps`) —
-  not the full transcript — so prompts stay short enough for a 1B-3B model's
-  context window. `lib/useMindChain.ts` runs them in order, streaming tokens
-  into the UI as each stage completes.
+- **The pipeline**: `lib/mindChain.ts` defines the 22 modules — Perception,
+  Attention, Memory, Learning, Temporal Awareness, Planning, Reasoning,
+  Emotion, Theory of Mind, Belief Store, Self-Reflection, Identity, Social
+  Cognition, Contradiction Engine, Metacognition, Integration, Language,
+  Curiosity, Goal Generation, Somatic Marker, Narrative, Voice. Each module is
+  a small, focused prompt that only sees the original stimulus plus the
+  specific earlier modules it depends on (see each module's `deps`) — not the
+  full transcript — so prompts stay short enough for a 1B-3B model's context
+  window.
+- **Real control flow, not just a linear chain**: `lib/useMindChain.ts`
+  implements two modules that can actually redirect the run, not just narrate
+  about it:
+  - **Contradiction Engine** (module 14) audits modules 1-13 for
+    contradictions and can emit up to 3 `MODULE_RERUN: [Name] — reason`
+    directives, each causing just that one module to be re-executed in place
+    with the contradiction appended as context.
+  - **Metacognition** (module 15) reviews the run and can send modules 1-14
+    back for a full fresh pass (up to 4 times) by starting its output with
+    `RERUN`; otherwise it starts with `PROCEED` and the run continues to
+    Integration (16) onward.
+  - Both are parsed with fail-safe-to-proceed semantics
+    (`parseModuleRerunDirectives`/`parseMetacognitionVerdict` in
+    `lib/mindChain.ts`): a 1-3B local model won't reliably emit exact
+    machine-parseable directives, so anything that doesn't clearly match the
+    expected format is treated as "no directive" rather than risking an
+    unbounded loop. **This means a single run can take meaningfully longer
+    than 22 model calls** — worst case, roughly 3-4x — since reruns compound
+    on an already-slow in-browser model. The UI surfaces every triggered
+    rerun in a live log so it's not a silent black box.
+  - **Integration** (16) is asked to report a IIT-style `PHI: 0.XX` estimate,
+    parsed and shown as a Φ badge next to the final output — reported, not
+    used to gate anything.
 - **Persistent memory**: `lib/memoryStore.ts` keeps this from being a
-  stateless one-shot chain. It's backed by `localStorage`, so it survives
-  reloads and persists across sessions in the same browser:
-  - Every completed run consolidates into a rolling first-person
-    **self-narrative** (stage 20, Narrative Integration, rewrites it in full
-    each time — consolidation, not concatenation) and appends a compact
-    **episode** (stimulus, emotion, decision, conscious output) to episodic
-    memory, capped at the most recent 40.
-  - The next run's **Long-Term Memory Retrieval** (stage 6) and **Self-Model
-    Check** (stage 10) are given this real history as context instead of
-    hallucinating a plausible-sounding memory from nothing — retrieval uses
-    simple keyword overlap between the new stimulus and past episodes,
-    falling back to the most recent ones if nothing matches.
-  - The `MemoryPanel` at the top of the page shows the current self-concept
-    and episode list, with a "Forget everything" control that clears it.
-- **UI**: `app/page.tsx` renders the 22 stages grouped into 7 phases
-  (Perception → Memory → Affect & Salience → Self & Social Cognition →
-  Imagination & Goals → Reasoning & Decision → Integration), plus a
-  highlighted final "conscious broadcast" card.
+  stateless one-shot pipeline. It's backed by `localStorage`, so it survives
+  reloads and persists across sessions (a "session" = one full pipeline run):
+  - **Identity** (module 12) rewrites the persisted first-person identity
+    narrative in full each session — consolidation, not concatenation — and
+    each session appends a compact **episode** (stimulus, emotion, reasoning,
+    voice) to episodic memory, capped at the most recent 40.
+  - **Memory** (module 3) and **Temporal Awareness** (module 5) are given
+    this real history as context — including a concrete session number and
+    summaries of the most recent and ~10-sessions-back episodes — instead of
+    hallucinating a plausible-sounding memory from nothing. Retrieval uses
+    keyword overlap between the new stimulus and past episodes, returning
+    nothing (rather than forcing in unrelated ones) when nothing matches.
+  - The `MemoryPanel` at the top of the page shows the current identity
+    narrative, session number, and episode list, with a "Forget everything"
+    control that clears it.
+- **UI**: `app/page.tsx` renders the 22 modules grouped into 7 phases
+  (Sensing → Memory & Learning → Deliberation → Self → Audit & Control →
+  Integration → Expression), a live rerun-activity log, and a highlighted
+  final **Voice** card with the Φ estimate.
 - **PWA**: `public/manifest.webmanifest` + `public/sw.js` make it installable.
   The service worker only caches this app's own shell (HTML/CSS/JS/icons) —
   it never intercepts the cross-origin model-weight requests, which WebLLM

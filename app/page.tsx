@@ -11,6 +11,7 @@ import { StimulusInput } from "@/components/StimulusInput";
 import { StageCard } from "@/components/StageCard";
 import { ConsciousOutput } from "@/components/ConsciousOutput";
 import { MemoryPanel } from "@/components/MemoryPanel";
+import { RerunLog } from "@/components/RerunLog";
 
 export default function Home() {
   const {
@@ -24,8 +25,10 @@ export default function Home() {
     run,
     stop,
     episodes,
-    selfNarrative,
+    identityNarrative,
     forgetEverything,
+    rerunEvents,
+    phi,
   } = useMindChain();
 
   const [webgpuOk, setWebgpuOk] = useState<boolean | null>(null);
@@ -60,7 +63,7 @@ export default function Home() {
     return map;
   }, [stages]);
 
-  const finalStage = stageById.get("consciousOutput");
+  const finalStage = stageById.get("voice");
 
   return (
     <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-5 px-4 py-8 pb-16">
@@ -68,14 +71,18 @@ export default function Home() {
         <h1 className="text-xl font-semibold text-neutral-50">Mind Chain</h1>
         <p className="mt-1 text-sm text-neutral-400">
           A small language model, running entirely on your device, walks a stimulus through 22
-          chained prompts modeling perception, memory, emotion, reasoning, and conscious
-          broadcast — no server, no API calls. Every run consolidates into a persisted
-          self-narrative and episodic memory, so this mind actually accumulates a past instead
-          of resetting each time.
+          modules mapped to real brain-region equivalents — Perception through Voice — grounded
+          in Integrated Information Theory. No server, no API calls. Contradiction Engine and
+          Metacognition can send parts of the run back for a redo when something doesn't hold
+          together, and each session consolidates into a persisted identity and episodic memory.
         </p>
       </header>
 
-      <MemoryPanel selfNarrative={selfNarrative} episodes={episodes} onForget={forgetEverything} />
+      <MemoryPanel
+        identityNarrative={identityNarrative}
+        episodes={episodes}
+        onForget={forgetEverything}
+      />
 
       {webgpuOk === false && (
         <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
@@ -124,6 +131,13 @@ export default function Home() {
           onRun={run}
           onStop={stop}
         />
+        {isRunning && (
+          <p className="text-[11px] text-neutral-500">
+            Modules 1-15 can loop back on themselves if Contradiction Engine or Metacognition
+            flag something — this can take noticeably longer than a straight pass, especially on
+            small local models.
+          </p>
+        )}
       </section>
 
       {error && (
@@ -132,8 +146,10 @@ export default function Home() {
         </div>
       )}
 
+      <RerunLog events={rerunEvents} />
+
       {finalStage && (finalStage.text || finalStage.status !== "pending") && (
-        <ConsciousOutput text={finalStage.text} isRunning={finalStage.status === "running"} />
+        <ConsciousOutput text={finalStage.text} isRunning={finalStage.status === "running"} phi={phi} />
       )}
 
       <section className="flex flex-col gap-5">
@@ -157,7 +173,7 @@ export default function Home() {
       </section>
 
       <footer className="pt-4 text-center text-[11px] text-neutral-600">
-        Model weights download once and are cached by your browser. All 22 stages run locally —
+        Model weights download once and are cached by your browser. All 22 modules run locally —
         nothing you type or generate leaves this device.
       </footer>
     </main>
