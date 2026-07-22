@@ -97,7 +97,7 @@ export async function runStage(
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
     ],
-    temperature: options.temperature ?? 0,
+    temperature: options.temperature ?? 0.2,
     max_tokens: options.maxTokens ?? 120,
     stream: true,
   });

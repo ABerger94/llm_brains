@@ -47,7 +47,7 @@ export interface MindStage {
   deps: string[];
   systemPrompt: string;
   buildUserPrompt: (ctx: MindStageContext) => string;
-  /** Overrides the default sampling temperature (0 — greedy/deterministic) if a module ever needs variation. */
+  /** Overrides the default sampling temperature (0.2) if a module ever needs more/less variation. */
   temperature?: number;
   /** Overrides the default token budget — small models ramble to fill whatever room they're given. */
   maxTokens?: number;
