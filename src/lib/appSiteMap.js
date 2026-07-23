@@ -14,6 +14,7 @@ import {
   GitMerge,
   Globe,
   Home,
+  Laptop,
   Mic,
   Moon,
   Orbit,
@@ -78,6 +79,14 @@ export const APP_ROUTES = [
     icon: GitBranch,
     manualBlurb:
       'Runs list at /graph-pipeline; System B mirror run history at /graph-pipeline/mirror (MirrorPipelineRun, dual-playground session). Each session opens a workspace with curiosity-style pipeline UI (stage map, neural graph, execution.log) plus inspector and composer. Probabilistic features (adaptive temperature, soft metacognition thresholds, multi-sample modules, embedding-ranked memory) run transparently during each graph run. Scheduled graph tasks also open at /graph-pipeline/scheduled/:taskId. /consciousness-stream redirects here.',
+  },
+  {
+    path: '/browser-mind',
+    title: 'Browser Mind',
+    nav: { section: 'cognition', label: 'Browser Mind' },
+    icon: Laptop,
+    manualBlurb:
+      'Self-contained 22-module cognitive pipeline that runs entirely client-side via WebGPU (@mlc-ai/web-llm) — no local LLM server or API key required. Separate module schema and memory store from the main Graph Pipeline; ported from the llm_brains sibling project.',
   },
   { path: '/biography', title: 'Mind Biography', nav: { section: 'mind' }, icon: BookOpen, manualBlurb: 'First-person narrative versions and auto-appends from runs.' },
   { path: '/health', title: 'Cognitive Health', nav: { section: 'mind' }, icon: Activity, manualBlurb: 'Aggregate readiness and mind-health snapshot cards. Health endpoint now includes embedding cache stats and calibrated thresholds.' },

@@ -18,6 +18,7 @@ import DmnReflectionsPage from './pages/DmnReflectionsPage';
 import LiveAnalyticsPage from './pages/LiveAnalyticsPage';
 import { GoalStackPage } from './pages/GoalStackPage';
 import NeuralNetworkPage from './pages/NeuralNetworkPage';
+import BrowserMindPage from './pages/BrowserMindPage';
 import Playground from './components/Playground';
 
 import {
@@ -140,6 +141,7 @@ export default function App() {
             <Route path="/neural-network" element={<NeuralNetworkPage />} />
 
             <Route path="/multi-mind" element={<MultiMindRedirectPage />} />
+            <Route path="/browser-mind" element={<BrowserMindPage />} />
 
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
