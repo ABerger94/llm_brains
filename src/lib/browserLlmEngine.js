@@ -36,6 +36,36 @@ export function isWebGPUAvailable() {
   return typeof navigator !== 'undefined' && 'gpu' in navigator;
 }
 
+let requestAdapterPatched = false;
+
+/**
+ * @mlc-ai/web-llm always requests an adapter with `powerPreference: "high-performance"`
+ * (hardcoded internally — no public option to change it). On laptops with only an
+ * integrated GPU, Chrome/Edge's `requestAdapter()` can return null specifically for
+ * "high-performance" even though the exact same device supports WebGPU fine at the
+ * default/low-power preference — verified via chrome://gpu showing "Hardware
+ * accelerated" while model loading still fails with "Unable to find a compatible GPU."
+ * Wraps `navigator.gpu.requestAdapter` to retry with less demanding preferences before
+ * giving up, so web-llm ends up with a real adapter on those machines too.
+ */
+function patchRequestAdapterFallback() {
+  if (requestAdapterPatched) return;
+  if (typeof navigator === 'undefined' || !navigator.gpu?.requestAdapter) return;
+  requestAdapterPatched = true;
+
+  const original = navigator.gpu.requestAdapter.bind(navigator.gpu);
+  navigator.gpu.requestAdapter = async (options) => {
+    const first = await original(options);
+    if (first) return first;
+    if (options?.powerPreference === 'low-power') return null;
+    const lowPower = await original({ ...options, powerPreference: 'low-power' });
+    if (lowPower) return lowPower;
+    const rest = { ...options };
+    delete rest.powerPreference;
+    return original(rest);
+  };
+}
+
 /** No compatible GPU/driver for WebGPU — a hardware/environment limitation, not something retrying fixes. */
 function isGpuAdapterError(message) {
   return /gpu|adapter|webgpu/i.test(message);
@@ -56,6 +86,7 @@ function describeEngineLoadError(e) {
 
 export async function loadEngine(modelId, onProgress) {
   const webllm = await import('@mlc-ai/web-llm');
+  patchRequestAdapterFallback();
 
   if (loadedModelId && loadedModelId !== modelId && enginePromise) {
     try {
