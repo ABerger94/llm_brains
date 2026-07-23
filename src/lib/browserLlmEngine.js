@@ -36,20 +36,46 @@ export function isWebGPUAvailable() {
   return typeof navigator !== 'undefined' && 'gpu' in navigator;
 }
 
+/** No compatible GPU/driver for WebGPU — a hardware/environment limitation, not something retrying fixes. */
+function isGpuAdapterError(message) {
+  return /gpu|adapter|webgpu/i.test(message);
+}
+
+/** Appends actionable guidance for the one failure mode users hit most: no usable GPU adapter. */
+function describeEngineLoadError(e) {
+  const original = e instanceof Error ? e.message : String(e);
+  if (!isGpuAdapterError(original)) return original;
+  return (
+    `${original}\n\nThis usually means the browser couldn't get a hardware-accelerated GPU adapter, not a bug in this app. Check: ` +
+    `chrome://gpu (WebGPU should say "Hardware accelerated", not "Unavailable"/"Software only"); ` +
+    `chrome://settings/system -> "Use graphics acceleration when available" is on (then relaunch); ` +
+    `GPU drivers are up to date; and that this isn't a Remote Desktop/VM session without real GPU passthrough, which WebGPU can't work around. ` +
+    `If none of that helps, use the "Local server" execution backend on this machine instead.`
+  );
+}
+
 export async function loadEngine(modelId, onProgress) {
   const webllm = await import('@mlc-ai/web-llm');
 
   if (loadedModelId && loadedModelId !== modelId && enginePromise) {
-    const existing = await enginePromise;
-    await existing.unload();
+    try {
+      const existing = await enginePromise;
+      await existing.unload();
+    } catch {
+      // previous load never actually succeeded — nothing to unload
+    }
     enginePromise = null;
     loadedModelId = null;
   }
 
   if (!enginePromise) {
     loadedModelId = modelId;
-    enginePromise = webllm.CreateMLCEngine(modelId, {
-      initProgressCallback: onProgress,
+    enginePromise = webllm.CreateMLCEngine(modelId, { initProgressCallback: onProgress }).catch((e) => {
+      // Reset so the next loadEngine() call (e.g. a "Reload model" retry) actually
+      // retries instead of forever returning this same rejected promise.
+      enginePromise = null;
+      loadedModelId = null;
+      throw new Error(describeEngineLoadError(e));
     });
   }
 
