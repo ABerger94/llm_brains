@@ -19,7 +19,17 @@ import LiveAnalyticsPage from './pages/LiveAnalyticsPage';
 import { GoalStackPage } from './pages/GoalStackPage';
 import NeuralNetworkPage from './pages/NeuralNetworkPage';
 import BrowserMindPage from './pages/BrowserMindPage';
+import BrowserOnlyShell from './components/BrowserOnlyShell';
 import Playground from './components/Playground';
+
+/**
+ * Set for the Vercel deployment build only (see vercel.json: `VITE_BROWSER_ONLY=1 vite build`).
+ * That build ships no Express backend, so it serves just the self-contained,
+ * client-side Browser Mind pipeline instead of the full server-driven app —
+ * every other route here assumes a live /api backend and would otherwise
+ * 404/fail silently in production.
+ */
+const BROWSER_ONLY = import.meta.env.VITE_BROWSER_ONLY === '1';
 
 import {
   LongTermMemoryPage,
@@ -44,6 +54,19 @@ import {
 } from './pages/ExtraPages';
 
 export default function App() {
+  if (BROWSER_ONLY) {
+    return (
+      <Router future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <BrowserOnlyShell>
+          <Routes>
+            <Route path="/" element={<BrowserMindPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </BrowserOnlyShell>
+      </Router>
+    );
+  }
+
   return (
     <Router future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <div className="flex h-full min-h-0 w-full min-w-0 flex-1 flex-col overflow-hidden">
