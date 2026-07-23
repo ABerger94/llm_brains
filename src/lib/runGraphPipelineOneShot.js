@@ -7,6 +7,7 @@ import {
 } from './runtimeSettings';
 import { getExecutionPlan } from './cognitiveModules';
 import { consumePipelineSseWithMetacognitionContinuations } from './pipelineSse';
+import { getPipelineExecutionBackend, EXECUTION_BACKEND_BROWSER } from './localPipeline/executionBackend';
 import { slimSharedMemoryForGraphCheckpoint, slimSharedMemoryForPipelinePost } from './slimSharedMemory';
 import { safeJsonStringifyPipelineBody } from './safeJsonStringify.js';
 import { rowsToRecentDialogue } from './pipelineDialogueContext';
@@ -347,7 +348,13 @@ export async function streamGraphPipelineSseLegs({
     pipelineOptionsSnapshot && typeof pipelineOptionsSnapshot === 'object'
       ? { ...pipelineOptionsSnapshot }
       : {};
-  return consumePipelineSseWithMetacognitionContinuations({
+  /** Dynamic import: see the matching branch in consciousnessStreamRunner.js for why. */
+  const runPipelineLeg =
+    getPipelineExecutionBackend() === EXECUTION_BACKEND_BROWSER
+      ? (await import('./localPipeline/localPipelineRunner')).runLocalPipelineWithMetacognitionContinuations
+      : consumePipelineSseWithMetacognitionContinuations;
+
+  return runPipelineLeg({
     fetchImpl,
     treatFirstLegAsContinuation,
     abortSignal,

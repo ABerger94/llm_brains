@@ -21,6 +21,7 @@ import { openrouterRequestFields } from './llmClientOptions';
 import { getRuntimeSettings, saveRuntimeSettings } from './runtimeSettings';
 import { notifyMindStorageChanged } from './mindStorageEvents';
 import { invokeLLM } from './llm';
+import { getPipelineExecutionBackend, EXECUTION_BACKEND_BROWSER } from './localPipeline/executionBackend';
 import {
   buildWorldModelCreatePayload,
   buildWorldModelUpdatePayload,
@@ -2563,20 +2564,27 @@ WORLD_HINTS: (bullet list, each line starting with "- ", proposed world-model fa
 SELF_NOTE: (one short paragraph for narrative identity continuity)
 QUESTIONS: (open threads worth revisiting)`;
 
-  const res = await fetch('/api/llm/text', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      prompt,
-      systemPrompt:
-        'You consolidate memory and identity for a cognitive pipeline app. Follow the output format exactly.',
-      temperature: 0.45,
-      max_tokens: maxTokens,
-      ...openrouterRequestFields(),
-    }),
-  });
-  const payload = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(payload.error || 'Consolidation LLM failed');
+  const consolidationSystemPrompt =
+    'You consolidate memory and identity for a cognitive pipeline app. Follow the output format exactly.';
+  let payload;
+  if (getPipelineExecutionBackend() === EXECUTION_BACKEND_BROWSER) {
+    const { callLLM } = await import('./localPipeline/browserCallLlm');
+    payload = await callLLM(consolidationSystemPrompt, prompt, { temperature: 0.45, max_tokens: maxTokens });
+  } else {
+    const res = await fetch('/api/llm/text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        systemPrompt: consolidationSystemPrompt,
+        temperature: 0.45,
+        max_tokens: maxTokens,
+        ...openrouterRequestFields(),
+      }),
+    });
+    payload = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(payload.error || 'Consolidation LLM failed');
+  }
 
   const text = String(payload.text || '');
   await E().ConsolidationDigest.create({

@@ -7,17 +7,40 @@
  *
  * runPipeline's onEvent already emits the exact event shapes the SSE path relays
  * verbatim (server/index.js just forwards them over the wire via sseSend) — so
- * consciousnessStreamRunner.js's onEvent handler needs zero changes to consume this.
+ * every caller's onEvent handler (consciousnessStreamRunner.js, runGraphPipelineOneShot.js)
+ * needs zero changes to consume this. Only reached via dynamic import() when the
+ * execution-backend setting is "browser" (see executionBackend.js) — never imported
+ * eagerly, so the normal server-backed build path pays no cost for it.
  *
- * Only buildable in the browser-only build: this imports server/pipeline.js, which
- * only resolves cleanly once vite.config.js's browser-only aliases are active (see
- * browserOnlyPipelineAliases()). Callers must not import this module in the normal
- * (server-backed) build path.
+ * server/pipeline.js resolves cleanly here because vite.config.js's localPipelineAliases()
+ * are registered unconditionally (both build paths), not gated on a build flag.
  */
 import './processPolyfill';
 import { runPipeline } from '../../../server/pipeline.js';
 import { PIPELINE_SCHEMA_VERSION } from '../../../shared/pipelineModules.mjs';
 import { slimSharedMemoryForPipelinePost } from '../slimSharedMemory';
+
+/** iOS Safari kills the whole tab under memory pressure well before desktop browsers hit real limits. */
+function isLikelyMobile() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent;
+  const isTouchMac = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1; // iPadOS reports as Mac
+  return /iPhone|iPad|iPod|Android/.test(ua) || isTouchMac;
+}
+
+/**
+ * On mobile, shrink the pipeline's own context-budget/max-tokens/timeout defaults
+ * (the same LOCAL_LLM_LOW_SPEC=1 knob server/llmEnv.js already exposes) so each of
+ * the many sequential WebGPU calls a full pipeline run makes stays smaller — less
+ * sustained GPU memory pressure, directly reducing tab-crash risk on memory-
+ * constrained devices. No-op on desktop (mobile crash reports were desktop-clean).
+ */
+function enableLowSpecOnMobile() {
+  if (!isLikelyMobile()) return;
+  if (typeof globalThis.process?.env === 'object') {
+    globalThis.process.env.LOCAL_LLM_LOW_SPEC = '1';
+  }
+}
 import { callLLM } from './browserCallLlm';
 
 export async function runLocalPipelineWithMetacognitionContinuations({
@@ -28,6 +51,7 @@ export async function runLocalPipelineWithMetacognitionContinuations({
   treatFirstLegAsContinuation = false,
   abortSignal,
 }) {
+  enableLowSpecOnMobile();
   let slimSm = initialSlimSharedMemory;
   let streamResult = null;
 

@@ -4,6 +4,7 @@
  */
 
 import { openrouterRequestFields } from '../lib/llmClientOptions';
+import { getPipelineExecutionBackend, EXECUTION_BACKEND_BROWSER } from '../lib/localPipeline/executionBackend';
 
 const TEXT_ENDPOINT = '/api/llm/text';
 const TEXT_STREAM_ENDPOINT = '/api/llm/text-stream';
@@ -17,6 +18,16 @@ export class LLMService {
    * Main text invocation used by the graph pipeline and the Base44 compatibility shim.
    */
   async InvokeLLM({ prompt, systemPrompt, temperature = 0.7, max_tokens = 1500, top_p = 0.9 }) {
+    if (getPipelineExecutionBackend() === EXECUTION_BACKEND_BROWSER) {
+      try {
+        const { callLLM } = await import('../lib/localPipeline/browserCallLlm');
+        const { text } = await callLLM(systemPrompt || '', prompt, { temperature, max_tokens });
+        return text || 'No response from model';
+      } catch (error) {
+        console.error('Browser LLM call failed:', error);
+        return `Error: ${error.message}`;
+      }
+    }
     try {
       const response = await fetch(this.baseUrl, {
         method: 'POST',
@@ -69,6 +80,14 @@ export class LLMService {
    * Streams tokens via POST /api/llm/text-stream (SSE). Falls back to single-chunk non-streaming if needed.
    */
   async InvokeLLMStream({ prompt, systemPrompt, temperature = 0.7, max_tokens = 1500, onChunk }) {
+    if (getPipelineExecutionBackend() === EXECUTION_BACKEND_BROWSER) {
+      // No true token streaming for browser execution (avoids the same per-token
+      // React re-render churn that used to crash the llm_brains sibling project) —
+      // single-chunk fallback, same as when SSE isn't available server-side.
+      const text = await this.InvokeLLM({ prompt, systemPrompt, temperature, max_tokens });
+      if (text && onChunk) onChunk(text);
+      return;
+    }
     try {
       const response = await fetch(TEXT_STREAM_ENDPOINT, {
         method: 'POST',

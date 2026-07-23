@@ -8,6 +8,7 @@ import { loadStructuralSelfForPipeline, buildWorkingMemorySeed } from './mindPer
 import { rowsToRecentDialogue } from './pipelineDialogueContext';
 import { readFetchErrorMessage } from './pipelineSse';
 import { pickLatestNonCheckpointPipelineRun } from './pipelineRunCheckpoint';
+import { getPipelineExecutionBackend, EXECUTION_BACKEND_BROWSER } from './localPipeline/executionBackend';
 
 const E = () => getMindEntityStores();
 
@@ -409,27 +410,52 @@ export async function completeMindBiographyViaJson(sessionNumber, prevBio, optio
   const temperature = typeof options.temperature === 'number' ? options.temperature : 0.35;
   const max_tokens = typeof options.max_tokens === 'number' ? options.max_tokens : 3200;
 
-  const res = await fetch('/api/llm/json', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      prompt,
-      systemPrompt,
-      temperature,
-      max_tokens,
-      top_p: 0.9,
-      ...openrouterRequestFields(),
-    }),
-  });
+  let data;
+  let provider;
+  let model;
+  if (getPipelineExecutionBackend() === EXECUTION_BACKEND_BROWSER) {
+    // Mirrors server/index.js's /api/llm/json exactly: appends the same
+    // JSON-only instruction, same parser (prompt-based JSON mode, no real
+    // grammar-constrained decoding server-side either).
+    const [{ callLLM }, { parseLlmJsonText }] = await Promise.all([
+      import('./localPipeline/browserCallLlm'),
+      import('../../server/llmContextBudget.js'),
+    ]);
+    const jsonSystem = [
+      systemPrompt || '',
+      '',
+      'You must respond with ONLY valid JSON. No markdown. No commentary. No code fences.',
+    ]
+      .join('\n')
+      .trim();
+    const result = await callLLM(jsonSystem, prompt, { temperature, max_tokens });
+    data = parseLlmJsonText(result.text);
+    provider = result.provider;
+    model = result.model;
+  } else {
+    const res = await fetch('/api/llm/json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        systemPrompt,
+        temperature,
+        max_tokens,
+        top_p: 0.9,
+        ...openrouterRequestFields(),
+      }),
+    });
 
-  const payload = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(
-      String(payload.error || payload.message || `Biography JSON request failed (${res.status})`).slice(0, 500)
-    );
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(
+        String(payload.error || payload.message || `Biography JSON request failed (${res.status})`).slice(0, 500)
+      );
+    }
+    data = payload.data;
+    provider = payload.provider;
+    model = payload.model;
   }
-
-  const data = payload.data;
   if (!data || typeof data !== 'object') throw new Error('Biography JSON: empty response');
 
   const fullText = String(data.autobiography || data.full_text || '').trim();
@@ -453,7 +479,7 @@ export async function completeMindBiographyViaJson(sessionNumber, prevBio, optio
     memoriesCount,
     beliefCount,
     runs,
-    provider: payload.provider,
-    model: payload.model,
+    provider,
+    model,
   };
 }
