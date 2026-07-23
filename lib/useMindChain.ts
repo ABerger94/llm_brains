@@ -14,13 +14,11 @@ import {
 } from "./mindChain";
 import { loadEngine, runStage, unloadEngine } from "./webllmEngine";
 import {
-  addEpisode,
   clearMemory as clearPersistedMemory,
-  getEpisodes,
-  getIdentityNarrative,
+  fetchMindSnapshot,
   getTemporalSnapshot,
   retrieveRelevantEpisodes,
-  setIdentityNarrative,
+  saveSession,
   type MemoryEpisode,
 } from "./memoryStore";
 
@@ -66,6 +64,7 @@ export function useMindChain() {
   const [error, setError] = useState<string | null>(null);
   const [episodes, setEpisodes] = useState<MemoryEpisode[]>([]);
   const [identityNarrative, setIdentityNarrativeState] = useState<string>("");
+  const [backendConfigured, setBackendConfigured] = useState<boolean | null>(null);
   const [rerunEvents, setRerunEvents] = useState<RerunEvent[]>([]);
   const [phi, setPhi] = useState<number | null>(null);
 
@@ -104,18 +103,20 @@ export function useMindChain() {
     };
   }, []);
 
-  const refreshMemory = useCallback(() => {
-    setEpisodes(getEpisodes());
-    setIdentityNarrativeState(getIdentityNarrative());
+  const refreshMemory = useCallback(async () => {
+    const snapshot = await fetchMindSnapshot();
+    setEpisodes(snapshot.episodes);
+    setIdentityNarrativeState(snapshot.identityNarrative);
+    setBackendConfigured(snapshot.backendConfigured);
   }, []);
 
   useEffect(() => {
     refreshMemory();
   }, [refreshMemory]);
 
-  const forgetEverything = useCallback(() => {
-    clearPersistedMemory();
-    refreshMemory();
+  const forgetEverything = useCallback(async () => {
+    await clearPersistedMemory();
+    await refreshMemory();
   }, [refreshMemory]);
 
   const prepareModel = useCallback(async (id: string) => {
@@ -150,11 +151,12 @@ export function useMindChain() {
     const signal = abortRef.current.signal;
 
     const results: Record<string, string> = {};
-    // Loaded once per run: real persisted memory, not fabricated per-module.
+    // Fetched once per run from the real backend, not fabricated per-module.
+    const mindSnapshot = await fetchMindSnapshot();
     const memory = {
-      identityNarrative: getIdentityNarrative(),
-      relevantEpisodes: retrieveRelevantEpisodes(stimulus, 3),
-      ...getTemporalSnapshot(),
+      identityNarrative: mindSnapshot.identityNarrative,
+      relevantEpisodes: retrieveRelevantEpisodes(mindSnapshot.episodes, stimulus, 3),
+      ...getTemporalSnapshot(mindSnapshot.episodes),
     };
 
     let totalCalls = 0;
@@ -261,17 +263,25 @@ export function useMindChain() {
 
       // Consolidate: Identity's rewritten narrative becomes the persisted
       // identity, and this session becomes a new episode — so the next run
-      // starts from a mind that actually remembers this one.
+      // starts from a mind that actually remembers this one. Saved to the
+      // backend in a single round trip, and the returned snapshot updates
+      // local state directly rather than triggering a second fetch.
       if (!signal.aborted && results.voice) {
-        if (results.identity) setIdentityNarrative(results.identity);
-        addEpisode({
-          timestamp: Date.now(),
-          stimulus,
-          emotion: results.emotion ?? "",
-          reasoning: results.reasoning ?? "",
-          voice: results.voice ?? "",
+        const saved = await saveSession({
+          identityNarrative: results.identity || undefined,
+          newEpisode: {
+            timestamp: Date.now(),
+            stimulus,
+            emotion: results.emotion ?? "",
+            reasoning: results.reasoning ?? "",
+            voice: results.voice ?? "",
+          },
         });
-        refreshMemory();
+        if (saved) {
+          setEpisodes(saved.episodes);
+          setIdentityNarrativeState(saved.identityNarrative);
+          setBackendConfigured(saved.backendConfigured);
+        }
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -306,6 +316,7 @@ export function useMindChain() {
     stop,
     episodes,
     identityNarrative,
+    backendConfigured,
     forgetEverything,
     rerunEvents,
     phi,

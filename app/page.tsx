@@ -26,6 +26,7 @@ export default function Home() {
     stop,
     episodes,
     identityNarrative,
+    backendConfigured,
     forgetEverything,
     rerunEvents,
     phi,
@@ -74,13 +75,15 @@ export default function Home() {
           modules mapped to real brain-region equivalents — Perception through Voice — grounded
           in Integrated Information Theory. Contradiction Engine and Metacognition can send parts
           of the run back for a redo when something doesn't hold together, and each session
-          consolidates into a persisted identity and episodic memory.
+          consolidates into an identity and episodic memory kept in a real backend database, not
+          just this browser.
         </p>
       </header>
 
       <MemoryPanel
         identityNarrative={identityNarrative}
         episodes={episodes}
+        backendConfigured={backendConfigured}
         onForget={forgetEverything}
       />
 
@@ -173,8 +176,10 @@ export default function Home() {
       </section>
 
       <footer className="pt-4 text-center text-[11px] text-neutral-600">
-        Model weights download once and are cached by your browser. All 22 modules run locally —
-        nothing you type or generate leaves this device.
+        Model weights download once and are cached by your browser, and all 22 modules run
+        locally — the LLM itself never leaves this device. What does leave: a compact summary of
+        each session (stimulus, emotion, reasoning, and the final response) is saved to a small
+        backend so this mind's memory persists across visits.
       </footer>
     </main>
   );

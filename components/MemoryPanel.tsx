@@ -7,10 +7,11 @@ import { timeAgo } from "@/lib/memoryStore";
 interface Props {
   identityNarrative: string;
   episodes: MemoryEpisode[];
+  backendConfigured: boolean | null;
   onForget: () => void;
 }
 
-export function MemoryPanel({ identityNarrative, episodes, onForget }: Props) {
+export function MemoryPanel({ identityNarrative, episodes, backendConfigured, onForget }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [confirmingForget, setConfirmingForget] = useState(false);
 
@@ -46,11 +47,18 @@ export function MemoryPanel({ identityNarrative, episodes, onForget }: Props) {
         )}
       </div>
 
+      {backendConfigured === false && (
+        <p className="mt-2 text-xs text-amber-300">
+          Backend memory store isn&apos;t connected yet — running without persistence this
+          session (see README for the one-time setup step).
+        </p>
+      )}
+
       {!hasMemory ? (
         <p className="mt-2 text-sm text-neutral-500">
           No memory yet — this mind hasn&apos;t experienced anything. Run the pipeline below and
           it will start accumulating an identity narrative and episodic memory that persists
-          across sessions (stored only in this browser).
+          across sessions in a real backend database.
         </p>
       ) : (
         <div className="mt-3 flex flex-col gap-3">

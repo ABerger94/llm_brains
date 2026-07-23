@@ -1,17 +1,25 @@
 "use client";
 
 /**
- * Persistent memory, backed by localStorage. This is what makes the mind
- * continuous across sessions instead of resetting to a blank slate each
- * time. A "session" is one full pipeline run (one stimulus processed
- * end-to-end). Each session:
+ * Persistent memory, backed by a real server-side database (see
+ * app/api/memory/route.ts + lib/server/memoryDb.ts), not just browser
+ * localStorage. This is what makes the mind continuous across sessions
+ * instead of resetting to a blank slate each time. A "session" is one full
+ * pipeline run (one stimulus processed end-to-end). Each session:
  *  - appends a compact episode to episodic memory (capped at the most
  *    recent 40), and
  *  - has the Identity module (not a separate log) rewrite the persisted
  *    identity narrative in full — consolidation, not concatenation, same as
  *    how biological memory consolidation compresses experience rather than
  *    accumulating a verbatim transcript forever.
+ *
+ * The LLM itself still runs entirely in-browser (see lib/webllmEngine.ts) —
+ * this module is only about where the resulting memory data lives. It's
+ * fetched/saved through /api/memory, keyed by an anonymous per-browser
+ * mindId (lib/mindId.ts), not tied to any account.
  */
+
+import { getOrCreateMindId } from "./mindId";
 
 export interface MemoryEpisode {
   id: string;
@@ -33,73 +41,57 @@ export interface TemporalSnapshot {
   olderSessionSummary: string;
 }
 
-const EPISODES_KEY = "mindchain.episodes.v1";
-const IDENTITY_NARRATIVE_KEY = "mindchain.identityNarrative.v1";
-const MAX_EPISODES = 40;
-const MAX_FIELD_LEN = 400;
+export interface MindSnapshot {
+  identityNarrative: string;
+  episodes: MemoryEpisode[];
+  /** False if the backend has no Redis connected — data won't reliably persist (see README). */
+  backendConfigured: boolean;
+}
+
 const OLDER_SESSION_LOOKBACK = 10;
+const EMPTY_SNAPSHOT: MindSnapshot = { identityNarrative: "", episodes: [], backendConfigured: false };
 
-function hasStorage(): boolean {
-  return typeof window !== "undefined" && !!window.localStorage;
-}
-
-function truncate(text: string, max: number): string {
-  return text.length > max ? text.slice(0, max - 1).trimEnd() + "…" : text;
-}
-
-export function getEpisodes(): MemoryEpisode[] {
-  if (!hasStorage()) return [];
+/** Fetches the current identity narrative + episode history from the backend. */
+export async function fetchMindSnapshot(): Promise<MindSnapshot> {
+  const mindId = getOrCreateMindId();
+  if (!mindId) return EMPTY_SNAPSHOT;
   try {
-    const raw = window.localStorage.getItem(EPISODES_KEY);
-    return raw ? (JSON.parse(raw) as MemoryEpisode[]) : [];
+    const res = await fetch(`/api/memory?mindId=${encodeURIComponent(mindId)}`, { cache: "no-store" });
+    if (!res.ok) return EMPTY_SNAPSHOT;
+    return (await res.json()) as MindSnapshot;
   } catch {
-    return [];
+    return EMPTY_SNAPSHOT;
   }
 }
 
-export function addEpisode(episode: Omit<MemoryEpisode, "id" | "sessionNumber">): MemoryEpisode[] {
-  if (!hasStorage()) return [];
-  const existing = getEpisodes();
-  const entry: MemoryEpisode = {
-    id: `${episode.timestamp}-${Math.random().toString(36).slice(2, 8)}`,
-    sessionNumber: existing.length + 1,
-    timestamp: episode.timestamp,
-    stimulus: truncate(episode.stimulus, MAX_FIELD_LEN),
-    emotion: truncate(episode.emotion, MAX_FIELD_LEN),
-    reasoning: truncate(episode.reasoning, MAX_FIELD_LEN),
-    voice: truncate(episode.voice, MAX_FIELD_LEN),
-  };
-  const next = [...existing, entry].slice(-MAX_EPISODES);
+/** Saves this session's rewritten identity narrative and/or a new episode in one round trip. */
+export async function saveSession(update: {
+  identityNarrative?: string;
+  newEpisode?: Omit<MemoryEpisode, "id" | "sessionNumber">;
+}): Promise<MindSnapshot | null> {
+  const mindId = getOrCreateMindId();
+  if (!mindId) return null;
   try {
-    window.localStorage.setItem(EPISODES_KEY, JSON.stringify(next));
+    const res = await fetch("/api/memory", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mindId, ...update }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as MindSnapshot;
   } catch {
-    // storage full/unavailable — memory just won't persist this run
-  }
-  return next;
-}
-
-export function getIdentityNarrative(): string {
-  if (!hasStorage()) return "";
-  try {
-    return window.localStorage.getItem(IDENTITY_NARRATIVE_KEY) ?? "";
-  } catch {
-    return "";
+    return null;
   }
 }
 
-export function setIdentityNarrative(text: string): void {
-  if (!hasStorage()) return;
+export async function clearMemory(): Promise<void> {
+  const mindId = getOrCreateMindId();
+  if (!mindId) return;
   try {
-    window.localStorage.setItem(IDENTITY_NARRATIVE_KEY, truncate(text, MAX_FIELD_LEN * 2));
+    await fetch(`/api/memory?mindId=${encodeURIComponent(mindId)}`, { method: "DELETE" });
   } catch {
-    // ignore
+    // non-fatal — worst case, old data just remains in the backend
   }
-}
-
-export function clearMemory(): void {
-  if (!hasStorage()) return;
-  window.localStorage.removeItem(EPISODES_KEY);
-  window.localStorage.removeItem(IDENTITY_NARRATIVE_KEY);
 }
 
 function summarizeEpisode(ep: MemoryEpisode): string {
@@ -107,8 +99,7 @@ function summarizeEpisode(ep: MemoryEpisode): string {
 }
 
 /** What Temporal Awareness needs to locate this run in the mind's own history. */
-export function getTemporalSnapshot(): TemporalSnapshot {
-  const episodes = getEpisodes();
+export function getTemporalSnapshot(episodes: MemoryEpisode[]): TemporalSnapshot {
   const mostRecent = episodes[episodes.length - 1];
   const olderIndex = episodes.length - 1 - OLDER_SESSION_LOOKBACK;
   const older = olderIndex >= 0 ? episodes[olderIndex] : undefined;
@@ -131,8 +122,7 @@ const STOPWORDS = new Set([
 ]);
 
 /** Formats up to `limit` past episodes relevant to `stimulus` as plain text for a prompt. */
-export function retrieveRelevantEpisodes(stimulus: string, limit = 3): string {
-  const episodes = getEpisodes();
+export function retrieveRelevantEpisodes(episodes: MemoryEpisode[], stimulus: string, limit = 3): string {
   if (episodes.length === 0) return "";
 
   const queryWords = tokenize(stimulus).filter((w) => !STOPWORDS.has(w));
@@ -156,7 +146,7 @@ export function retrieveRelevantEpisodes(stimulus: string, limit = 3): string {
   return relevant.map(({ ep }) => `- ${summarizeEpisode(ep)}`).join("\n");
 }
 
-function timeAgo(timestamp: number): string {
+export function timeAgo(timestamp: number): string {
   const diffMs = Date.now() - timestamp;
   const minutes = Math.round(diffMs / 60000);
   if (minutes < 1) return "just now";
@@ -166,5 +156,3 @@ function timeAgo(timestamp: number): string {
   const days = Math.round(hours / 24);
   return `${days}d ago`;
 }
-
-export { timeAgo };
