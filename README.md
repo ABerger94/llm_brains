@@ -25,37 +25,24 @@ loads.
   specific earlier modules it depends on (see each module's `deps`) — not the
   full transcript — so prompts stay short enough for a 1B-3B model's context
   window.
-- **Real control flow, not just a linear chain**: `lib/useMindChain.ts`
-  implements two modules that can actually redirect the run, not just narrate
-  about it:
-  - **Contradiction Engine** (module 14) audits modules 1-13 for
-    contradictions and can emit up to `CONTRADICTION_ENGINE_MAX_DIRECTIVES`
-    (2) `MODULE_RERUN: [Name] — reason` directives, each causing just that
-    one module to be re-executed in place with the contradiction appended as
-    context.
-  - **Metacognition** (module 15) reviews the run and can send modules 1-14
-    back for a full fresh pass, up to `METACOGNITION_MAX_RERUNS` (1) time, by
-    starting its output with `RERUN`; otherwise it starts with `PROCEED` and
-    the run continues to Integration (16) onward.
-  - Both are parsed with fail-safe-to-proceed semantics
-    (`parseModuleRerunDirectives`/`parseMetacognitionVerdict` in
-    `lib/mindChain.ts`): a 1-3B local model won't reliably emit exact
-    machine-parseable directives, so anything that doesn't clearly match the
-    expected format is treated as "no directive" rather than risking an
-    unbounded loop. There's also a hard backstop,
-    `MAX_TOTAL_MODULE_CALLS` (45), independent of those caps, in case
-    parsing or looping ever behaves unexpectedly.
-  - These caps started higher (3 / 4, matching the original design) but were
-    lowered after real-device crashes: a full rerun redoes ~15 module calls,
-    so the original worst case (~75 sequential calls in one browser tab) was
-    enough sustained WebGPU/WASM memory pressure to crash both the installed
-    PWA and the browser tab outright, especially on mobile. `runOneStage` in
-    `lib/useMindChain.ts` also calls the engine's `resetChat()` between every
-    module call — each call is an unrelated single-turn prompt, so there's no
-    reason to let internal conversation/KV-cache state accumulate across ~40
-    sequential generations in one session. The UI surfaces every triggered
-    rerun in a live log so none of this is a silent black box, but a run can
-    still take meaningfully longer than 22 model calls when reruns fire.
+- **A flat, bounded pass — exactly 22 model calls, no more**: `lib/useMindChain.ts`
+  runs the 22 modules straight through in order every time. An earlier
+  version let **Contradiction Engine** (14) and **Metacognition** (15)
+  actually redirect the run — targeted module reruns and full-pipeline
+  reruns, up to ~75 model calls worst case in one browser tab. That was
+  enough sustained WebGPU/WASM load to crash both the installed PWA and the
+  browser tab outright, on desktop and mobile, not just make it slow. Both
+  modules still run and still produce their real audit output (visible in
+  their own cards, informational only) — the app just no longer acts on it.
+  Two other things that came out of chasing the same crashes:
+  - `runOneStage` calls the engine's `resetChat()` after every module — each
+    call is an unrelated single-turn prompt, so there's no reason to let
+    internal conversation/KV-cache state accumulate across the run.
+  - Streaming token updates are batched to at most once per animation frame
+    (`scheduleTextUpdate` in `lib/useMindChain.ts`) instead of one React
+    re-render per token, and there's a small yield between module calls so
+    the browser gets a chance to breathe/GC instead of the whole run
+    monopolizing the main thread back-to-back.
   - **Integration** (16) is asked to report a IIT-style `PHI: 0.XX` estimate,
     parsed and shown as a Φ badge next to the final output — reported, not
     used to gate anything.
@@ -77,8 +64,8 @@ loads.
     control that clears it.
 - **UI**: `app/page.tsx` renders the 22 modules grouped into 7 phases
   (Sensing → Memory & Learning → Deliberation → Self → Audit & Control →
-  Integration → Expression), a live rerun-activity log, and a highlighted
-  final **Voice** card with the Φ estimate.
+  Integration → Expression), and a highlighted final **Voice** card with the
+  Φ estimate.
 - **PWA**: `public/manifest.webmanifest` + `public/sw.js` make it installable.
   The service worker only caches this app's own shell (HTML/CSS/JS/icons) —
   it never intercepts the cross-origin model-weight requests, which WebLLM

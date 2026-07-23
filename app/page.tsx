@@ -11,7 +11,6 @@ import { StimulusInput } from "@/components/StimulusInput";
 import { StageCard } from "@/components/StageCard";
 import { ConsciousOutput } from "@/components/ConsciousOutput";
 import { MemoryPanel } from "@/components/MemoryPanel";
-import { RerunLog } from "@/components/RerunLog";
 
 export default function Home() {
   const {
@@ -27,7 +26,6 @@ export default function Home() {
     episodes,
     identityNarrative,
     forgetEverything,
-    rerunEvents,
     phi,
   } = useMindChain();
 
@@ -72,9 +70,10 @@ export default function Home() {
         <p className="mt-1 text-sm text-neutral-400">
           A small language model, running entirely on your device, walks a stimulus through 22
           modules mapped to real brain-region equivalents — Perception through Voice — grounded
-          in Integrated Information Theory. No server, no API calls. Contradiction Engine and
-          Metacognition can send parts of the run back for a redo when something doesn't hold
-          together, and each session consolidates into a persisted identity and episodic memory.
+          in Integrated Information Theory. No server, no API calls. Every run is a single bounded
+          pass (Contradiction Engine and Metacognition still audit it, shown in their own cards,
+          but don't re-run anything — that keeps things stable on both desktop and mobile), and
+          each session consolidates into a persisted identity and episodic memory.
         </p>
       </header>
 
@@ -131,13 +130,6 @@ export default function Home() {
           onRun={run}
           onStop={stop}
         />
-        {isRunning && (
-          <p className="text-[11px] text-neutral-500">
-            Modules 1-15 can loop back on themselves if Contradiction Engine or Metacognition
-            flag something — this can take noticeably longer than a straight pass, especially on
-            small local models.
-          </p>
-        )}
       </section>
 
       {error && (
@@ -145,8 +137,6 @@ export default function Home() {
           {error}
         </div>
       )}
-
-      <RerunLog events={rerunEvents} />
 
       {finalStage && (finalStage.text || finalStage.status !== "pending") && (
         <ConsciousOutput text={finalStage.text} isRunning={finalStage.status === "running"} phi={phi} />

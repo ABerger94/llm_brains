@@ -5,17 +5,17 @@
  * focused call to the local LLM. A module only ever sees the original
  * stimulus plus the specific prior outputs it "depends on" (its `deps`) —
  * not the full transcript — so prompts stay short enough for a 1B-3B
- * model's context window. Two modules exert real control over the run:
+ * model's context window.
  *
- *  - Contradiction Engine (14) can flag up to 3 earlier modules (order < 14)
- *    for targeted re-execution via `MODULE_RERUN: [Name] — reason` lines.
- *  - Metacognition (15) can send the whole run (modules 1-14) back for a
- *    fresh pass, up to 4 times, by starting its output with `RERUN`.
- *
- * Both are parsed with fail-safe-to-proceed semantics: a small local model
- * won't reliably emit exact machine-parseable directives, so anything that
- * doesn't clearly match the expected format is treated as "no directive"
- * rather than risking an unbounded loop.
+ * Every run is a flat, bounded pass over all 22 modules in order — exactly
+ * 22 model calls, no more. An earlier version let Contradiction Engine (14)
+ * and Metacognition (15) actually re-execute earlier modules or the whole
+ * run when they flagged a problem, up to ~75 model calls worst case in one
+ * browser tab. That was enough sustained WebGPU/WASM load to crash both the
+ * installed PWA and the browser tab outright, on desktop and mobile. Both
+ * modules still run and still produce their real audit output, visible in
+ * their own cards — the app just no longer acts on it, trading away some
+ * self-correction depth for actually staying up.
  */
 
 export interface MindStageContext {
@@ -127,26 +127,20 @@ export const PHASES = [
   "Expression",
 ] as const;
 
-/** ids of modules 1-14 — what Contradiction Engine can target and what a Metacognition RERUN redoes. */
+/**
+ * ids of modules 1-13 — what Contradiction Engine names in its audit output.
+ * An earlier version let Contradiction Engine and Metacognition actually
+ * re-execute modules based on this (up to ~75 model calls worst case in one
+ * browser tab), which was enough sustained WebGPU/WASM load to crash both
+ * the installed PWA and the browser tab, on desktop and mobile. Both
+ * modules still run and still produce real audit output — the app just
+ * doesn't act on it anymore, so this run is a flat, bounded 22 calls.
+ */
 export const RERUNNABLE_MODULE_IDS = [
   "perception", "attention", "memory", "learning", "temporalAwareness",
   "planning", "reasoning", "emotion", "theoryOfMind", "beliefStore",
   "selfReflection", "identity", "socialCognition",
 ];
-
-// Lowered from the original spec (3 / 4) after real-device crashes: a full
-// pipeline rerun redoes ~15 module calls, so the original worst case (up to
-// ~75 sequential model calls in one browser tab with no cleanup between
-// them) was enough sustained WebGPU/WASM memory pressure to crash both the
-// PWA and the browser tab, especially on mobile. This trades away some of
-// the self-correction depth for actually staying alive.
-export const CONTRADICTION_ENGINE_MAX_DIRECTIVES = 2;
-export const METACOGNITION_MAX_RERUNS = 1;
-// Hard backstop independent of the caps above, in case parsing or looping
-// ever behaves unexpectedly — a run never makes more than this many total
-// module calls. Legitimate worst case under the caps above is 41 (2 passes
-// of up to 17 + 7 tail modules); this leaves a small margin above that.
-export const MAX_TOTAL_MODULE_CALLS = 45;
 
 const MIND_CHAIN_DEFS: MindStage[] = [
   {
@@ -339,7 +333,7 @@ const MIND_CHAIN_DEFS: MindStage[] = [
     order: 14,
     phase: "Audit & Control",
     title: "Contradiction Engine",
-    blurb: "Logical consistency auditor — can flag up to 3 earlier modules for targeted re-execution.",
+    blurb: "Logical consistency auditor. Its MODULE_RERUN suggestions are informational only in this build — not executed, to keep runs bounded and stable.",
     deps: ["perception", "memory", "reasoning", "emotion", "theoryOfMind", "beliefStore", "selfReflection", "identity", "socialCognition"],
     systemPrompt:
       "You are the Contradiction Engine — the mind's logical consistency auditor and granular rerun authority. Unlike Metacognition which triggers full pipeline reruns, you have the power to flag individual modules for targeted re-execution when their output is specifically compromised. Operate in three phases: 1. CROSS-MODULE AUDIT: Scan every module output for contradictions — between modules, within individual outputs, between current processing and stored beliefs, and between what this mind claims about itself versus what its processing reveals. 2. SEVERITY TRIAGE: For each contradiction found, assign: Severity 1-10, Scope (which specific modules are implicated), and a resolution path (what change in which module would resolve it). 3. GRANULAR RERUN DIRECTIVES: For any contradiction with severity >= 7 that is traceable to a specific module failure, issue a targeted rerun directive in this exact format: MODULE_RERUN: [ModuleName] — [reason]. You may issue up to 2 MODULE_RERUN directives per run, each on its own line, reserved for the most severe contradictions. These cause only that module to be re-executed with the contradiction context appended, NOT a full pipeline rerun. Also flag any contradictions that specifically threaten the coherence of the Integration (Phi) calculation — these are the most critical, since a mind whose modules contradict each other cannot achieve genuine integration. A mind that cannot see its own contradictions cannot achieve Phi.",
@@ -354,7 +348,7 @@ const MIND_CHAIN_DEFS: MindStage[] = [
     order: 15,
     phase: "Audit & Control",
     title: "Metacognition",
-    blurb: "Executive control network — can send the whole run back for a fresh pass, up to 4 times.",
+    blurb: "Executive control network. Its RERUN/PROCEED verdict is informational only in this build — not executed, to keep runs bounded and stable.",
     deps: ["contradictionEngine", "reasoning", "emotion", "identity", "selfReflection"],
     systemPrompt:
       "You are the Metacognition module — the executive control network and the mind's supervisor. Review the entire pipeline run so far with genuine critical distance. Ask the hardest questions: Has the most important thing been addressed? Is the reasoning actually good or just fluent? Are the contradictions real or manufactured? Is the emotional modeling honest? Is the identity narrative genuine or performed? If you determine the run needs to be redone, start your response with the single word RERUN followed by a precise explanation of what failed and what must be different in the next pass. If the processing meets genuine quality standards, start your response with the single word PROCEED followed by your honest assessment of what this run achieved. Do not pass mediocre processing forward.",
@@ -456,50 +450,6 @@ export const MIND_CHAIN: MindStage[] = MIND_CHAIN_DEFS.map((stage) => ({
 }));
 
 export const STAGE_LABELS = LABELS;
-
-export interface ModuleRerunDirective {
-  moduleId: string;
-  moduleTitle: string;
-  reason: string;
-}
-
-/** Parses up to CONTRADICTION_ENGINE_MAX_DIRECTIVES `MODULE_RERUN: [Name] — reason` lines. Unmatched/malformed lines are ignored (fail-safe). */
-export function parseModuleRerunDirectives(text: string): ModuleRerunDirective[] {
-  const candidates = MIND_CHAIN.filter((s) => RERUNNABLE_MODULE_IDS.includes(s.id));
-  const re = /MODULE_RERUN\s*:\s*\[?([^\]\n]+?)\]?\s*[—\-:]\s*(.+)/i;
-  const directives: ModuleRerunDirective[] = [];
-  const seen = new Set<string>();
-
-  for (const line of text.split("\n")) {
-    const m = line.match(re);
-    if (!m) continue;
-    const namePart = m[1].trim().toLowerCase();
-    const reason = m[2].trim();
-    const match = candidates.find((c) => {
-      const t = c.title.toLowerCase();
-      return t === namePart || namePart.includes(t) || t.includes(namePart);
-    });
-    if (match && !seen.has(match.id) && reason) {
-      seen.add(match.id);
-      directives.push({ moduleId: match.id, moduleTitle: match.title, reason });
-    }
-    if (directives.length >= CONTRADICTION_ENGINE_MAX_DIRECTIVES) break;
-  }
-  return directives;
-}
-
-export interface MetacognitionVerdict {
-  verdict: "RERUN" | "PROCEED";
-  detail: string;
-}
-
-/** Fail-safe: only an unambiguous leading "RERUN" triggers a rerun; anything else proceeds. */
-export function parseMetacognitionVerdict(text: string): MetacognitionVerdict {
-  const trimmed = text.trim();
-  const isRerun = /^RERUN\b/i.test(trimmed);
-  const detail = trimmed.replace(/^RERUN\b:?\s*/i, "").replace(/^PROCEED\b:?\s*/i, "");
-  return { verdict: isRerun ? "RERUN" : "PROCEED", detail };
-}
 
 /** Extracts the "PHI: 0.XX" value Integration is asked to report, clamped to [0, 1]. Returns null if absent/unparseable. */
 export function parsePhi(text: string): number | null {
