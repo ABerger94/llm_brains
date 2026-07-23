@@ -5,6 +5,7 @@ import type { InitProgressReport, MLCEngineInterface } from "@mlc-ai/web-llm";
 import {
   MIND_CHAIN,
   METACOGNITION_MAX_RERUNS,
+  MAX_TOTAL_MODULE_CALLS,
   sanitizeStageText,
   parseModuleRerunDirectives,
   parseMetacognitionVerdict,
@@ -114,7 +115,10 @@ export function useMindChain() {
       ...getTemporalSnapshot(),
     };
 
+    let totalCalls = 0;
+
     async function runOneStage(stage: MindStage, note?: string) {
+      totalCalls++;
       setStages((prev) => prev.map((s) => (s.id === stage.id ? { ...s, status: "running" } : s)));
 
       const deps: Record<string, string> = {};
@@ -135,6 +139,16 @@ export function useMindChain() {
       const text = sanitizeStageText(rawText);
       results[stage.id] = text;
       setStages((prev) => prev.map((s) => (s.id === stage.id ? { ...s, status: "done", text } : s)));
+
+      // Each module call is a fresh, unrelated single-turn prompt — clear the
+      // engine's internal conversation/KV state between calls rather than
+      // letting ~40 sequential generations accumulate in one browser tab.
+      try {
+        await engineRef.current!.resetChat();
+      } catch {
+        // non-fatal: not every backend/build supports this, and stability
+        // here matters more than the cleanup succeeding every time.
+      }
     }
 
     try {
@@ -150,7 +164,7 @@ export function useMindChain() {
         }
 
         for (const id of LOOP_MODULE_IDS) {
-          if (signal.aborted) break;
+          if (signal.aborted || totalCalls >= MAX_TOTAL_MODULE_CALLS) break;
           const stage = stageById.get(id)!;
           await runOneStage(stage, priorAttemptNote);
 
@@ -165,7 +179,7 @@ export function useMindChain() {
                 },
               ]);
               for (const d of directives) {
-                if (signal.aborted) break;
+                if (signal.aborted || totalCalls >= MAX_TOTAL_MODULE_CALLS) break;
                 await runOneStage(
                   stageById.get(d.moduleId)!,
                   `A consistency audit flagged this output: "${d.reason}". Revise it accordingly, more carefully this time.`,
@@ -175,7 +189,7 @@ export function useMindChain() {
           }
         }
 
-        if (signal.aborted) break;
+        if (signal.aborted || totalCalls >= MAX_TOTAL_MODULE_CALLS) break;
 
         const verdict = parseMetacognitionVerdict(results.metacognition ?? "");
         if (verdict.verdict === "RERUN" && metaRerunCount < METACOGNITION_MAX_RERUNS) {
@@ -192,7 +206,10 @@ export function useMindChain() {
 
       if (signal.aborted) return;
 
-      // Modules 16-22, run once.
+      // Modules 16-22, run once. Not gated by MAX_TOTAL_MODULE_CALLS: the
+      // safety valve is sized so these always fit even in the legitimate
+      // worst case, and skipping straight to Voice without ever speaking
+      // would be a worse failure than a few extra calls.
       for (const id of TAIL_MODULE_IDS) {
         if (signal.aborted) break;
         await runOneStage(stageById.get(id)!);

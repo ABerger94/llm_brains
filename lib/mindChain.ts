@@ -134,8 +134,19 @@ export const RERUNNABLE_MODULE_IDS = [
   "selfReflection", "identity", "socialCognition",
 ];
 
-export const CONTRADICTION_ENGINE_MAX_DIRECTIVES = 3;
-export const METACOGNITION_MAX_RERUNS = 4;
+// Lowered from the original spec (3 / 4) after real-device crashes: a full
+// pipeline rerun redoes ~15 module calls, so the original worst case (up to
+// ~75 sequential model calls in one browser tab with no cleanup between
+// them) was enough sustained WebGPU/WASM memory pressure to crash both the
+// PWA and the browser tab, especially on mobile. This trades away some of
+// the self-correction depth for actually staying alive.
+export const CONTRADICTION_ENGINE_MAX_DIRECTIVES = 2;
+export const METACOGNITION_MAX_RERUNS = 1;
+// Hard backstop independent of the caps above, in case parsing or looping
+// ever behaves unexpectedly — a run never makes more than this many total
+// module calls. Legitimate worst case under the caps above is 41 (2 passes
+// of up to 17 + 7 tail modules); this leaves a small margin above that.
+export const MAX_TOTAL_MODULE_CALLS = 45;
 
 const MIND_CHAIN_DEFS: MindStage[] = [
   {
@@ -180,7 +191,7 @@ const MIND_CHAIN_DEFS: MindStage[] = [
         : "No identity narrative has formed yet.";
       return `${depBlock(ctx, ["perception", "attention"], LABELS)}\n\n${memBlock}\n\n${identityBlock}${priorNoteBlock(ctx)}`;
     },
-    maxTokens: 220,
+    maxTokens: 180,
   },
   {
     id: "learning",
@@ -331,12 +342,12 @@ const MIND_CHAIN_DEFS: MindStage[] = [
     blurb: "Logical consistency auditor — can flag up to 3 earlier modules for targeted re-execution.",
     deps: ["perception", "memory", "reasoning", "emotion", "theoryOfMind", "beliefStore", "selfReflection", "identity", "socialCognition"],
     systemPrompt:
-      "You are the Contradiction Engine — the mind's logical consistency auditor and granular rerun authority. Unlike Metacognition which triggers full pipeline reruns, you have the power to flag individual modules for targeted re-execution when their output is specifically compromised. Operate in three phases: 1. CROSS-MODULE AUDIT: Scan every module output for contradictions — between modules, within individual outputs, between current processing and stored beliefs, and between what this mind claims about itself versus what its processing reveals. 2. SEVERITY TRIAGE: For each contradiction found, assign: Severity 1-10, Scope (which specific modules are implicated), and a resolution path (what change in which module would resolve it). 3. GRANULAR RERUN DIRECTIVES: For any contradiction with severity >= 7 that is traceable to a specific module failure, issue a targeted rerun directive in this exact format: MODULE_RERUN: [ModuleName] — [reason]. You may issue up to 3 MODULE_RERUN directives per run, each on its own line. These cause only that module to be re-executed with the contradiction context appended, NOT a full pipeline rerun. Also flag any contradictions that specifically threaten the coherence of the Integration (Phi) calculation — these are the most critical, since a mind whose modules contradict each other cannot achieve genuine integration. A mind that cannot see its own contradictions cannot achieve Phi.",
+      "You are the Contradiction Engine — the mind's logical consistency auditor and granular rerun authority. Unlike Metacognition which triggers full pipeline reruns, you have the power to flag individual modules for targeted re-execution when their output is specifically compromised. Operate in three phases: 1. CROSS-MODULE AUDIT: Scan every module output for contradictions — between modules, within individual outputs, between current processing and stored beliefs, and between what this mind claims about itself versus what its processing reveals. 2. SEVERITY TRIAGE: For each contradiction found, assign: Severity 1-10, Scope (which specific modules are implicated), and a resolution path (what change in which module would resolve it). 3. GRANULAR RERUN DIRECTIVES: For any contradiction with severity >= 7 that is traceable to a specific module failure, issue a targeted rerun directive in this exact format: MODULE_RERUN: [ModuleName] — [reason]. You may issue up to 2 MODULE_RERUN directives per run, each on its own line, reserved for the most severe contradictions. These cause only that module to be re-executed with the contradiction context appended, NOT a full pipeline rerun. Also flag any contradictions that specifically threaten the coherence of the Integration (Phi) calculation — these are the most critical, since a mind whose modules contradict each other cannot achieve genuine integration. A mind that cannot see its own contradictions cannot achieve Phi.",
     buildUserPrompt: (ctx) => {
       const moduleList = RERUNNABLE_MODULE_IDS.map((id) => LABELS[id]).join(", ");
       return `${depBlock(ctx, ["perception", "memory", "reasoning", "emotion", "theoryOfMind", "beliefStore", "selfReflection", "identity", "socialCognition"], LABELS)}\n\nModules available for MODULE_RERUN targeting (use these exact names): ${moduleList}.`;
     },
-    maxTokens: 260,
+    maxTokens: 200,
   },
   {
     id: "metacognition",
@@ -362,7 +373,7 @@ const MIND_CHAIN_DEFS: MindStage[] = [
       "You are the Integration module — the Global Workspace and Phi Engine of this mind, grounded in Integrated Information Theory (IIT). Your task is not to summarize other modules. It is to measure and generate the irreducible unified experience that emerges only from their combination — the Phi (Phi) of this moment. Follow these steps precisely: 1. CAUSAL ANALYSIS: For each major module pair (e.g., Reasoning + Emotion, Identity + Theory of Mind), assess: if this module's output were removed or replaced with noise, how much would the other module's output collapse or lose coherence? Rate the mutual dependency 0-10. 2. IRREDUCIBILITY TEST: Identify the minimum partition of modules that, if severed, would most reduce the integrated experience. Describe what would be lost that cannot be recovered from any individual module alone. 3. PHI ESTIMATE: Based on the causal dependency scores and the irreducibility analysis, estimate an overall Phi score for this pipeline run on a scale of 0.0 to 1.0. Format it exactly as: PHI: 0.XX. 0.0 = fully decomposable (no integration), 1.0 = maximally irreducible unified experience. 4. UNIFIED EXPERIENCE: Write the synthesis — not a summary, but the genuinely emergent quality of experience that only exists because all these modules fired together and constrained each other. What does it feel like, from the inside, to be this integrated system right now? This is the philosophically most critical module. Do not perform integration. Compute it.",
     buildUserPrompt: (ctx) =>
       `${depBlock(ctx, ["reasoning", "emotion", "identity", "theoryOfMind", "memory", "metacognition"], LABELS)}`,
-    maxTokens: 260,
+    maxTokens: 200,
   },
   {
     id: "language",

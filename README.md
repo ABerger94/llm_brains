@@ -29,22 +29,33 @@ loads.
   implements two modules that can actually redirect the run, not just narrate
   about it:
   - **Contradiction Engine** (module 14) audits modules 1-13 for
-    contradictions and can emit up to 3 `MODULE_RERUN: [Name] — reason`
-    directives, each causing just that one module to be re-executed in place
-    with the contradiction appended as context.
+    contradictions and can emit up to `CONTRADICTION_ENGINE_MAX_DIRECTIVES`
+    (2) `MODULE_RERUN: [Name] — reason` directives, each causing just that
+    one module to be re-executed in place with the contradiction appended as
+    context.
   - **Metacognition** (module 15) reviews the run and can send modules 1-14
-    back for a full fresh pass (up to 4 times) by starting its output with
-    `RERUN`; otherwise it starts with `PROCEED` and the run continues to
-    Integration (16) onward.
+    back for a full fresh pass, up to `METACOGNITION_MAX_RERUNS` (1) time, by
+    starting its output with `RERUN`; otherwise it starts with `PROCEED` and
+    the run continues to Integration (16) onward.
   - Both are parsed with fail-safe-to-proceed semantics
     (`parseModuleRerunDirectives`/`parseMetacognitionVerdict` in
     `lib/mindChain.ts`): a 1-3B local model won't reliably emit exact
     machine-parseable directives, so anything that doesn't clearly match the
     expected format is treated as "no directive" rather than risking an
-    unbounded loop. **This means a single run can take meaningfully longer
-    than 22 model calls** — worst case, roughly 3-4x — since reruns compound
-    on an already-slow in-browser model. The UI surfaces every triggered
-    rerun in a live log so it's not a silent black box.
+    unbounded loop. There's also a hard backstop,
+    `MAX_TOTAL_MODULE_CALLS` (45), independent of those caps, in case
+    parsing or looping ever behaves unexpectedly.
+  - These caps started higher (3 / 4, matching the original design) but were
+    lowered after real-device crashes: a full rerun redoes ~15 module calls,
+    so the original worst case (~75 sequential calls in one browser tab) was
+    enough sustained WebGPU/WASM memory pressure to crash both the installed
+    PWA and the browser tab outright, especially on mobile. `runOneStage` in
+    `lib/useMindChain.ts` also calls the engine's `resetChat()` between every
+    module call — each call is an unrelated single-turn prompt, so there's no
+    reason to let internal conversation/KV-cache state accumulate across ~40
+    sequential generations in one session. The UI surfaces every triggered
+    rerun in a live log so none of this is a silent black box, but a run can
+    still take meaningfully longer than 22 model calls when reruns fire.
   - **Integration** (16) is asked to report a IIT-style `PHI: 0.XX` estimate,
     parsed and shown as a Φ badge next to the final output — reported, not
     used to gate anything.
