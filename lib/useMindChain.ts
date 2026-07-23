@@ -2,7 +2,16 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { InitProgressReport, MLCEngineInterface } from "@mlc-ai/web-llm";
-import { MIND_CHAIN, sanitizeStageText, parsePhi, type MindStage } from "./mindChain";
+import {
+  MIND_CHAIN,
+  METACOGNITION_MAX_RERUNS,
+  MAX_TOTAL_MODULE_CALLS,
+  sanitizeStageText,
+  parseModuleRerunDirectives,
+  parseMetacognitionVerdict,
+  parsePhi,
+  type MindStage,
+} from "./mindChain";
 import { loadEngine, runStage, unloadEngine } from "./webllmEngine";
 import {
   addEpisode,
@@ -25,6 +34,11 @@ export interface StageState {
 
 export type EngineStatus = "idle" | "loading" | "ready" | "error";
 
+export interface RerunEvent {
+  type: "contradiction" | "metacognition";
+  detail: string;
+}
+
 function isDeviceLostError(e: unknown): boolean {
   const message = e instanceof Error ? e.message : String(e);
   return /device|context lost|gpu/i.test(message);
@@ -34,6 +48,12 @@ function isDeviceLostError(e: unknown): boolean {
 function yieldToBrowser(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
+
+const stageById = new Map(MIND_CHAIN.map((s) => [s.id, s]));
+// Modules 1-15 (Perception..Metacognition): the span Metacognition can send back for a fresh pass.
+const LOOP_MODULE_IDS = MIND_CHAIN.filter((s) => s.order <= 15).map((s) => s.id);
+// Modules 16-22 (Integration..Voice): run once, after the loop above settles on PROCEED.
+const TAIL_MODULE_IDS = MIND_CHAIN.filter((s) => s.order > 15).map((s) => s.id);
 
 export function useMindChain() {
   const [engineStatus, setEngineStatus] = useState<EngineStatus>("idle");
@@ -46,6 +66,7 @@ export function useMindChain() {
   const [error, setError] = useState<string | null>(null);
   const [episodes, setEpisodes] = useState<MemoryEpisode[]>([]);
   const [identityNarrative, setIdentityNarrativeState] = useState<string>("");
+  const [rerunEvents, setRerunEvents] = useState<RerunEvent[]>([]);
   const [phi, setPhi] = useState<number | null>(null);
 
   const engineRef = useRef<MLCEngineInterface | null>(null);
@@ -123,6 +144,7 @@ export function useMindChain() {
     setIsRunning(true);
     setError(null);
     resetStages();
+    setRerunEvents([]);
     setPhi(null);
     abortRef.current = new AbortController();
     const signal = abortRef.current.signal;
@@ -135,13 +157,16 @@ export function useMindChain() {
       ...getTemporalSnapshot(),
     };
 
-    async function runOneStage(stage: MindStage) {
+    let totalCalls = 0;
+
+    async function runOneStage(stage: MindStage, note?: string) {
+      totalCalls++;
       setStages((prev) => prev.map((s) => (s.id === stage.id ? { ...s, status: "running" } : s)));
 
       const deps: Record<string, string> = {};
       for (const depId of stage.deps) deps[depId] = results[depId] ?? "";
 
-      const userPrompt = stage.buildUserPrompt({ stimulus, deps, memory });
+      const userPrompt = stage.buildUserPrompt({ stimulus, deps, memory, priorAttemptNote: note });
 
       const rawText = await runStage(engineRef.current!, stage.systemPrompt, userPrompt, {
         signal,
@@ -156,7 +181,7 @@ export function useMindChain() {
 
       // Each module call is a fresh, unrelated single-turn prompt — clear the
       // engine's internal conversation/KV state between calls rather than
-      // letting 22 sequential generations accumulate in one browser tab.
+      // letting sequential generations accumulate in one browser tab.
       try {
         await engineRef.current!.resetChat();
       } catch {
@@ -167,27 +192,77 @@ export function useMindChain() {
     }
 
     try {
-      // A single straight-line pass over all 22 modules, in order. An
-      // earlier version let Contradiction Engine and Metacognition actually
-      // re-execute earlier modules (up to ~75 model calls worst case in one
-      // browser tab) — that was sustained enough WebGPU/WASM load to crash
-      // both the installed PWA and the browser tab outright, on desktop and
-      // mobile. Both modules still run and still produce their real audit
-      // output (visible in their own cards) — the app just no longer acts
-      // on it, trading some self-correction depth for actually staying up.
-      for (const stage of MIND_CHAIN) {
-        if (signal.aborted) break;
-        await runOneStage(stage);
+      let priorAttemptNote: string | undefined;
+      let metaRerunCount = 0;
+
+      // Modules 1-15, looping back to 1 whenever Metacognition says RERUN
+      // (capped at METACOGNITION_MAX_RERUNS, with a hard MAX_TOTAL_MODULE_CALLS
+      // backstop independent of that cap).
+      while (!signal.aborted) {
+        if (metaRerunCount > 0) {
+          setStages((prev) =>
+            prev.map((s) => (LOOP_MODULE_IDS.includes(s.id) ? { id: s.id, status: "pending", text: "" } : s)),
+          );
+        }
+
+        for (const id of LOOP_MODULE_IDS) {
+          if (signal.aborted || totalCalls >= MAX_TOTAL_MODULE_CALLS) break;
+          const stage = stageById.get(id)!;
+          await runOneStage(stage, priorAttemptNote);
+
+          if (id === "contradictionEngine") {
+            const directives = parseModuleRerunDirectives(results.contradictionEngine ?? "");
+            if (directives.length > 0) {
+              setRerunEvents((prev) => [
+                ...prev,
+                {
+                  type: "contradiction",
+                  detail: `Flagged for rerun: ${directives.map((d) => `${d.moduleTitle} — ${d.reason}`).join("; ")}`,
+                },
+              ]);
+              for (const d of directives) {
+                if (signal.aborted || totalCalls >= MAX_TOTAL_MODULE_CALLS) break;
+                await runOneStage(
+                  stageById.get(d.moduleId)!,
+                  `A consistency audit flagged this output: "${d.reason}". Revise it accordingly, more carefully this time.`,
+                );
+              }
+            }
+          }
+        }
+
+        if (signal.aborted || totalCalls >= MAX_TOTAL_MODULE_CALLS) break;
+
+        const verdict = parseMetacognitionVerdict(results.metacognition ?? "");
+        if (verdict.verdict === "RERUN" && metaRerunCount < METACOGNITION_MAX_RERUNS) {
+          metaRerunCount++;
+          priorAttemptNote = verdict.detail || "Metacognition determined this run needs to be redone.";
+          setRerunEvents((prev) => [
+            ...prev,
+            { type: "metacognition", detail: `Rerun ${metaRerunCount}/${METACOGNITION_MAX_RERUNS}: ${priorAttemptNote}` },
+          ]);
+          continue;
+        }
+        break;
       }
 
       if (signal.aborted) return;
+
+      // Modules 16-22, run once. Not gated by MAX_TOTAL_MODULE_CALLS: the
+      // safety valve is sized so these always fit even in the legitimate
+      // worst case, and skipping straight past Voice would be a worse
+      // failure than a few extra calls.
+      for (const id of TAIL_MODULE_IDS) {
+        if (signal.aborted) break;
+        await runOneStage(stageById.get(id)!);
+      }
 
       setPhi(parsePhi(results.integration ?? ""));
 
       // Consolidate: Identity's rewritten narrative becomes the persisted
       // identity, and this session becomes a new episode — so the next run
       // starts from a mind that actually remembers this one.
-      if (results.voice) {
+      if (!signal.aborted && results.voice) {
         if (results.identity) setIdentityNarrative(results.identity);
         addEpisode({
           timestamp: Date.now(),
@@ -232,6 +307,7 @@ export function useMindChain() {
     episodes,
     identityNarrative,
     forgetEverything,
+    rerunEvents,
     phi,
   };
 }
