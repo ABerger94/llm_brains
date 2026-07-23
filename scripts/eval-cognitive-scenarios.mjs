@@ -6,29 +6,25 @@ process.env.LLM_CHUNKED_MODULE_CALLS = 'off';
 import { runPipeline, formatSharedMemoryForModule } from '../server/pipeline.js';
 import { MODULES } from '../shared/pipelineModules.mjs';
 
+const INTEGRATION_DRAFT =
+  'ok\nINTEGRATION_JSON: {"salience":["s"],"conflicts":[],"openQuestions":[],"provisionalStance":"stance draft","integrationConfidence":0.6,"broadcastWinners":["w"],"phenomenalUnity":"partial","epistemicThreads":[{"thread":"t","kind":"user"}]}';
+
+const INTEGRATION_FINAL =
+  'ok\nINTEGRATION_JSON: {"salience":["s"],"conflicts":[],"openQuestions":[],"provisionalStance":"stance final","integrationConfidence":0.7,"broadcastWinners":["w"],"phenomenalUnity":"unified","epistemicThreads":[{"thread":"t","kind":"user"}]}';
+
 const STUB = {
-  Perception: 'structured perception ok',
-  Attention: '- salient point one about the user request',
-  Memory: 'memory context',
-  Learning: 'learning\nSURPRISE_ASSESSMENT: {"score":0.2,"note":"ok"}\nWORKING_MEMORY_PROMOTE: {"ids":[]}',
-  'Temporal Awareness': 'now',
-  Planning: 'plan\nUSER_STANCE_PREDICTION: {"expectUserWants":"answer","confidence":0.5}',
-  Reasoning: 'reasoning chain',
-  Emotion: 'neutral',
-  'Theory of Mind': 'user wants clarity',
-  'Belief Store':
+  SensorySalience: 'EXPLICIT\nSALIENT_1 what\n why',
+  ContextMemory:
+    'RETRIEVED\nSURPRISE_ASSESSMENT: {"score":0.2,"note":"ok"}\nWORKING_MEMORY_PROMOTE: {"ids":[]}',
+  Deliberation:
+    'GOAL\nUSER_STANCE_PREDICTION: {"expectUserWants":"answer","confidence":0.5}\nHYPOTHESES_JSON: {"hypotheses":[]}',
+  Beliefs:
     'beliefs ok\nBELIEF_REVISIONS: {"revisions":[]}\nEPISTEMIC_CLAIMS: {"claims":[{"text":"User asked X","kind":"user_attributed","confidence":0.9}]}',
-  'Self-Reflection': 'this reasoning is flawed in ways X',
-  Identity: 'SELF_MODEL_DELTA: {}\nself',
-  'Social Cognition': 'collaborative',
-  'Contradiction Engine': 'no severe contradictions',
-  Metacognition: 'PROCEED ok',
-  Integration:
-    'ok\nINTEGRATION_JSON: {"salience":["s"],"conflicts":[],"openQuestions":[],"provisionalStance":"ps","integrationConfidence":0.6,"epistemicThreads":[{"thread":"t","kind":"user"}]}',
-  Language: 'language draft',
-  Curiosity: 'q?',
-  'Goal Generation': 'goalar',
-  'Somatic Marker': 'calm',
+  SelfRelationTension: 'STRONG\nWEAK\nthis reasoning is flawed in ways X\nTENSIONS\nNONE',
+  Integration: INTEGRATION_DRAFT,
+  ExecutiveGate: 'PROCEED 0.9\n- ok',
+  IntegrationFinalize: INTEGRATION_FINAL,
+  Motivation: 'MAIN_QUESTION: q?\nURGENCY: 0.5\nTHREADS:\n- NONE\nGOAL_URGENCY: 0.5\nSOMATIC_MARKER: calm',
   Narrative: 'internal narrative',
   Voice: 'final voice line',
 };
@@ -42,7 +38,7 @@ async function callLLM(systemPrompt, userContent, options) {
     };
   }
   const mod = MODULES.find((m) => m.systemPrompt === systemPrompt);
-  const name = mod?.name || 'Perception';
+  const name = mod?.name || 'SensorySalience';
   const text = STUB[name] || `stub-${name}`;
   return { text, provider: 'stub', model: 'stub-model' };
 }
@@ -57,7 +53,7 @@ async function main() {
 
   const voiceJson = formatSharedMemoryForModule(sharedMemory, 'Voice');
   if (voiceJson.includes('this reasoning is flawed')) {
-    console.error('fail: Voice shared memory should redact Self-Reflection text');
+    console.error('fail: Voice shared memory should redact SelfRelationTension critic text');
     process.exit(1);
   }
   if (!voiceJson.includes('redacted for Voice')) {
@@ -66,26 +62,26 @@ async function main() {
   }
   const claims = sharedMemory.epistemicClaims || [];
   if (!claims.length || claims[0].kind !== 'user_attributed') {
-    console.error('fail: epistemicClaims not parsed from Belief Store');
+    console.error('fail: epistemicClaims not parsed from Beliefs');
     process.exit(1);
   }
   const gw = sharedMemory.globalWorkspace || {};
   if (!Array.isArray(gw.epistemicThreads) || !gw.epistemicThreads.length) {
-    console.error('fail: epistemicThreads missing from integration');
+    console.error('fail: epistemicThreads missing from integration finalize');
     process.exit(1);
   }
   if (!(sharedMemory.predictionHistory || []).length) {
-    console.error('fail: predictionHistory should record Planning output');
+    console.error('fail: predictionHistory should record Deliberation USER_STANCE_PREDICTION');
     process.exit(1);
   }
 
-  const rerunStub = { ...STUB, Metacognition: 'RERUN deeper pass' };
+  const rerunStub = { ...STUB, ExecutiveGate: 'RERUN 0.85 deeper pass\n- fix' };
   async function callLLMRerun(systemPrompt, userContent, options) {
     if (String(systemPrompt || '').includes('ingest one fragment')) {
       return { text: JSON.stringify({ chunkIndex: 0, bullets: ['stub-ingest'] }), provider: 'stub', model: 'stub' };
     }
     const mod = MODULES.find((m) => m.systemPrompt === systemPrompt);
-    const name = mod?.name || 'Perception';
+    const name = mod?.name || 'SensorySalience';
     const text = rerunStub[name] || `stub-${name}`;
     return { text, provider: 'stub', model: 'stub-model' };
   }
@@ -101,23 +97,23 @@ async function main() {
     );
     process.exit(1);
   }
-  if (!String(rerunResult.sharedMemory.moduleOutputs.Integration || '').trim()) {
-    console.error('fail: Integration must run when RERUN cap is 0 (forced proceed to Voice)');
+  if (!String(rerunResult.sharedMemory.moduleOutputs.IntegrationFinalize || '').trim()) {
+    console.error('fail: IntegrationFinalize must run when RERUN cap is 0 (forced proceed to Voice)');
     process.exit(1);
   }
   const capFlags = rerunResult.sharedMemory.metaCognitionFlags || [];
-  if (!capFlags.some((f) => f.supervisor === 'Metacognition' && f.capExceeded)) {
-    console.error('fail: Metacognition RERUN with max=0 should record capExceeded on metaCognitionFlags');
+  if (!capFlags.some((f) => f.supervisor === 'ExecutiveGate' && f.capExceeded)) {
+    console.error('fail: ExecutiveGate RERUN with max=0 should record capExceeded on metaCognitionFlags');
     process.exit(1);
   }
 
-  const perLegStub = { ...STUB, Metacognition: 'RERUN per-leg continuation test' };
+  const perLegStub = { ...STUB, ExecutiveGate: 'RERUN 0.7 per-leg continuation test\n- fix' };
   async function callLLMPerLeg(systemPrompt, userContent, options) {
     if (String(systemPrompt || '').includes('ingest one fragment')) {
       return { text: JSON.stringify({ chunkIndex: 0, bullets: ['stub-ingest'] }), provider: 'stub', model: 'stub' };
     }
     const mod = MODULES.find((m) => m.systemPrompt === systemPrompt);
-    const name = mod?.name || 'Perception';
+    const name = mod?.name || 'SensorySalience';
     const text = perLegStub[name] || `stub-${name}`;
     return { text, provider: 'stub', model: 'stub-model' };
   }
@@ -152,10 +148,21 @@ async function main() {
       preserveModuleTrace: false,
     },
   });
-  if (!leg2.continuationRequired) {
+  if (leg2.continuationRequired) {
     console.error(
-      'fail: leg2 continuation with max=1 must allow another RERUN (per-leg cap; expected continuationRequired)'
+      'fail: leg2 with max=1 after leg1 consumed the rerun must finish inline (cumulative cap across continuation POSTs)'
     );
+    process.exit(1);
+  }
+  const leg2CapExceeded = (leg2.sharedMemory.metaCognitionFlags || []).some(
+    (f) => f.supervisor === 'ExecutiveGate' && f.capExceeded
+  );
+  if (!leg2CapExceeded) {
+    console.error('fail: leg2 ExecutiveGate RERUN with exhausted cap should set capExceeded on metaCognitionFlags');
+    process.exit(1);
+  }
+  if (!String(leg2.sharedMemory.moduleOutputs?.Voice || '').trim()) {
+    console.error('fail: leg2 should reach Voice after forced PROCEED');
     process.exit(1);
   }
 

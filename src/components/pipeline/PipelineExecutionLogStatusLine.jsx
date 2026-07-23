@@ -22,7 +22,7 @@ export default function PipelineExecutionLogStatusLine({ runError, isRunning, ex
     return (
       <div
         className={cn(
-          'max-h-[min(50vh,28rem)] overflow-y-auto overflow-x-auto border-b border-destructive/30 bg-destructive/10 px-3 py-1.5 font-mono text-[11px] leading-snug text-destructive shadow-[0_1px_0_0_hsl(var(--border)/0.35)] [overflow-wrap:anywhere]',
+          'max-h-[min(50svh,28rem)] overflow-y-auto overflow-x-auto border-b border-destructive/30 bg-destructive/10 px-3 py-1.5 font-mono text-[11px] leading-snug text-destructive shadow-[0_1px_0_0_hsl(var(--border)/0.35)] [overflow-wrap:anywhere]',
           className
         )}
         role="status"

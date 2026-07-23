@@ -1,4 +1,4 @@
-# Tailscale + iPhone access to YourBrain (dev)
+# Tailscale + iPhone access to MetaSelf-CognitiveStack (dev)
 
 The app runs on your **PC** (`npm run dev` — Hugging Face–first, Vite on **5174**; **`npm run dev:local`** uses **3000**). The iPhone only opens the **Vite** URL; the Express API on the PC handles LLM calls.
 

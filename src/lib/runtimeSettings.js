@@ -1,4 +1,5 @@
 import { getKvSync, setKvSync } from './browserStorage';
+import { MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR } from './mindEntityContext';
 
 const STORAGE_KEY = 'mybrain_runtime_settings';
 
@@ -50,6 +51,201 @@ export function normalizeMindConstitutionUserModelFields(obj) {
   return obj;
 }
 
+/** Normalize System B (mirror) identity fields after merge — same shape as primary counterparts. */
+export function normalizePlaygroundMirrorIdentityFields(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const d = DEFAULT_RUNTIME_SETTINGS;
+  obj.mindConstitutionPlaygroundMirror =
+    obj.mindConstitutionPlaygroundMirror == null ? '' : String(obj.mindConstitutionPlaygroundMirror);
+  obj.mindDisplayNamePlaygroundMirror =
+    obj.mindDisplayNamePlaygroundMirror == null ? '' : String(obj.mindDisplayNamePlaygroundMirror);
+  obj.pinnedWorkingMemoryPlaygroundMirror = Array.isArray(obj.pinnedWorkingMemoryPlaygroundMirror)
+    ? [...obj.pinnedWorkingMemoryPlaygroundMirror]
+    : [...d.pinnedWorkingMemoryPlaygroundMirror];
+  obj.modulePromptOverridesPlaygroundMirror =
+    obj.modulePromptOverridesPlaygroundMirror && typeof obj.modulePromptOverridesPlaygroundMirror === 'object'
+      ? { ...obj.modulePromptOverridesPlaygroundMirror }
+      : { ...d.modulePromptOverridesPlaygroundMirror };
+  const umStored =
+    obj.userModelPlaygroundMirror && typeof obj.userModelPlaygroundMirror === 'object'
+      ? obj.userModelPlaygroundMirror
+      : {};
+  const um = { ...d.userModelPlaygroundMirror, ...umStored };
+  const USER_MODEL_TEXT_KEYS = [
+    'display_name',
+    'goals',
+    'expertise',
+    'emotional_state',
+    'communication_style',
+  ];
+  for (const k of USER_MODEL_TEXT_KEYS) {
+    const raw = um[k];
+    if (raw == null || !String(raw).trim()) {
+      um[k] = d.userModelPlaygroundMirror[k];
+    } else {
+      um[k] = String(raw);
+    }
+  }
+  um.version =
+    typeof umStored.version === 'number' && Number.isFinite(umStored.version)
+      ? umStored.version
+      : d.userModelPlaygroundMirror.version;
+  obj.userModelPlaygroundMirror = um;
+  if (typeof obj.playgroundMirrorIdentitySeededFromPrimary !== 'boolean') {
+    obj.playgroundMirrorIdentitySeededFromPrimary = false;
+  }
+  return obj;
+}
+
+/**
+ * Identity slice for pipeline POST options: primary mind vs System B mirror (constitution, user model, personality, etc.).
+ * Infrastructure fields (tokens, API keys, metacognition globals) stay on the full `rs` object — use those separately.
+ * @param {object} rs - merged runtime settings
+ * @param {string} [mindStorageProfile] - {@link MIND_STORAGE_PROFILE_PRIMARY} | {@link MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR}
+ */
+export function getPipelineIdentityRuntimeSlice(rs, mindStorageProfile) {
+  const r = rs && typeof rs === 'object' ? rs : DEFAULT_RUNTIME_SETTINGS;
+  const mirror = mindStorageProfile === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR;
+  return {
+    mindConstitution: mirror ? String(r.mindConstitutionPlaygroundMirror ?? '') : String(r.mindConstitution ?? ''),
+    userModel:
+      mirror && r.userModelPlaygroundMirror && typeof r.userModelPlaygroundMirror === 'object'
+        ? r.userModelPlaygroundMirror
+        : r.userModel && typeof r.userModel === 'object'
+          ? r.userModel
+          : { ...DEFAULT_RUNTIME_SETTINGS.userModel },
+    personalityProfile:
+      mirror && r.personalityProfilePlaygroundMirror && typeof r.personalityProfilePlaygroundMirror === 'object'
+        ? r.personalityProfilePlaygroundMirror
+        : r.personalityProfile && typeof r.personalityProfile === 'object'
+          ? r.personalityProfile
+          : { ...DEFAULT_RUNTIME_SETTINGS.personalityProfile },
+    mindDisplayName: mirror
+      ? String(r.mindDisplayNamePlaygroundMirror ?? '').trim()
+      : String(r.mindDisplayName ?? '').trim(),
+    pinnedWorkingMemory: mirror
+      ? Array.isArray(r.pinnedWorkingMemoryPlaygroundMirror)
+        ? r.pinnedWorkingMemoryPlaygroundMirror
+        : [...DEFAULT_RUNTIME_SETTINGS.pinnedWorkingMemoryPlaygroundMirror]
+      : Array.isArray(r.pinnedWorkingMemory)
+        ? r.pinnedWorkingMemory
+        : [...DEFAULT_RUNTIME_SETTINGS.pinnedWorkingMemory],
+    modulePromptOverrides:
+      mirror && r.modulePromptOverridesPlaygroundMirror && typeof r.modulePromptOverridesPlaygroundMirror === 'object'
+        ? r.modulePromptOverridesPlaygroundMirror
+        : r.modulePromptOverrides && typeof r.modulePromptOverrides === 'object'
+          ? r.modulePromptOverrides
+          : {},
+  };
+}
+
+/**
+ * Same identity slice as {@link getPipelineIdentityRuntimeSlice} — alias for settings UI and callers that speak in terms of
+ * “full runtime settings + profile” rather than pipeline prep only.
+ * @param {object} rs - merged runtime settings
+ * @param {string} mindStorageProfile - {@link MIND_STORAGE_PROFILE_PRIMARY} | {@link MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR}
+ */
+export function getRuntimeSettingsForMindProfile(rs, mindStorageProfile) {
+  return getPipelineIdentityRuntimeSlice(rs, mindStorageProfile);
+}
+
+/**
+ * Canonical nested snapshot of System B fields for `profiles.playgroundMirror` (dual-write with flat mirror keys).
+ * @param {object} rs - merged runtime settings
+ */
+export function buildPlaygroundMirrorProfileNested(rs) {
+  const r = rs && typeof rs === 'object' ? rs : DEFAULT_RUNTIME_SETTINGS;
+  return {
+    mindConstitution: String(r.mindConstitutionPlaygroundMirror ?? ''),
+    mindDisplayName: String(r.mindDisplayNamePlaygroundMirror ?? ''),
+    userModel:
+      r.userModelPlaygroundMirror && typeof r.userModelPlaygroundMirror === 'object'
+        ? { ...r.userModelPlaygroundMirror }
+        : { ...DEFAULT_RUNTIME_SETTINGS.userModelPlaygroundMirror },
+    personalityProfile:
+      r.personalityProfilePlaygroundMirror && typeof r.personalityProfilePlaygroundMirror === 'object'
+        ? { ...r.personalityProfilePlaygroundMirror }
+        : { ...DEFAULT_RUNTIME_SETTINGS.personalityProfilePlaygroundMirror },
+    pinnedWorkingMemory: Array.isArray(r.pinnedWorkingMemoryPlaygroundMirror)
+      ? [...r.pinnedWorkingMemoryPlaygroundMirror]
+      : [...DEFAULT_RUNTIME_SETTINGS.pinnedWorkingMemoryPlaygroundMirror],
+    modulePromptOverrides:
+      r.modulePromptOverridesPlaygroundMirror && typeof r.modulePromptOverridesPlaygroundMirror === 'object'
+        ? { ...r.modulePromptOverridesPlaygroundMirror }
+        : {},
+  };
+}
+
+/**
+ * Overlay flat mirror keys from a nested `profiles.playgroundMirror` object (nested wins on load).
+ * @param {object} merged - normalized settings (mutated)
+ * @param {object} nested
+ */
+export function applyPlaygroundMirrorProfileNestedToFlat(merged, nested) {
+  if (!merged || typeof merged !== 'object' || !nested || typeof nested !== 'object') return;
+  if (Object.prototype.hasOwnProperty.call(nested, 'mindConstitution')) {
+    merged.mindConstitutionPlaygroundMirror = String(nested.mindConstitution ?? '');
+  }
+  if (Object.prototype.hasOwnProperty.call(nested, 'mindDisplayName')) {
+    merged.mindDisplayNamePlaygroundMirror = String(nested.mindDisplayName ?? '');
+  }
+  if (nested.userModel && typeof nested.userModel === 'object') {
+    merged.userModelPlaygroundMirror = {
+      ...DEFAULT_RUNTIME_SETTINGS.userModelPlaygroundMirror,
+      ...nested.userModel,
+    };
+  }
+  if (nested.personalityProfile && typeof nested.personalityProfile === 'object') {
+    merged.personalityProfilePlaygroundMirror = {
+      ...DEFAULT_RUNTIME_SETTINGS.personalityProfilePlaygroundMirror,
+      ...nested.personalityProfile,
+    };
+  }
+  if (Object.prototype.hasOwnProperty.call(nested, 'pinnedWorkingMemory')) {
+    merged.pinnedWorkingMemoryPlaygroundMirror = Array.isArray(nested.pinnedWorkingMemory)
+      ? [...nested.pinnedWorkingMemory]
+      : [...DEFAULT_RUNTIME_SETTINGS.pinnedWorkingMemoryPlaygroundMirror];
+  }
+  if (nested.modulePromptOverrides && typeof nested.modulePromptOverrides === 'object') {
+    merged.modulePromptOverridesPlaygroundMirror = { ...nested.modulePromptOverrides };
+  }
+}
+
+/**
+ * One-time: copy primary non–user-model identity into mirror keys so upgrades are not blank; mirror user model stays blank unless edited.
+ * @param {object} merged - normalized settings object (mutated)
+ * @param {boolean} [persist] - default true when called from getRuntimeSettings after load
+ */
+export function maybeSeedPlaygroundMirrorIdentityFromPrimary(merged, persist = true) {
+  if (!merged || typeof merged !== 'object') return merged;
+  if (merged.playgroundMirrorIdentitySeededFromPrimary === true) return merged;
+  const d = DEFAULT_RUNTIME_SETTINGS;
+  merged.mindConstitutionPlaygroundMirror = String(merged.mindConstitution ?? '');
+  merged.mindDisplayNamePlaygroundMirror = String(merged.mindDisplayName ?? '');
+  merged.pinnedWorkingMemoryPlaygroundMirror = Array.isArray(merged.pinnedWorkingMemory)
+    ? [...merged.pinnedWorkingMemory]
+    : [...d.pinnedWorkingMemoryPlaygroundMirror];
+  merged.modulePromptOverridesPlaygroundMirror =
+    merged.modulePromptOverrides && typeof merged.modulePromptOverrides === 'object'
+      ? { ...merged.modulePromptOverrides }
+      : {};
+  merged.userModelPlaygroundMirror = { ...d.userModelPlaygroundMirror };
+  merged.playgroundMirrorIdentitySeededFromPrimary = true;
+  normalizePlaygroundMirrorIdentityFields(merged);
+  if (persist && typeof window !== 'undefined') {
+    try {
+      merged.profiles = {
+        ...(typeof merged.profiles === 'object' && merged.profiles ? merged.profiles : {}),
+        playgroundMirror: buildPlaygroundMirrorProfileNested(merged),
+      };
+      setKvSync(STORAGE_KEY, JSON.stringify(merged));
+    } catch (e) {
+      console.warn('[runtimeSettings] mirror identity seed persist failed', e);
+    }
+  }
+  return merged;
+}
+
 export const DEFAULT_RUNTIME_SETTINGS = {
   /** Display-only name for the LM you use locally (LM Studio / API model is configured outside this app). */
   preferredModelLabel:
@@ -63,6 +259,12 @@ export const DEFAULT_RUNTIME_SETTINGS = {
   pipelineDelayMs: 500,
   /** Per-module completion cap (server clamps to context). Default 800 keeps typical 4k–8k n_ctx locals stable; raise for larger models. */
   pipelineMaxTokens: 800,
+  /** `unified` = one early LLM for layers 1–4 (default). `classic` = separate module per step. */
+  pipelineProfile: 'unified',
+  /** `default` | `aggressive` | `off` — server may skip/trim (e.g. self-relation) when `aggressive`. */
+  pipelineGating: 'default',
+  /** Parallel stance/belief similarity at Integration_finalize (server). */
+  forkJoinWave: false,
   /** When true, focus/drift/sleep may persist voice/narrative into long-term memory per phase rules (wake still logs a timeline event). */
   autoSaveMemories: true,
   /** Always on: after each saved pipeline run the app merges structured beliefs from recent outputs (see mindPersistence). */
@@ -80,6 +282,17 @@ export const DEFAULT_RUNTIME_SETTINGS = {
     relationalStance: null,
     systemTreatmentNotes: '',
     /** When true, an empty facet list stays empty (reset / user cleared traits). */
+    suppressBundledPersonalityDefaults: false,
+  },
+  /**
+   * System B (playground mirror) personality facets — persisted in the same KV blob; not injected into the default pipeline
+   * unless explicitly wired later. Edited on /personality/mirror.
+   */
+  personalityProfilePlaygroundMirror: {
+    version: 1,
+    facets: BUNDLED_DEFAULT_PERSONALITY_FACETS.map((f) => ({ ...f })),
+    relationalStance: null,
+    systemTreatmentNotes: '',
     suppressBundledPersonalityDefaults: false,
   },
   /** Working profile of the human user: fed to Theory of Mind, USER_MODEL_JSON, and refined by USER_MODEL_DELTA from runs. */
@@ -100,11 +313,42 @@ export const DEFAULT_RUNTIME_SETTINGS = {
   modulePromptOverrides: {},
   /** Lines seeded into WORKING_MEMORY_SLOTS at the start of each pipeline run (volatile; not long-term memory). */
   pinnedWorkingMemory: [],
+  /** System B: binding principles (separate from primary {@link mindConstitution}). */
+  mindConstitutionPlaygroundMirror: '',
+  /** System B: display label for the mirror mind in pipeline prompts. */
+  mindDisplayNamePlaygroundMirror: '',
   /**
-   * Max counted supervisor rework legs (Metacognition / Workspace Metacognition) before Voice is required (server clamps 0–20).
+   * System B: Theory of Mind / USER_MODEL_JSON — separate from {@link userModel}.
+   * Defaults are blank so the mirror leg starts without copying the primary profile; fill in Settings or via USER_MODEL_DELTA.
+   * One-time seed from primary (constitution, WM, etc.): {@link playgroundMirrorIdentitySeededFromPrimary}.
+   */
+  userModelPlaygroundMirror: {
+    display_name: '',
+    goals: '',
+    expertise: '',
+    emotional_state: '',
+    communication_style: '',
+    version: 0,
+  },
+  /** System B: working-memory seed lines. */
+  pinnedWorkingMemoryPlaygroundMirror: [],
+  /** System B: per-module prompt overrides. */
+  modulePromptOverridesPlaygroundMirror: {},
+  /** True after mirror identity was seeded from primary or defaults were committed for new installs. */
+  playgroundMirrorIdentitySeededFromPrimary: false,
+  /**
+   * Nested mirror profile (dual-write with flat `*PlaygroundMirror` keys). Load applies nested over flat when present
+   * ({@link applyPlaygroundMirrorProfileNestedToFlat}); save refreshes nested from flat ({@link buildPlaygroundMirrorProfileNested}).
+   */
+  profiles: {
+    playgroundMirror: null,
+  },
+  /**
+   * Max counted supervisor rework legs (Metacognition / Workspace Metacognition) for one user message/run, cumulative across
+   * chained SSE legs and scheduled continuations (server clamps 0–20).
    * At 0 or when exhausted, explicit RERUN no longer defers or splits legs — the pipeline proceeds toward Voice in the same leg.
    */
-  maxMetacognitionReruns: 0,
+  maxMetacognitionReruns: 2,
   /**
    * Minutes to wait before running a deferred supervisor RERUN (browser ScheduledTask in IndexedDB).
    * Default 3: supervisor continuation runs after a short cooldown instead of immediate chained SSE legs.
@@ -123,22 +367,38 @@ export const DEFAULT_RUNTIME_SETTINGS = {
    * and prompts treat GLOBAL_WORKSPACE_JSON as the primary broadcast. Off by default to avoid dropping nuance on dense turns.
    */
   strictGlobalWorkspaceBroadcast: false,
+  /** @deprecated Ignored — belief/world updates always persist directly (no inbox). */
+  stagedMindUpdatesMode: 'off',
+  /** Minutes to wait before auto-queued consolidation_pass when META_ACTIONS sets requestBackgroundConsolidation. */
+  metaBackgroundConsolidationDelayMinutes: 15,
+  /**
+   * Max due scheduled tasks started per scheduler tick (catch-up on reopen). Lower reduces burst load when many tasks are overdue.
+   */
+  schedulerCatchUpMaxDuePerTick: 6,
   /** When true, completing a pipeline that sets followupHints.beliefTensionReview queues a one-shot belief_tension_review task. */
   autoQueueBeliefTensionReview: false,
   autoQueueBeliefTensionReviewDelayMinutes: 3,
+  /** Playground auto-continue: automatically start the next dual block after the current one finishes. */
+  playgroundAutoContinue: false,
+  /** Seconds to wait between auto-continued blocks (1-60). */
+  playgroundAutoContinueDelaySeconds: 5,
+  /** Max blocks before auto-continue stops (1-100). */
+  playgroundAutoContinueMaxBlocks: 10,
+  /** Turns per dual-chat block (1-20). */
+  playgroundTurnsPerBlock: 5,
   /** When true, curiosity_generation enqueues a one-shot curiosity_pursuit after a short delay. */
-  autoQueueCuriosityPursuitAfterGeneration: false,
-  autoQueueCuriosityPursuitDelayMinutes: 2,
+  autoQueueCuriosityPursuitAfterGeneration: true,
+  autoQueueCuriosityPursuitDelayMinutes: 1,
   /** Scheduled curiosity_pursuit uses full graph pipeline instead of a single LLM call (higher cost). */
   curiosityPursuitUseGraphPipeline: false,
   /** Max completed curiosity_pursuit scheduled tasks per local calendar day (0 = no limit). */
-  curiosityPursuitMaxPerDay: 12,
+  curiosityPursuitMaxPerDay: 30,
   /** On-demand deep curiosity: max graph runs per Pursue click (including the first). */
-  curiosityDeepPursuitMaxRunsPerAction: 3,
+  curiosityDeepPursuitMaxRunsPerAction: 5,
   /** Do not auto-chain pursuits at or beyond this depth (root = 0). */
-  curiosityDeepPursuitMaxDepth: 4,
+  curiosityDeepPursuitMaxDepth: 6,
   /** Default delay before a single scheduled curiosity pursuit (minutes). */
-  curiositySchedulePursuitDelayMinutes: 15,
+  curiositySchedulePursuitDelayMinutes: 5,
   /** Stagger between cluster scheduled pursuits (minutes). */
   curiosityClusterScheduleStaggerMinutes: 30,
   /** When a blocking pipeline is active, defer due curiosity_pursuit by this many minutes. */
@@ -146,7 +406,7 @@ export const DEFAULT_RUNTIME_SETTINGS = {
   /** Scheduled goal_pursuit uses full graph pipeline instead of a single LLM call (higher cost). */
   goalPursuitUseGraphPipeline: false,
   /** Max completed goal_pursuit scheduled tasks per local calendar day (0 = no limit). */
-  goalPursuitMaxPerDay: 8,
+  goalPursuitMaxPerDay: 20,
   /** On-demand deep goal: max graph runs per Pursue click (including the first). */
   goalDeepPursuitMaxRunsPerAction: 3,
   /** Do not auto-chain goal pursuits at or beyond this depth (root = 0). */
@@ -157,7 +417,7 @@ export const DEFAULT_RUNTIME_SETTINGS = {
   goalClusterScheduleStaggerMinutes: 35,
   /** When a blocking pipeline is active, defer due goal_pursuit by this many minutes. */
   goalPursuitDeferWhenBusyMinutes: 10,
-  /** When the API recovers, silently resume interrupted graph/stream if gates pass. */
+  /** API recovery + interrupted reload: try persisted checkpoints, then reconnect replay (see reconnectRecovery). */
   autoResumeGraphPipelineOnReconnect: true,
   /** Rolling window for silent graph reconnect resumes (anti-loop). */
   graphPipelineReconnectResumeCooldownMs: 600_000,
@@ -176,6 +436,23 @@ export const DEFAULT_RUNTIME_SETTINGS = {
   schedulerAutoRetryBaseDelayMinutes: 5,
   /** Max single backoff delay in minutes. */
   schedulerAutoRetryMaxDelayMinutes: 60,
+  /**
+   * If a scheduled task stays `running` longer than this without finishing, the runner treats it as stale
+   * (crashed tab or hung pipeline) and marks it failed or auto-requeues. Long graph runs can exceed 20 minutes;
+   * default 120 minutes. Clamped 5–1440 in {@link resolveStaleRunningScheduledTaskMs}.
+   */
+  staleRunningScheduledTaskMinutes: 120,
+  /**
+   * While a scheduled task is `running`, bump `scheduler_last_progress_at` on the row this often so
+   * {@link recoverStaleRunningScheduledTasks} uses liveness vs `run_started_at` only. 0 disables heartbeats.
+   */
+  schedulerHeartbeatIntervalMs: 300_000,
+  /**
+   * Max automatic due-task runs at once (each increment is one pipeline or scheduled job in flight from the tick loop).
+   * Persisted 0 or invalid values are treated as this default (see {@link resolveSchedulerMaxConcurrentRunningTasks}). Clamp 1–32 when saving.
+   */
+  schedulerMaxConcurrentBackgroundRuns: 2,
+  schedulerMaxConcurrentRunningTasks: 4,
 };
 
 /**
@@ -240,6 +517,8 @@ export function getRuntimeSettings() {
         },
       };
       normalizeMindConstitutionUserModelFields(out);
+      normalizePlaygroundMirrorIdentityFields(out);
+      out.playgroundMirrorIdentitySeededFromPrimary = true;
       return out;
     }
 
@@ -263,6 +542,27 @@ export function getRuntimeSettings() {
           ? merged.personalityProfile.facets.map((f) => (f && typeof f === 'object' ? { ...f } : f))
           : [],
         suppressBundledPersonalityDefaults: suppressBundled,
+      };
+    }
+
+    if (!merged.personalityProfilePlaygroundMirror || typeof merged.personalityProfilePlaygroundMirror !== 'object') {
+      merged.personalityProfilePlaygroundMirror = {
+        version: DEFAULT_RUNTIME_SETTINGS.personalityProfilePlaygroundMirror.version,
+        facets: BUNDLED_DEFAULT_PERSONALITY_FACETS.map((f) => ({ ...f })),
+        relationalStance: null,
+        systemTreatmentNotes: '',
+        suppressBundledPersonalityDefaults: false,
+      };
+    } else {
+      const suppressBundledPm =
+        merged.personalityProfilePlaygroundMirror.suppressBundledPersonalityDefaults === true;
+      merged.personalityProfilePlaygroundMirror = {
+        ...DEFAULT_RUNTIME_SETTINGS.personalityProfilePlaygroundMirror,
+        ...merged.personalityProfilePlaygroundMirror,
+        facets: Array.isArray(merged.personalityProfilePlaygroundMirror.facets)
+          ? merged.personalityProfilePlaygroundMirror.facets.map((f) => (f && typeof f === 'object' ? { ...f } : f))
+          : [],
+        suppressBundledPersonalityDefaults: suppressBundledPm,
       };
     }
 
@@ -379,6 +679,28 @@ export function getRuntimeSettings() {
         Math.floor(Number(parsed.schedulerAutoRetryMaxDelayMinutes))
       );
     }
+    if (Number.isFinite(Number(parsed.staleRunningScheduledTaskMinutes))) {
+      merged.staleRunningScheduledTaskMinutes = Math.max(
+        5,
+        Math.min(1440, Math.floor(Number(parsed.staleRunningScheduledTaskMinutes)))
+      );
+    } else if (Number.isFinite(Number(parsed.staleRunningScheduledTaskMs))) {
+      merged.staleRunningScheduledTaskMinutes = Math.max(
+        5,
+        Math.min(1440, Math.floor(Number(parsed.staleRunningScheduledTaskMs) / 60_000))
+      );
+    }
+    if (Number.isFinite(Number(parsed.schedulerHeartbeatIntervalMs))) {
+      merged.schedulerHeartbeatIntervalMs = Math.max(
+        0,
+        Math.min(3_600_000, Math.floor(Number(parsed.schedulerHeartbeatIntervalMs)))
+      );
+    }
+    if (Number.isFinite(Number(parsed.schedulerMaxConcurrentRunningTasks))) {
+      const c = Math.floor(Number(parsed.schedulerMaxConcurrentRunningTasks));
+      merged.schedulerMaxConcurrentRunningTasks =
+        c <= 0 ? DEFAULT_RUNTIME_SETTINGS.schedulerMaxConcurrentRunningTasks : Math.min(32, c);
+    }
     if (Number.isFinite(Number(parsed.metacognitionRerunDelayMinutes))) {
       merged.metacognitionRerunDelayMinutes = normalizeMetacognitionRerunDelayMinutesValue(
         parsed.metacognitionRerunDelayMinutes
@@ -401,7 +723,17 @@ export function getRuntimeSettings() {
     delete merged.schedulerAutoRetryMax;
     delete merged.staleRunningScheduledTaskMs;
 
+    merged.profiles = {
+      playgroundMirror: null,
+      ...(typeof merged.profiles === 'object' && merged.profiles ? merged.profiles : {}),
+    };
+    if (merged.profiles.playgroundMirror && typeof merged.profiles.playgroundMirror === 'object') {
+      applyPlaygroundMirrorProfileNestedToFlat(merged, merged.profiles.playgroundMirror);
+    }
+
     normalizeMindConstitutionUserModelFields(merged);
+    normalizePlaygroundMirrorIdentityFields(merged);
+    maybeSeedPlaygroundMirrorIdentityFromPrimary(merged);
     return merged;
   } catch (error) {
     console.error('Failed to load runtime settings:', error);
@@ -416,6 +748,8 @@ export function getRuntimeSettings() {
       },
     };
     normalizeMindConstitutionUserModelFields(out);
+    normalizePlaygroundMirrorIdentityFields(out);
+    out.playgroundMirrorIdentitySeededFromPrimary = true;
     return out;
   }
 }
@@ -431,7 +765,29 @@ export function saveRuntimeSettings(nextSettings) {
   merged.metacognitionRerunDelayMinutes = normalizeMetacognitionRerunDelayMinutesValue(
     merged.metacognitionRerunDelayMinutes
   );
+  if (Number.isFinite(Number(merged.staleRunningScheduledTaskMinutes))) {
+    merged.staleRunningScheduledTaskMinutes = Math.max(
+      5,
+      Math.min(1440, Math.floor(Number(merged.staleRunningScheduledTaskMinutes)))
+    );
+  }
+  if (Number.isFinite(Number(merged.schedulerHeartbeatIntervalMs))) {
+    merged.schedulerHeartbeatIntervalMs = Math.max(
+      0,
+      Math.min(3_600_000, Math.floor(Number(merged.schedulerHeartbeatIntervalMs)))
+    );
+  }
+  if (Number.isFinite(Number(merged.schedulerMaxConcurrentRunningTasks))) {
+    const c = Math.floor(Number(merged.schedulerMaxConcurrentRunningTasks));
+    merged.schedulerMaxConcurrentRunningTasks =
+      c <= 0 ? DEFAULT_RUNTIME_SETTINGS.schedulerMaxConcurrentRunningTasks : Math.min(32, c);
+  }
   normalizeMindConstitutionUserModelFields(merged);
+  normalizePlaygroundMirrorIdentityFields(merged);
+  merged.profiles = {
+    ...(typeof merged.profiles === 'object' && merged.profiles ? merged.profiles : {}),
+    playgroundMirror: buildPlaygroundMirrorProfileNested(merged),
+  };
   setKvSync(STORAGE_KEY, JSON.stringify(merged));
   return merged;
 }
@@ -443,7 +799,7 @@ export function runtimeSettingsForPersistence(rt) {
   return o;
 }
 
-/** Resolved max supervisor reruns before Voice for pipeline POST options (0–20). */
+/** Resolved max supervisor reruns per user message/run for pipeline POST options (0–20; cumulative across continuation legs). */
 export function resolveMaxMetacognitionReruns(rt) {
   const source = rt && typeof rt === 'object' ? rt : getRuntimeSettings();
   const n = Number(source.maxMetacognitionReruns);
@@ -495,4 +851,49 @@ export function resolveMetacognitionRerunDelayMinutesFromSnapshot(snapshot, rt) 
     }
   }
   return resolveMetacognitionRerunDelayMinutes(rtSettings);
+}
+
+/**
+ * Max wall time without completion (or without a heartbeat bump while `running`) before the scheduled-task
+ * runner treats a task as stale. See {@link DEFAULT_RUNTIME_SETTINGS.staleRunningScheduledTaskMinutes}.
+ * @param {object} [rt]
+ * @returns {number} milliseconds
+ */
+export function resolveStaleRunningScheduledTaskMs(rt) {
+  const source = rt && typeof rt === 'object' ? rt : getRuntimeSettings();
+  const min = Number(source.staleRunningScheduledTaskMinutes);
+  const clamped = Number.isFinite(min)
+    ? Math.max(5, Math.min(1440, Math.floor(min)))
+    : Math.max(
+        5,
+        Math.min(1440, Math.floor(Number(DEFAULT_RUNTIME_SETTINGS.staleRunningScheduledTaskMinutes) || 120))
+      );
+  return clamped * 60_000;
+}
+
+/**
+ * Interval for updating `scheduler_last_progress_at` on running tasks; 0 disables.
+ * @param {object} [rt]
+ * @returns {number} milliseconds, or 0
+ */
+export function resolveSchedulerHeartbeatIntervalMs(rt) {
+  const source = rt && typeof rt === 'object' ? rt : getRuntimeSettings();
+  const n = Number(source.schedulerHeartbeatIntervalMs);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.max(30_000, Math.min(3_600_000, Math.floor(n)));
+}
+
+/**
+ * Max concurrent automatic due-task runs from the scheduler tick.
+ * Non-positive stored values resolve to the default (3) so overdue backlogs cannot spawn unlimited parallel runs.
+ * @param {object} [rt]
+ * @returns {number} integer in [1, 32]
+ */
+export function resolveSchedulerMaxConcurrentRunningTasks(rt) {
+  const source = rt && typeof rt === 'object' ? rt : getRuntimeSettings();
+  const n = Number(source.schedulerMaxConcurrentRunningTasks);
+  if (!Number.isFinite(n)) return DEFAULT_RUNTIME_SETTINGS.schedulerMaxConcurrentRunningTasks;
+  const floored = Math.floor(n);
+  if (floored <= 0) return DEFAULT_RUNTIME_SETTINGS.schedulerMaxConcurrentRunningTasks;
+  return Math.min(32, floored);
 }

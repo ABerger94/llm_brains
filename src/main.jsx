@@ -1,16 +1,36 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';
+import App from './App.jsx';
 import { flushKvWrites, openAndMigrateBrowserStorage } from './lib/browserStorage';
 
-async function boot() {
-  try {
-    await openAndMigrateBrowserStorage();
-  } catch (e) {
-    console.error('IndexedDB bootstrap failed:', e);
-  }
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then((regs) => {
+    for (const r of regs) r.unregister();
+  });
+}
 
-  const { default: App } = await import('./App.jsx');
+const STORAGE_BOOT_TIMEOUT_MS = 5000;
+
+async function boot() {
+  const storageBoot = openAndMigrateBrowserStorage().catch((e) => {
+    console.error('IndexedDB bootstrap failed:', e);
+  });
+  await Promise.race([
+    storageBoot,
+    new Promise((resolve) => setTimeout(resolve, STORAGE_BOOT_TIMEOUT_MS)),
+  ]);
+  try {
+    await storageBoot;
+  } catch {
+    /* logged above */
+  }
+  try {
+    const { rehydrateLocalMindUiAfterKvBoot } = await import('./lib/rehydrateLocalMindUiAfterKvBoot.js');
+    await rehydrateLocalMindUiAfterKvBoot();
+  } catch (e) {
+    console.warn('Local UI rehydrate after KV boot failed:', e);
+  }
 
   window.addEventListener('pagehide', () => {
     void flushKvWrites();
@@ -22,7 +42,6 @@ async function boot() {
     </React.StrictMode>
   );
 
-  // Defer priority backfill until after first paint to avoid jank on cold start.
   const schedule = typeof requestIdleCallback === 'function' ? requestIdleCallback : (fn) => setTimeout(fn, 200);
   schedule(async () => {
     try {
@@ -30,6 +49,12 @@ async function boot() {
       await runPriorityQueueBackfillOnce();
     } catch (e) {
       console.warn('Priority queue backfill skipped:', e);
+    }
+    try {
+      const { promoteAllPendingMindUpdates } = await import('./lib/pendingMindUpdates.js');
+      await promoteAllPendingMindUpdates();
+    } catch (e) {
+      console.warn('Legacy pending mind updates flush skipped:', e);
     }
   });
 }

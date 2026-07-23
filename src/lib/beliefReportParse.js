@@ -1,7 +1,10 @@
 /**
  * Parse Belief Store module dumps (BELIEF_UPDATE_REPORT, numbered Reasoning lines, BELIEF: | …)
- * into atomic { statement, confidence, reasoning } for storage and display.
+ * into atomic { statement, confidence, reasoning?, category? } for storage and display.
  */
+
+import { normalizeBeliefMapCategory } from '../../shared/beliefMapCategory.mjs';
+import { clipTextComplete } from '../../shared/textClip.mjs';
 
 const PIPELINE_DIGEST_PREFIX = '[Pipeline belief digest] ';
 const EPISTEMIC_CLAIM_PREFIX = '[Epistemic claim] ';
@@ -12,11 +15,30 @@ const JUNK_CUT_RE = [
   /\{\s*"revisions"\s*:/,
 ];
 
+const JUNK_STATEMENT_RE = /^\*{0,3}\s*(belief\s*store\s*update|updated?\s*beliefs?|new\s*beliefs?|belief\s*summary|belief\s*revision|section\s*\d+|summary|overview)\s*\*{0,3}$/i;
+
+/**
+ * True when `s` is a section header / markdown decoration rather than an actual belief.
+ * Strips markdown bold/italic/heading markers before testing.
+ */
+export function isJunkBeliefStatement(s) {
+  const t = String(s || '')
+    .replace(/^#+\s*/, '')
+    .replace(/\*+/g, '')
+    .replace(/^[-–—•]\s*/, '')
+    .trim();
+  if (!t || t.length < 8) return true;
+  if (JUNK_STATEMENT_RE.test(t)) return true;
+  if (/^belief\s*store\b/i.test(t) && t.length < 40) return true;
+  return false;
+}
+
 const SECTION_HEADER_RE =
   /(Confirmed beliefs|Revised beliefs|New beliefs formed|Challenged beliefs)(\s*\(([^)]*)\))?\s*:/gi;
 
 const NUMBERED_REASONING_RE = /(\d+)\.\s*(.+?)\s*\(\s*Reasoning:\s*([^)]+)\)/gi;
 
+/** Legacy: CONFIDENCE without MAP (no category). */
 const PIPE_BELIEF_RE =
   /BELIEF\s*:\s*([^|]+)\|\s*CONFIDENCE\s*:\s*([\d.]+)(?:\s*\|\s*REASONING\s*:\s*([^|]+))?/gi;
 
@@ -100,8 +122,46 @@ function parseNumberedItems(text, sectionDefault) {
   return items;
 }
 
+/**
+ * One BELIEF: line with pipe-separated KEY: value segments after the statement.
+ * @returns {{ statement: string, confidence: number, reasoning?: string, category?: string } | null}
+ */
+function parseBeliefPipeLine(line) {
+  const m = line.match(/^\s*BELIEF\s*:\s*(.+)$/i);
+  if (!m) return null;
+  const rest = m[1].trim();
+  const parts = rest.split('|').map((p) => p.trim());
+  if (parts.length === 0) return null;
+  const statement = parts[0];
+  if (statement.length < 3) return null;
+  /** @type {Record<string, string>} */
+  const fields = {};
+  for (let i = 1; i < parts.length; i += 1) {
+    const seg = parts[i];
+    const kv = seg.match(/^([A-Za-z_]+)\s*:\s*(.*)$/s);
+    if (kv) fields[kv[1].toLowerCase()] = kv[2].trim();
+  }
+  const conf = parseFloat(fields.confidence);
+  const confidence = Number.isFinite(conf) ? Math.min(1, Math.max(0.05, conf)) : 0.75;
+  const mapCanon = normalizeBeliefMapCategory(fields.map);
+  const reasoning = fields.reasoning || fields.note || undefined;
+  const out = { statement, confidence, ...(reasoning ? { reasoning } : {}) };
+  if (mapCanon) out.category = mapCanon;
+  return out;
+}
+
 function parsePipeFormat(text) {
   const items = [];
+  const lines = String(text).split(/\r?\n/);
+  for (const rawLine of lines) {
+    let line = rawLine.trim();
+    if (!line) continue;
+    line = line.replace(/^[-*•\d.)]+\s*/, '').trim();
+    const parsed = parseBeliefPipeLine(line);
+    if (parsed) items.push(parsed);
+  }
+  if (items.length) return items;
+
   const re = new RegExp(PIPE_BELIEF_RE.source, 'gi');
   let m;
   while ((m = re.exec(text)) !== null) {
@@ -120,7 +180,7 @@ function parsePipeFormat(text) {
 
 /**
  * @param {string} raw
- * @returns {Array<{ statement: string, confidence: number, reasoning?: string }>}
+ * @returns {Array<{ statement: string, confidence: number, reasoning?: string, category?: string }>}
  */
 export function parseBeliefModuleOutput(raw) {
   const stripped = stripStoragePrefixes(raw);
@@ -182,4 +242,16 @@ export function beliefStatementAsPlainText(raw) {
   const parts = beliefStatementsForDisplay(raw);
   if (!parts.length) return '';
   return parts.join(' · ');
+}
+
+/**
+ * Primary line for belief lists and map labels: structured text when possible, otherwise a clipped raw fallback
+ * (mirror / legacy blobs often omit parseable BELIEF: lines but still have readable prose).
+ */
+export function beliefListPrimaryLine(raw) {
+  const plain = beliefStatementAsPlainText(raw);
+  if (plain && plain.trim()) return plain.trim();
+  const s = String(raw ?? '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  return clipTextComplete(s, 2000, { ellipsis: true });
 }

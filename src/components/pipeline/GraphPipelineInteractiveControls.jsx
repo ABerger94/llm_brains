@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
-import { AlertTriangle, ChevronDown, Loader2, Play, RotateCcw, Send, Settings2 } from 'lucide-react';
-import { Button, Input, toast } from '../ui';
+import { useEffect, useState, useSyncExternalStore } from 'react';
+import { ChevronDown, Loader2, Send, Settings2 } from 'lucide-react';
+import { Button, Input } from '../ui';
 import FileAttachButton from './FileAttachButton';
 import { cn } from '../../lib/utils';
 import {
@@ -9,19 +9,24 @@ import {
   hydrateConsciousnessStreamFromDb,
 } from '../../lib/consciousnessStreamStore';
 import { startConsciousnessStreamRun } from '../../lib/consciousnessStreamRunner';
-import { resumeInterruptedGraphPipelineManual } from '../../lib/reconnectRecovery';
+import {
+  resolveGraphSessionMindStorageProfile,
+} from '../../lib/graphSessionMindProfile';
+import { normalizeScheduledTaskMindStorageProfile } from '../../lib/mindEntityContext';
+import { conversationEntityForPlaygroundSession } from '../../lib/playgroundDualMind';
 import { conversationToStreamEntries } from '../../lib/conversationStreamEntries';
 import { filterConversationRowsForGraphSession } from '../../lib/graphPipelineConversation';
 import { ConversationMessage } from '../../lib/data';
 import { MIND_PHASE_OPTIONS } from '../../lib/mindPersistence';
-import {
-  graphPipelineStore,
-  subscribeGraphPipeline,
-  validCooperativePipelineCheckpoint,
-} from '../../lib/graphPipelineStore';
 import GraphPipelineMetacognitionLimitsRow from './GraphPipelineMetacognitionLimitsRow';
+import GraphPipelineStreamResumeBanners from './GraphPipelineStreamResumeBanners';
 
-export default function GraphPipelineInteractiveControls({ graphSessionId }) {
+export default function GraphPipelineInteractiveControls({
+  graphSessionId,
+  hideResumeBanners = false,
+  mindStorageProfileForRun,
+  mirrorWorkspace = false,
+}) {
   const snap = useSyncExternalStore(
     subscribeConsciousnessStream,
     () => consciousnessStreamStore.getState(),
@@ -35,30 +40,27 @@ export default function GraphPipelineInteractiveControls({ graphSessionId }) {
     mindPhase,
     arousal,
     streamIntent,
-    runInterrupted,
     dbHydrated,
   } = snap;
 
   const [pendingFiles, setPendingFiles] = useState([]);
-  const [resumeInterruptedBusy, setResumeInterruptedBusy] = useState(false);
-  const [checkpointResumeBusy, setCheckpointResumeBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const gpSnap = useSyncExternalStore(
-    subscribeGraphPipeline,
-    () => graphPipelineStore.getState(),
-    () => graphPipelineStore.getState()
-  );
-  const pipelineCheckpoint = validCooperativePipelineCheckpoint(gpSnap.pipelineCheckpoint);
   const streamLocksUi = isProcessing;
+  const sid = graphSessionId != null && String(graphSessionId).trim() ? String(graphSessionId).trim() : '';
+  const resolvedMindProfile =
+    mindStorageProfileForRun != null && mindStorageProfileForRun !== ''
+      ? normalizeScheduledTaskMindStorageProfile(mindStorageProfileForRun)
+      : resolveGraphSessionMindStorageProfile(sid || undefined);
 
   useEffect(() => {
     if (graphSessionId == null || !String(graphSessionId).trim()) return;
-    const sid = String(graphSessionId).trim();
+    const sidInner = String(graphSessionId).trim();
     let cancelled = false;
     (async () => {
-      const rows = await ConversationMessage.list('-created_date', 320);
+      const Conv = sidInner ? conversationEntityForPlaygroundSession(sidInner) : ConversationMessage;
+      const rows = await Conv.list('-created_date', 320);
       if (cancelled) return;
-      const filtered = filterConversationRowsForGraphSession(rows, sid);
+      const filtered = filterConversationRowsForGraphSession(rows, sidInner);
       const s = consciousnessStreamStore.getState();
       if (s.isProcessing) return;
       hydrateConsciousnessStreamFromDb(conversationToStreamEntries(filtered), {
@@ -76,139 +78,37 @@ export default function GraphPipelineInteractiveControls({ graphSessionId }) {
     if (!input.trim() && pendingFiles.length === 0 && attachments.length === 0) return;
     const files = [...pendingFiles];
     setPendingFiles([]);
-    await startConsciousnessStreamRun({ pendingFiles: files });
+    await startConsciousnessStreamRun({
+      pendingFiles: files,
+      mindStorageProfile: resolvedMindProfile,
+      ...(sid ? { graphSessionIdForPersistence: sid } : {}),
+    });
   };
-
-  const resumeInterruptedPipeline = useCallback(async () => {
-    setResumeInterruptedBusy(true);
-    try {
-      const r = await resumeInterruptedGraphPipelineManual();
-      if (r.graphStarted) {
-        toast({
-          title: 'Resuming pipeline',
-          description: 'Continuing the graph/stream run from the server\u2026',
-        });
-        return;
-      }
-      const hints = {
-        not_interrupted: 'Nothing to resume right now.',
-        already_running: 'A run is already in progress.',
-        pipeline_busy: 'The graph pipeline (this transcript) is already running in this tab.',
-        no_recoverable_input: 'No saved user message or attachments to send.',
-        not_started: 'The run did not start \u2014 check the API or your last message.',
-      };
-      const desc =
-        hints[r.graphReason] ||
-        (String(r.graphReason).startsWith('error:')
-          ? String(r.graphReason).replace(/^error:/, '').trim()
-          : r.graphReason);
-      toast({
-        title: 'Could not resume',
-        description: desc,
-        variant: r.graphReason === 'not_interrupted' ? 'default' : 'destructive',
-      });
-    } catch (e) {
-      toast({
-        title: 'Resume failed',
-        description: e instanceof Error ? e.message : String(e),
-        variant: 'destructive',
-      });
-    } finally {
-      setResumeInterruptedBusy(false);
-    }
-  }, []);
 
   return (
     <>
-      {/* Checkpoint banner */}
-      {pipelineCheckpoint ? (
-        <div className="flex shrink-0 flex-col gap-2 border-b border-border bg-sky-500/5 px-4 py-2 text-xs sm:flex-row sm:items-center dark:bg-sky-950/25">
-          <div className="flex min-w-0 flex-1 items-center gap-2">
-            <Play className="h-3.5 w-3.5 shrink-0 text-sky-400" aria-hidden />
-            <p className="min-w-0 flex-1 text-muted-foreground">
-              Checkpoint saved. <span className="font-medium text-foreground/90">Continue</span> to resume or discard.
-            </p>
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <Button
-              type="button"
-              variant="default"
-              size="sm"
-              className="h-7 gap-1 text-xs"
-              disabled={streamLocksUi || checkpointResumeBusy}
-              onClick={() => {
-                setCheckpointResumeBusy(true);
-                void (async () => {
-                  try {
-                    await startConsciousnessStreamRun({ resumeFromCheckpoint: true });
-                  } catch (e) {
-                    toast({
-                      title: 'Resume failed',
-                      description: e instanceof Error ? e.message : String(e),
-                      variant: 'destructive',
-                    });
-                  } finally {
-                    setCheckpointResumeBusy(false);
-                  }
-                })();
-              }}
-            >
-              <Play className="h-3 w-3 shrink-0" aria-hidden />
-              Continue
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-7 border-sky-500/40 text-xs"
-              disabled={streamLocksUi}
-              onClick={() => graphPipelineStore.clearPipelineCheckpoint()}
-            >
-              Discard
-            </Button>
-          </div>
-        </div>
-      ) : null}
-
-      {/* Interrupted banner */}
-      {runInterrupted && !pipelineCheckpoint ? (
-        <div className="flex shrink-0 flex-col gap-2 border-b border-border bg-amber-500/5 px-4 py-2 text-xs sm:flex-row sm:items-center">
-          <div className="flex min-w-0 flex-1 items-center gap-2">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-400" aria-hidden />
-            <p className="min-w-0 flex-1 text-muted-foreground">
-              Pipeline interrupted. <span className="font-medium text-foreground/90">Resume</span> to continue from server.
-            </p>
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <Button
-              type="button"
-              variant="default"
-              size="sm"
-              className="h-7 gap-1 text-xs"
-              disabled={streamLocksUi || resumeInterruptedBusy}
-              onClick={() => void resumeInterruptedPipeline()}
-            >
-              <RotateCcw className="h-3 w-3 shrink-0" aria-hidden />
-              Resume
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-7 border-amber-500/40 text-xs"
-              onClick={() => consciousnessStreamStore.dismissInterrupted()}
-            >
-              Dismiss
-            </Button>
-          </div>
-        </div>
+      {!hideResumeBanners ? (
+        <GraphPipelineStreamResumeBanners
+          graphSessionId={sid}
+          mindStorageProfileOverride={mindStorageProfileForRun}
+        />
       ) : null}
 
       {/* Collapsible run settings */}
-      <div className="shrink-0 border-b border-border/70">
+      <div
+        className={cn(
+          'shrink-0 border-b',
+          mirrorWorkspace
+            ? 'border-red-500/40 bg-background shadow-[inset_4px_0_0_0_rgba(239,68,68,0.35)]'
+            : 'border-border/70'
+        )}
+      >
         <button
           type="button"
-          className="flex w-full items-center gap-2 px-4 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/20"
+          className={cn(
+            'flex w-full items-center gap-2 px-4 py-1.5 text-xs text-muted-foreground transition-colors',
+            mirrorWorkspace ? 'hover:bg-red-500/5 dark:hover:bg-red-950/20' : 'hover:bg-muted/20'
+          )}
           onClick={() => setSettingsOpen((v) => !v)}
           aria-expanded={settingsOpen}
         >
@@ -221,7 +121,14 @@ export default function GraphPipelineInteractiveControls({ graphSessionId }) {
           <ChevronDown className={cn('ml-auto h-3.5 w-3.5 transition-transform', settingsOpen && 'rotate-180')} aria-hidden />
         </button>
         {settingsOpen ? (
-          <div className="space-y-2 border-t border-border/50 bg-muted/5 px-4 py-2.5">
+          <div
+            className={cn(
+              'space-y-2 border-t px-4 py-2.5',
+              mirrorWorkspace
+                ? 'border-red-500/30 bg-muted/10 shadow-[inset_4px_0_0_0_rgba(239,68,68,0.2)]'
+                : 'border-border/50 bg-muted/5'
+            )}
+          >
             <div className="flex flex-wrap items-center gap-3">
               <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <span className="font-medium">Phase</span>
@@ -243,7 +150,10 @@ export default function GraphPipelineInteractiveControls({ graphSessionId }) {
                 <span className="text-xs font-medium text-muted-foreground">Arousal</span>
                 <div className="relative h-2 w-20 overflow-hidden rounded-full border border-border/80 bg-muted/50">
                   <div
-                    className="h-full rounded-full bg-gradient-to-r from-violet-500/70 to-rose-500/80 transition-[width] duration-300 ease-out"
+                    className={cn(
+                      'h-full rounded-full bg-gradient-to-r from-violet-500/70 transition-[width] duration-300 ease-out',
+                      mirrorWorkspace ? 'to-red-500/80' : 'to-rose-500/80'
+                    )}
                     style={{ width: `${Math.min(100, Math.max(0, Number(arousal) || 0) * 100)}%` }}
                   />
                 </div>
@@ -266,7 +176,15 @@ export default function GraphPipelineInteractiveControls({ graphSessionId }) {
       </div>
 
       {/* Composer */}
-      <div className="shrink-0 border-t border-border bg-background px-4 py-3 shadow-[0_-1px_3px_rgba(0,0,0,0.06)]">
+      <div
+        className={cn(
+          'shrink-0 border-t px-4 py-3 shadow-[0_-1px_3px_rgba(0,0,0,0.06)]',
+          mirrorWorkspace
+            ? 'border-red-500/40 bg-background shadow-[inset_4px_0_0_0_rgba(239,68,68,0.35)]'
+            : 'border-border bg-background'
+        )}
+        data-graph-composer-mind={mirrorWorkspace ? 'mirror' : 'primary'}
+      >
         <div className="flex items-center gap-2">
           <FileAttachButton
             pendingFiles={pendingFiles}

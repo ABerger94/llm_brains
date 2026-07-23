@@ -1,12 +1,14 @@
 import {
   useCallback,
   useEffect,
+  forwardRef,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
   useSyncExternalStore,
 } from 'react';
+import { createPortal } from 'react-dom';
 import { useSearchParams } from 'react-router-dom';
 import {
   AlertTriangle,
@@ -28,7 +30,9 @@ import moment from 'moment';
 import { Button, Textarea, toast } from '../components/ui';
 import PursuitMetacognitionLimitsRow from '../components/pipeline/PursuitMetacognitionLimitsRow';
 import PursuitPipelinePrepSelect from '../components/pipeline/PursuitPipelinePrepSelect';
-import { GoalItem, ScheduledTask } from '../lib/data';
+import { ScheduledTask } from '../lib/data';
+import { useMindScope, useScopedEntities } from '../context/MindScopeContext';
+import MindScopeTabs from '../components/MindScopeTabs';
 import { effectiveItemPriority, maxActiveClusterPriority } from '../lib/priorityUtils';
 import { runGoalDeepPursuitChain, runGoalPursuitLlmOnly } from '../lib/goalPursuit';
 import { isAbortError } from '../lib/dashboardAbortActivePipeline';
@@ -37,6 +41,7 @@ import {
   computeGoalPipelineMinimapSnapshot,
   freshPursuitPipelineUiForNewGraphRun,
   initialGoalPipelineUi,
+  pursuitShowsLivePipelineChrome,
   reduceGoalPipelineSse,
 } from '../lib/goalPipelineSseUi';
 import NeuralNetworkViz from '../components/NeuralNetworkViz';
@@ -51,6 +56,7 @@ import {
 } from '../lib/goalPagePursuitStore';
 import { formatPursuitThreadProgressLine } from '../lib/pursuitThreadStatusFormat';
 import {
+  PIPELINE_LOG_EMPTY_IDLE,
   PIPELINE_LOG_EMPTY_RUNNING,
   PIPELINE_LOG_PURSUIT_OUTSIDE_TAB,
   PIPELINE_MINIMAP_STRIP_LABEL,
@@ -58,6 +64,7 @@ import {
 import { PipelineStageMinimap } from '../components/consciousness/PipelineStageMinimap';
 import PipelineExecutionLogStatusLine from '../components/pipeline/PipelineExecutionLogStatusLine';
 import { scheduleTask } from '../lib/schedulerStore';
+import { normalizeScheduledTaskMindStorageProfile, MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR } from '../lib/mindEntityContext';
 import {
   isCooperativePauseAllExternalHoldActive,
   setCooperativePauseAllExternalHold,
@@ -68,10 +75,37 @@ import {
   subscribeInteractiveGraphOrStreamActivity,
 } from '../lib/pipelineBusyGate';
 import { finalizeNewGoalRoot } from '../lib/goalLineage';
+import { goalUiStatus } from '../lib/goalQueueMetrics';
 import { useMindStorageRefresh, notifyMindStorageChanged } from '../lib/mindStorageEvents';
 import { getRuntimeSettings } from '../lib/runtimeSettings';
 import { cn } from '../lib/utils';
 import { COGNITIVE_MODULES, getFirstProcessingModuleId, getFirstProcessingModuleName } from '../lib/cognitiveModules';
+import PageShell from '../components/PageShell';
+
+/**
+ * Mobile expanded goal pipeline must render above AppLayout’s sticky header (z-30); `main` is z-20 so
+ * fixed descendants cannot win — portal to `document.body` with a higher z-index.
+ */
+const GoalPipelineMobilePortal = forwardRef(function GoalPipelineMobilePortal(
+  { portal, className, children },
+  ref
+) {
+  const el = (
+    <div ref={ref} className={className}>
+      {children}
+    </div>
+  );
+  return portal ? createPortal(el, document.body) : el;
+});
+
+function subscribeMaxWidthLg(listener) {
+  const mq = window.matchMedia('(max-width: 1023px)');
+  mq.addEventListener('change', listener);
+  return () => mq.removeEventListener('change', listener);
+}
+function getMaxWidthLgSnapshot() {
+  return typeof window !== 'undefined' && window.matchMedia('(max-width: 1023px)').matches;
+}
 
 function truncate(value, length = 220) {
   if (!value) return '';
@@ -162,7 +196,7 @@ function GoalCollapsibleThread({ text }) {
       <summary className="cursor-pointer select-none px-2 py-1.5 text-xs font-medium text-muted-foreground hover:bg-muted/35">
         Pursuit thread <span className="font-normal opacity-70">· expand ({s.length} chars)</span>
       </summary>
-      <div className="max-h-[min(45vh,24rem)] overflow-y-auto border-t border-border/40 px-2 py-2 text-xs leading-relaxed text-muted-foreground">
+      <div className="max-h-[min(45svh,24rem)] overflow-y-auto border-t border-border/40 px-2 py-2 text-xs leading-relaxed text-muted-foreground">
         <p className="whitespace-pre-wrap break-words">{s}</p>
       </div>
     </details>
@@ -184,7 +218,7 @@ function GoalCollapsibleResolution({ text }) {
       <summary className="cursor-pointer select-none px-2 py-1.5 text-xs font-medium text-green-800 dark:text-green-300/90 hover:bg-green-500/15">
         Answer / reflection <span className="font-normal opacity-70">· expand ({s.length} chars)</span>
       </summary>
-      <div className="max-h-[min(50vh,28rem)] overflow-y-auto border-t border-green-500/20 p-2 text-xs leading-relaxed text-green-900 dark:text-green-300/95">
+      <div className="max-h-[min(50svh,28rem)] overflow-y-auto border-t border-green-500/20 p-2 text-xs leading-relaxed text-green-900 dark:text-green-300/95">
         <p className="whitespace-pre-wrap break-words">{s}</p>
       </div>
     </details>
@@ -206,32 +240,10 @@ function GoalCollapsibleLogDetail({ detail }) {
       <summary className="cursor-pointer font-mono text-[10px] text-muted-foreground hover:text-foreground/80">
         Module output · expand ({s.length} chars)
       </summary>
-      <pre className="mt-1 max-h-[min(36vh,18rem)] overflow-y-auto whitespace-pre-wrap break-words text-[11px] text-muted-foreground/90">
+      <pre className="mt-1 max-h-[min(36svh,18rem)] overflow-y-auto whitespace-pre-wrap break-words text-[11px] text-muted-foreground/90">
         {s}
       </pre>
     </details>
-  );
-}
-
-function PageShell({ icon: Icon, title, description, actions, children }) {
-  return (
-    <div className="min-h-screen p-4 sm:p-6">
-      <div className="mx-auto max-w-7xl">
-        <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-          <div className="min-w-0">
-            <div className="mb-2 flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/15">
-                <Icon className="h-5 w-5 text-primary" />
-              </div>
-              <h1 className="text-2xl font-bold">{title}</h1>
-            </div>
-            <p className="max-w-2xl text-sm text-muted-foreground">{description}</p>
-          </div>
-          {actions ? <div className="flex flex-wrap gap-2">{actions}</div> : null}
-        </div>
-        {children}
-      </div>
-    </div>
   );
 }
 
@@ -245,19 +257,6 @@ const GOAL_STATUS_STYLES = {
   resolved: 'border-green-500/30 bg-green-500/5 text-green-800 dark:text-green-400',
   dormant: 'border-border bg-muted/20 text-muted-foreground',
 };
-
-function goalNormStatus(s) {
-  const v = s || 'open';
-  if (v === 'pursuing' || v === 'resolved' || v === 'dormant') return v;
-  return 'open';
-}
-
-/** DB `pursuing` without a live page slot is stale (e.g. reload mid-run) — treat as `open` in the UI. */
-function goalUiStatus(item, pursuits) {
-  const norm = goalNormStatus(item.status);
-  if (norm === 'pursuing' && !pursuits[String(item.id)]?.running) return 'open';
-  return norm;
-}
 
 function goalClusterHasActivePursuit(clusterItems, pursuitsState) {
   return (Array.isArray(clusterItems) ? clusterItems : []).some(
@@ -280,6 +279,8 @@ function fallbackGoalPursuitEntryFromItems(goalId, itemList) {
 }
 
 export function GoalStackPage() {
+  const { isMirror, profile: mindStorageProfile } = useMindScope();
+  const { GoalItem } = useScopedEntities();
   const [searchParams, setSearchParams] = useSearchParams();
   const dashboardFocusConsumedRef = useRef(null);
   const [items, setItems] = useState([]);
@@ -297,6 +298,9 @@ export function GoalStackPage() {
     () => Object.values(pursuits).some((p) => p.running),
     [pursuits]
   );
+  const pageSystemAccent = isMirror ? 'b' : 'a';
+  const entryAccent = (entry) =>
+    entry?.mindStorageProfile === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR ? 'b' : 'a';
   const [pipelineCarouselIndex, setPipelineCarouselIndex] = useState(0);
   const goalPipelineLogRef = useRef(null);
   const goalPipelinePanelRef = useRef(null);
@@ -314,6 +318,9 @@ export function GoalStackPage() {
   );
   /** Mobile: goal pipeline stays a bottom strip until expanded; do not auto-open when visiting this page. */
   const [goalMobileSheetExpanded, setGoalMobileSheetExpanded] = useState(false);
+  const isMaxLg = useSyncExternalStore(subscribeMaxWidthLg, getMaxWidthLgSnapshot, () => false);
+  /** When true, fullscreen panel is portaled so it stacks above the app chrome (see GoalPipelineMobilePortal). */
+  const portalMobileGoalPipeline = goalMobileSheetExpanded && isMaxLg;
   /** Desktop only: execution log starts collapsed so the pipeline panel does not dominate the page. */
   const [goalDesktopLogExpanded, setGoalDesktopLogExpanded] = useState(false);
   const [goalQuestionFilter, setGoalQuestionFilter] = useState('open');
@@ -324,7 +331,12 @@ export function GoalStackPage() {
     if (!activePursuitId) return null;
     return pursuits[activePursuitId] ?? fallbackGoalPursuitEntryFromItems(activePursuitId, items);
   }, [activePursuitId, pursuits, items]);
-  const activeGoalPipelineUi = activePursuit?.goalPipelineUi;
+  const activeGoalPipelineUi = useMemo(() => {
+    if (!activePursuit) return null;
+    const raw = activePursuit.goalPipelineUi;
+    if (pursuitShowsLivePipelineChrome(activePursuit)) return raw;
+    return freshPursuitPipelineUiForNewGraphRun(raw);
+  }, [activePursuit]);
   const activePursuitProgress = activePursuit?.pursuitProgress ?? null;
 
   const interruptedResumeGoalItem = useMemo(
@@ -335,6 +347,15 @@ export function GoalStackPage() {
   const onGoalPipelineSse = useCallback((goalId, evt) => {
     updateGoalPagePursuitPipelineUiForId(goalId, (prev) => reduceGoalPipelineSse(prev, evt));
   }, []);
+
+  useEffect(() => {
+    if (!portalMobileGoalPipeline) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [portalMobileGoalPipeline]);
 
   useLayoutEffect(() => {
     const el = goalPipelineLogRef.current;
@@ -417,9 +438,24 @@ export function GoalStackPage() {
             pursuitProgress: null,
             goalPipelineUi: initialGoalPipelineUi(),
             goalStatement: String(item.goal_statement || '').trim() || undefined,
+            mindStorageProfile,
           });
         }
       }
+      if (dashboardFocusConsumedRef.current === focusId) return;
+      dashboardFocusConsumedRef.current = focusId;
+      setGoalMobileSheetExpanded(true);
+      requestAnimationFrame(() => {
+        document.getElementById(`goal-focus-${focusId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+      setSearchParams(
+        (p) => {
+          const n = new URLSearchParams(p);
+          n.delete('focus');
+          return n;
+        },
+        { replace: true }
+      );
       return;
     }
 
@@ -520,7 +556,7 @@ export function GoalStackPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    const raw = await GoalItem.list('-created_date', 100);
+    const raw = await GoalItem.listAll('-created_date');
     const sorted = [...raw].sort((a, b) => {
       const pa = effectiveItemPriority(a);
       const pb = effectiveItemPriority(b);
@@ -529,7 +565,7 @@ export function GoalStackPage() {
     });
     setItems(sorted);
     setLoading(false);
-  }, []);
+  }, [GoalItem]);
 
   useEffect(() => {
     load();
@@ -549,7 +585,7 @@ export function GoalStackPage() {
         source: 'manual',
       });
       try {
-        await finalizeNewGoalRoot(created);
+        await finalizeNewGoalRoot(created, GoalItem);
       } catch {
         /* ignore */
       }
@@ -577,10 +613,12 @@ export function GoalStackPage() {
       pursuitProgress: 'Starting…',
       goalPipelineUi: freshPursuitPipelineUiForNewGraphRun(prevUi),
       goalStatement: String(item.goal_statement || '').trim() || undefined,
+      mindStorageProfile,
     });
     let pipelinePaused = false;
     try {
       const { pipelinePaused: didPause } = await runGoalDeepPursuitChain(item, {
+        mindStorageProfile,
         signal: ac.signal,
         onProgress: (label) => {
           patchGoalPagePursuitEntry(gid, { pursuitProgress: label });
@@ -743,8 +781,9 @@ export function GoalStackPage() {
       pursuitProgress: null,
       goalStatement: String(item.goal_statement || '').trim() || undefined,
       goalPipelineUi: freshPursuitPipelineUiForNewGraphRun(prev?.goalPipelineUi),
+      mindStorageProfile,
     });
-  }, []);
+  }, [mindStorageProfile]);
 
   /** Ensures the slot exists, selects it in the carousel, and expands the mobile sheet so run-limit inputs apply to this goal. */
   const focusGoalPursuitSlot = useCallback(
@@ -776,11 +815,12 @@ export function GoalStackPage() {
       pursuitProgress: 'Quick reflect…',
       goalPipelineUi: initialGoalPipelineUi(),
       goalStatement: String(item.goal_statement || '').trim() || undefined,
+      mindStorageProfile,
     });
     try {
       await GoalItem.update(item.id, { status: 'pursuing' });
       await load();
-      await runGoalPursuitLlmOnly(item);
+      await runGoalPursuitLlmOnly(item, { mindStorageProfile });
       await load();
     } catch (e) {
       console.error(e);
@@ -797,11 +837,13 @@ export function GoalStackPage() {
 
   async function hasPendingPursuitForTarget(targetId) {
     const all = await ScheduledTask.list('-created_date', 120);
+    const wantProfile = normalizeScheduledTaskMindStorageProfile(mindStorageProfile);
     return all.some(
       (t) =>
         t.task_type === 'goal_pursuit' &&
         (t.status || 'pending') === 'pending' &&
-        t.target_goal_id === targetId
+        t.target_goal_id === targetId &&
+        normalizeScheduledTaskMindStorageProfile(t.mind_storage_profile) === wantProfile
     );
   }
 
@@ -825,6 +867,7 @@ export function GoalStackPage() {
       target_goal_id: item.id,
       reason: `Goal: ${truncate(item.goal_statement, 120)}`,
       scheduled_by: 'user',
+      mind_storage_profile: mindStorageProfile,
       ...(gUi && gUi.metacognitionMaxReruns != null
         ? { metacognition_max_reruns_override: gUi.metacognitionMaxReruns }
         : {}),
@@ -913,6 +956,20 @@ export function GoalStackPage() {
       });
   }, [filteredGoalClusters, pursuits]);
 
+  const goalPipelineRootClassName = useMemo(
+    () =>
+      portalMobileGoalPipeline
+        ? 'min-w-0 fixed inset-0 z-[70] flex min-h-0 flex-col bg-background pt-[env(safe-area-inset-top,0px)] pb-[env(safe-area-inset-bottom,0px)]'
+        : cn(
+            'min-w-0',
+            goalMobileSheetExpanded
+              ? 'max-lg:fixed max-lg:inset-0 max-lg:z-50 max-lg:flex max-lg:flex-col max-lg:bg-background max-lg:pt-[env(safe-area-inset-top,0px)]'
+              : 'max-lg:fixed max-lg:inset-x-0 max-lg:bottom-0 max-lg:z-40 max-lg:px-2 max-lg:pt-1',
+            'lg:relative lg:z-auto lg:bg-transparent lg:pt-0 lg:scroll-mt-[calc(env(safe-area-inset-top,0px)+4.5rem)]'
+          ),
+    [portalMobileGoalPipeline, goalMobileSheetExpanded]
+  );
+
   return (
     <PageShell
       icon={Target}
@@ -928,13 +985,27 @@ export function GoalStackPage() {
       }
     >
       <div className="mx-auto max-w-4xl space-y-6">
+        <div className="flex flex-wrap items-center gap-2">
+          <MindScopeTabs />
+        </div>
+        {isMirror ? (
+          <p className="rounded-lg border border-border/80 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+            System B: browse and pursue mirror goals here — full graph runs and scheduled tasks use the isolated mirror
+            mind store.
+          </p>
+        ) : null}
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <div className="rounded-xl border border-sky-500/20 bg-sky-500/5 p-4 text-center">
             <div className="text-2xl font-bold text-sky-800 dark:text-sky-300">{openItems.length}</div>
             <div className="text-xs text-muted-foreground">Open goals</div>
           </div>
-          <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 text-center">
-            <div className="text-2xl font-bold text-primary">{pursuingItems.length}</div>
+          <div className={cn(
+            'rounded-xl border p-4 text-center',
+            pageSystemAccent === 'b'
+              ? 'border-red-500/20 bg-red-500/5'
+              : 'border-primary/20 bg-primary/5'
+          )}>
+            <div className={cn('text-2xl font-bold', pageSystemAccent === 'b' ? 'text-red-400' : 'text-primary')}>{pursuingItems.length}</div>
             <div className="text-xs text-muted-foreground">Actively pursuing</div>
           </div>
           <div className="rounded-xl border border-green-500/20 bg-green-500/5 p-4 text-center">
@@ -959,20 +1030,18 @@ export function GoalStackPage() {
           ))}
         </div>
 
-        {pursuitIds.length > 0 || pursuitPrepCandidates.length > 0 ? (
-          <div
+        {(pursuitIds.length > 0 || pursuitPrepCandidates.length > 0) ? (
+          <GoalPipelineMobilePortal
             ref={goalPipelinePanelRef}
-            className={cn(
-              'min-w-0',
-              goalMobileSheetExpanded
-                ? 'max-lg:fixed max-lg:inset-0 max-lg:z-50 max-lg:flex max-lg:flex-col max-lg:bg-background max-lg:pt-[env(safe-area-inset-top,0px)]'
-                : 'max-lg:fixed max-lg:inset-x-0 max-lg:bottom-0 max-lg:z-40 max-lg:px-2 max-lg:pt-1',
-              'lg:relative lg:z-auto lg:bg-transparent lg:pt-0 lg:scroll-mt-[calc(env(safe-area-inset-top,0px)+4.5rem)]'
-            )}
+            portal={portalMobileGoalPipeline}
+            className={goalPipelineRootClassName}
           >
             <div
               className={cn(
-                'space-y-3 rounded-xl border border-primary/25 bg-card p-3 shadow-sm sm:p-4',
+                'space-y-3 rounded-xl border bg-card p-3 shadow-sm sm:p-4',
+                pageSystemAccent === 'b'
+                  ? 'border-red-500/40 shadow-[inset_4px_0_0_0_rgba(239,68,68,0.45)]'
+                  : 'border-primary/25',
                 goalMobileSheetExpanded
                   ? 'max-lg:mx-0 max-lg:mb-0 max-lg:flex max-lg:h-full max-lg:min-h-0 max-lg:flex-1 max-lg:flex-col max-lg:gap-3 max-lg:overflow-hidden max-lg:rounded-none max-lg:border-0 max-lg:shadow-none max-lg:max-h-none max-lg:pb-[env(safe-area-inset-bottom,0px)]'
                   : 'max-lg:mx-auto max-lg:space-y-0 max-lg:overflow-x-hidden max-lg:rounded-b-none max-lg:rounded-t-2xl max-lg:border-x-0 max-lg:border-b-0 max-lg:px-2 max-lg:py-1.5 max-lg:pb-[max(0.5rem,env(safe-area-inset-bottom,0px))] max-lg:shadow-[0_-6px_28px_rgba(0,0,0,0.14)] dark:max-lg:shadow-[0_-6px_28px_rgba(0,0,0,0.45)]'
@@ -991,7 +1060,7 @@ export function GoalStackPage() {
                       !goalMobileSheetExpanded && 'max-lg:text-xs'
                     )}
                   >
-                    <Layers className="h-4 w-4 shrink-0 text-primary" />
+                    <Layers className={cn('h-4 w-4 shrink-0', pageSystemAccent === 'b' ? 'text-red-400' : 'text-primary')} />
                     <span className="truncate">Goal pipeline</span>
                     {pursuitIds.length > 1 ? (
                       <span className="shrink-0 text-[10px] font-normal tabular-nums text-muted-foreground">
@@ -1201,14 +1270,16 @@ export function GoalStackPage() {
                   className={cn(
                     'flex w-full flex-nowrap overflow-x-auto overscroll-x-contain scroll-smooth snap-x snap-mandatory',
                     '[scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden',
-                    'touch-pan-x [-webkit-overflow-scrolling:touch]',
+                    '[touch-action:pan-x_pan-y] [-webkit-overflow-scrolling:touch]',
                     goalMobileSheetExpanded && 'max-lg:min-h-0 max-lg:flex-1'
                   )}
                 >
                   {pursuitIds.map((pid) => {
                     const storedEntry = pursuits[pid];
                     const entry = storedEntry ?? fallbackGoalPursuitEntryFromItems(pid, items);
-                    const pipelineUi = entry.goalPipelineUi;
+                    const pipelineUi = pursuitShowsLivePipelineChrome(entry)
+                      ? entry.goalPipelineUi
+                      : freshPursuitPipelineUiForNewGraphRun(entry.goalPipelineUi);
                     const slideMinimap = computeGoalPipelineMinimapSnapshot(
                       pipelineUi.moduleStatuses,
                       entry.running
@@ -1233,13 +1304,19 @@ export function GoalStackPage() {
                           >
                             <div
                               className={cn(
-                                'relative h-[min(280px,40vh)] min-h-[13rem] min-w-0 overflow-hidden rounded-lg border border-border bg-muted/10',
+                                'relative h-[min(280px,40svh)] min-h-[13rem] min-w-0 overflow-hidden rounded-lg border',
+                                entry.running && entryAccent(entry) === 'b'
+                                  ? 'border-red-500/45 bg-red-500/[0.08] shadow-[inset_0_0_80px_rgba(239,68,68,0.10)] dark:bg-red-500/10 dark:shadow-[inset_0_0_90px_rgba(239,68,68,0.14)]'
+                                  : entry.running && entryAccent(entry) === 'a'
+                                    ? 'border-blue-500/45 bg-blue-500/[0.08] shadow-[inset_0_0_80px_rgba(59,130,246,0.10)] dark:bg-blue-500/10 dark:shadow-[inset_0_0_90px_rgba(59,130,246,0.14)]'
+                                    : 'border-border bg-muted lg:bg-muted/10',
                                 goalDesktopLogExpanded ? 'lg:col-span-2' : 'lg:col-span-1'
                               )}
                             >
                               <NeuralNetworkViz
                                 variant="embedded"
                                 activeModuleId={activeModuleId}
+                                runAccent={entry.running ? entryAccent(entry) : null}
                                 ariaLabel="Goal pursuit pipeline modules"
                               />
                             </div>
@@ -1247,7 +1324,7 @@ export function GoalStackPage() {
                               className={cn(
                                 'flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-card',
                                 goalDesktopLogExpanded
-                                  ? 'lg:max-h-[min(72vh,520px)] lg:min-h-[min(240px,32vh)]'
+                                  ? 'lg:max-h-[min(72svh,520px)] lg:min-h-[min(240px,32svh)]'
                                   : 'lg:max-h-none lg:min-h-0 lg:shrink-0'
                               )}
                             >
@@ -1301,7 +1378,11 @@ export function GoalStackPage() {
                                 <div className="space-y-2 p-3">
                                   {pipelineUi.executionLog.length === 0 ? (
                                     <p className="text-xs text-muted-foreground">
-                                      {storedEntry ? PIPELINE_LOG_EMPTY_RUNNING : PIPELINE_LOG_PURSUIT_OUTSIDE_TAB}
+                                      {storedEntry
+                                        ? pursuitShowsLivePipelineChrome(entry)
+                                          ? PIPELINE_LOG_EMPTY_RUNNING
+                                          : PIPELINE_LOG_EMPTY_IDLE
+                                        : PIPELINE_LOG_PURSUIT_OUTSIDE_TAB}
                                     </p>
                                   ) : (
                                     pipelineUi.executionLog.map((logEntry, i) => (
@@ -1333,7 +1414,7 @@ export function GoalStackPage() {
               </div>
               ) : null}
             </div>
-          </div>
+          </GoalPipelineMobilePortal>
         ) : null}
 
         <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,320px)_minmax(0,1fr)]">
@@ -1431,7 +1512,10 @@ export function GoalStackPage() {
                       <div className="space-y-2 border-l-2 border-sky-500/25 pl-3">
                         {clusterItems.map((item) => {
                           const st = goalUiStatus(item, pursuits);
-                          const styleCls = GOAL_STATUS_STYLES[st] || GOAL_STATUS_STYLES.open;
+                          const itemPursuitEntry = pursuits[String(item.id)];
+                          const styleCls = st === 'pursuing' && entryAccent(itemPursuitEntry) === 'b'
+                            ? 'border-red-500/30 bg-red-500/5 text-red-400'
+                            : (GOAL_STATUS_STYLES[st] || GOAL_STATUS_STYLES.open);
                           const p = effectiveItemPriority(item);
                           const depth = Number(item.pursuit_depth ?? 0);
                           const parent = item.parent_goal_id
@@ -1586,7 +1670,7 @@ export function GoalStackPage() {
           </div>
         </div>
 
-        {pursuitIds.length > 0 || pursuitPrepCandidates.length > 0 ? (
+        {(pursuitIds.length > 0 || pursuitPrepCandidates.length > 0) ? (
           <div
             className={cn(
               'shrink-0 lg:hidden',

@@ -63,9 +63,9 @@ export function conversationToStreamEntries(rows) {
             id: `${idBase}-mt-${i}`,
             type: 'meta-calibration',
             content: line,
-            moduleId: 'metacognition',
-            moduleName: 'Metacognition',
-            moduleColor: COGNITIVE_MODULES.find((x) => x.id === 'metacognition')?.color,
+            moduleId: 'executiveGate',
+            moduleName: 'ExecutiveGate',
+            moduleColor: COGNITIVE_MODULES.find((x) => x.id === 'executiveGate')?.color,
             moduleGlyph: 'M',
             time: t,
           });

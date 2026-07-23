@@ -18,7 +18,7 @@ const graphUi = {
   uploading: true,
   cooperativePauseToken: 'dead-token',
   moduleStatuses: { Perception: 'processing', Voice: 'complete' },
-  pipelineCheckpoint: { executionCursor: { v: 1 }, slimSharedMemory: { moduleOutputs: {} } },
+  pipelineCheckpoint: { executionCursor: { v: 2 }, slimSharedMemory: { moduleOutputs: {} } },
   runInterrupted: true,
 };
 

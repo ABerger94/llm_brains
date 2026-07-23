@@ -1,5 +1,6 @@
 import { graphPipelineStore, subscribeGraphPipeline } from './graphPipelineStore';
 import { consciousnessStreamStore, subscribeConsciousnessStream } from './consciousnessStreamStore';
+import { getRuntimeSettings } from './runtimeSettings';
 
 /**
  * Depth counter for headless / scheduled work ({@link beginBackgroundCognitiveWork}): scheduler jobs
@@ -100,6 +101,53 @@ export function getInteractiveGraphOrStreamActivitySnapshot() {
 }
 
 /**
+ * Resolves when {@link isInteractiveGraphOrStreamActive} is false (graph + consciousness stream idle).
+ * System Chat chains multiple full-graph legs; if the user starts the next leg while stores still show
+ * `isRunning` / `isProcessing`, {@link startConsciousnessStreamRun} would no-op — waiting here avoids that.
+ * @param {{ timeoutMs?: number, pollIntervalMs?: number }} [options]
+ * @returns {Promise<void>}
+ */
+export function waitUntilInteractiveGraphOrStreamIdle({ timeoutMs = 90_000, pollIntervalMs = 32 } = {}) {
+  if (!isInteractiveGraphOrStreamActive()) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    let pollId = /** @type {ReturnType<typeof setInterval> | null} */ (null);
+    let unsub = () => {};
+
+    const cleanup = () => {
+      if (pollId != null) {
+        clearInterval(pollId);
+        pollId = null;
+      }
+      try {
+        unsub();
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const check = () => {
+      if (!isInteractiveGraphOrStreamActive()) {
+        cleanup();
+        resolve();
+        return;
+      }
+      if (Date.now() - started > timeoutMs) {
+        cleanup();
+        reject(
+          new Error('Pipeline is still busy. Wait for the current run to finish, then try again.')
+        );
+      }
+    };
+
+    unsub = subscribeInteractiveGraphOrStreamActivity(check);
+    pollId = setInterval(check, pollIntervalMs);
+    check();
+  });
+}
+
+/**
  * True while interactive graph/stream **or** background/scheduled cognitive work is active.
  * Use for deferring automated follow-ups (e.g. chained scheduler tasks). For gating interactive
  * starts, prefer {@link isInteractiveGraphOrStreamActive}. Several scheduled jobs may run at once;
@@ -108,4 +156,32 @@ export function getInteractiveGraphOrStreamActivitySnapshot() {
  */
 export function isAnyBlockingPipelineActive() {
   return isInteractiveGraphOrStreamActive() || isBackgroundCognitiveWorkActive();
+}
+
+/**
+ * Resolves when background cognitive depth is below the `schedulerMaxConcurrentBackgroundRuns` limit.
+ * Unlike {@link waitUntilInteractiveGraphOrStreamIdle}, this does NOT wait for interactive
+ * graph/stream runs — so scheduled work can proceed while the user is using the Playground.
+ * @param {{ timeoutMs?: number, pollIntervalMs?: number }} [options]
+ * @returns {Promise<void>}
+ */
+export function waitUntilScheduledSlotAvailable({ timeoutMs = 120_000, pollIntervalMs = 500 } = {}) {
+  const rt = getRuntimeSettings();
+  const maxBg = Math.max(1, Math.min(32, Math.floor(Number(rt.schedulerMaxConcurrentBackgroundRuns) || 2)));
+  if (backgroundCognitiveDepth < maxBg) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const pollId = setInterval(() => {
+      if (backgroundCognitiveDepth < maxBg) {
+        clearInterval(pollId);
+        resolve();
+        return;
+      }
+      if (Date.now() - started > timeoutMs) {
+        clearInterval(pollId);
+        reject(new Error(`Scheduled slot unavailable after ${timeoutMs}ms (background depth: ${backgroundCognitiveDepth}, max: ${maxBg})`));
+      }
+    }, pollIntervalMs);
+  });
 }

@@ -1,4 +1,3 @@
-import { BeliefStore, GoalItem, LongTermMemory } from './data';
 import { llmService } from '../services/llmService';
 import { notifyMindStorageChanged } from './mindStorageEvents';
 import { clipTextComplete } from '../../shared/textClip.mjs';
@@ -9,14 +8,24 @@ import { isPipelinePauseOutcome } from './pipelinePauseOutcome';
 import { resolvePursuitResumeFromLastPipelineRun } from './pipelinePursuitResume';
 import { effectiveItemPriority } from './priorityUtils';
 import { getGraphSessionIdForPersistence } from './graphPipelineSessionScope';
+import { buildCuriosityResolutionText } from './curiosityPursuit';
+import {
+  getActiveMindEntityProfile,
+  getMindEntityStores,
+  normalizeScheduledTaskMindStorageProfile,
+  setActiveMindEntityProfile,
+} from './mindEntityContext';
+
 function truncate(s, n) {
   return clipTextComplete(String(s || ''), n, { ellipsis: true });
 }
 
 /**
  * Pick the next goal item to pursue (open + dormant, by priority then age).
+ * Uses {@link getMindEntityStores} — set active mind profile before calling.
  */
 export async function resolveGoalItemForScheduledPursuit(task) {
+  const { GoalItem } = getMindEntityStores();
   const tid = task?.target_goal_id;
   if (tid) {
     const item = await GoalItem.retrieve(String(tid));
@@ -31,6 +40,7 @@ export async function resolveGoalItemForScheduledPursuit(task) {
 }
 
 export async function pickGoalItemForPursuit() {
+  const { GoalItem } = getMindEntityStores();
   const [open, dormant] = await Promise.all([
     GoalItem.filter({ status: 'open' }, '-created_date', 40),
     GoalItem.filter({ status: 'dormant' }, '-created_date', 20),
@@ -63,6 +73,7 @@ Work the full stack toward this goal: use beliefs and memories in context, recon
 }
 
 async function loadBeliefsAndMemoriesForPursuit() {
+  const { BeliefStore, LongTermMemory } = getMindEntityStores();
   const active = await BeliefStore.filter({ status: 'active' }, '-created_date', 15);
   const beliefsForPrompt = active.length
     ? active
@@ -73,13 +84,19 @@ async function loadBeliefsAndMemoriesForPursuit() {
 
 /**
  * Lightweight LLM-only pass (no full graph). Caller should set status to pursuing before calling.
+ * @param {string} [opts.mindStorageProfile] `primary` or `playgroundMirror`
  */
-export async function runGoalPursuitLlmOnly(item) {
-  const { beliefsForPrompt, memories } = await loadBeliefsAndMemoriesForPursuit();
-  const thread = item.pursuit_thread ? String(item.pursuit_thread) : '';
+export async function runGoalPursuitLlmOnly(item, { mindStorageProfile } = {}) {
+  const normalized = normalizeScheduledTaskMindStorageProfile(mindStorageProfile);
+  const prev = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(normalized);
+  try {
+    const { GoalItem, LongTermMemory } = getMindEntityStores();
+    const { beliefsForPrompt, memories } = await loadBeliefsAndMemoriesForPursuit();
+    const thread = item.pursuit_thread ? String(item.pursuit_thread) : '';
 
-  const exploration = await llmService.InvokeLLM({
-    prompt: `You are a cognitive mind actively working toward a self-set goal.
+    const exploration = await llmService.InvokeLLM({
+      prompt: `You are a cognitive mind actively working toward a self-set goal.
 
 GOAL: ${item.goal_statement}
 PURSUIT THREAD: ${thread || '(none)'}
@@ -99,34 +116,43 @@ ${memories
   .join('\n')}
 
 Advance this goal: what progress is plausible now, what blocks remain, what would count as meaningful next work? End with a short synthesis (not assistant boilerplate).`,
-    max_tokens: 1800,
-    temperature: 0.65,
-  });
+      max_tokens: 1800,
+      temperature: 0.65,
+    });
 
-  const latest = await GoalItem.retrieve(item.id);
-  await GoalItem.update(item.id, {
-    status: 'open',
-    resolution: exploration,
-    times_returned_to: (latest?.times_returned_to ?? item.times_returned_to ?? 0) + 1,
-  });
+    const latest = await GoalItem.retrieve(item.id);
+    const explorationTrim = String(exploration || '').trim();
+    await GoalItem.update(item.id, {
+      status: explorationTrim.length >= 20 ? 'resolved' : 'open',
+      resolution: exploration,
+      times_returned_to: (latest?.times_returned_to ?? item.times_returned_to ?? 0) + 1,
+    });
 
-  await LongTermMemory.create({
-    title: `Goal pursuit: ${truncate(item.goal_statement, 100)}`,
-    content: `Goal pursuit: ${item.goal_statement}\n\n${exploration}`,
-    memory_type: 'semantic',
-    source: 'goal-pursuit',
-  });
+    await LongTermMemory.create({
+      title: `Goal pursuit: ${truncate(item.goal_statement, 100)}`,
+      content: `Goal pursuit: ${item.goal_statement}\n\n${exploration}`,
+      memory_type: 'semantic',
+      source: 'goal-pursuit',
+    });
 
-  notifyMindStorageChanged({ source: 'goals' });
-  notifyMindStorageChanged({ source: 'long-term-memory' });
+    notifyMindStorageChanged({ source: 'goals' });
+    notifyMindStorageChanged({ source: 'long-term-memory' });
 
-  return truncate(exploration, 400) || 'Goal pursuit complete.';
+    return truncate(exploration, 400) || 'Goal pursuit complete.';
+  } finally {
+    setActiveMindEntityProfile(prev);
+  }
 }
 
-export async function finalizePursuedGoalAfterGraph(itemId, voiceText, pipelineRunId) {
+/**
+ * @param {{ rawOutputs?: object, sharedMemory?: object }} [extras] Same as curiosity graph finalize — Voice may be empty while Narrative/Integration hold the answer.
+ */
+export async function finalizePursuedGoalAfterGraph(itemId, voiceText, pipelineRunId, extras = {}) {
+  const { GoalItem } = getMindEntityStores();
   const latest = await GoalItem.retrieve(itemId);
   if (!latest) return;
-  const voice = clipTextComplete(String(voiceText || ''), 24_000, { ellipsis: true });
+  const { rawOutputs = null, sharedMemory = null } = extras || {};
+  const voice = buildCuriosityResolutionText(voiceText, rawOutputs, sharedMemory);
   if (!String(voice || '').trim()) return;
 
   const prevRun = latest.last_pursuit_pipeline_run_id != null ? String(latest.last_pursuit_pipeline_run_id) : '';
@@ -152,6 +178,7 @@ export async function finalizePursuedGoalAfterGraph(itemId, voiceText, pipelineR
 }
 
 export async function pickNextDeepGoalChildFromParent(parentId, maxDepth) {
+  const { GoalItem } = getMindEntityStores();
   const children = await GoalItem.filter({ parent_goal_id: parentId }, '-created_date', 60);
   const pool = children.filter((c) => {
     const st = c.status || 'open';
@@ -172,84 +199,101 @@ export async function pickNextDeepGoalChildFromParent(parentId, maxDepth) {
 /**
  * Full graph pursuit with optional chained child runs (settings caps).
  * @param {AbortSignal} [opts.signal]
- */
-/**
+ * @param {string} [opts.mindStorageProfile] `primary` or `playgroundMirror`
  * @returns {Promise<{ pipelinePaused: boolean }>}
  */
-export async function runGoalDeepPursuitChain(startItem, { onProgress, onPipelineSse, signal } = {}) {
-  const rt = getRuntimeSettings();
-  const maxRuns = Math.max(1, Math.floor(Number(rt.goalDeepPursuitMaxRunsPerAction) || 3));
-  const maxDepth = Math.max(1, Math.floor(Number(rt.goalDeepPursuitMaxDepth) || 4));
+export async function runGoalDeepPursuitChain(
+  startItem,
+  { onProgress, onPipelineSse, signal, mindStorageProfile } = {}
+) {
+  const normalized = normalizeScheduledTaskMindStorageProfile(mindStorageProfile);
+  const prev = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(normalized);
+  try {
+    const { GoalItem } = getMindEntityStores();
+    const rt = getRuntimeSettings();
+    const maxRuns = Math.max(1, Math.floor(Number(rt.goalDeepPursuitMaxRunsPerAction) || 3));
+    const maxDepth = Math.max(1, Math.floor(Number(rt.goalDeepPursuitMaxDepth) || 4));
 
-  let pipelinePaused = false;
-  let current = startItem;
-  for (let runIndex = 0; runIndex < maxRuns; runIndex += 1) {
-    const fresh = await GoalItem.retrieve(current.id);
-    if (!fresh) break;
-    current = fresh;
-    const depth = Number(current.pursuit_depth ?? 0);
-    if (depth >= maxDepth) break;
+    let pipelinePaused = false;
+    let current = startItem;
+    for (let runIndex = 0; runIndex < maxRuns; runIndex += 1) {
+      setActiveMindEntityProfile(normalized);
+      const fresh = await GoalItem.retrieve(current.id);
+      if (!fresh) break;
+      current = fresh;
+      const depth = Number(current.pursuit_depth ?? 0);
+      if (depth >= maxDepth) break;
 
-    onProgress?.(`Run ${runIndex + 1}/${maxRuns}`);
+      onProgress?.(`Run ${runIndex + 1}/${maxRuns}`);
 
-    await GoalItem.update(current.id, { status: 'pursuing' });
-    notifyMindStorageChanged({ source: 'goals' });
-
-    let result;
-    try {
-      const rootId = current.root_goal_id || current.id;
-      const prompt = buildGoalPursuitGraphPrompt(current);
-      const resume = await resolvePursuitResumeFromLastPipelineRun(current);
-      const oneShotOpts = {
-        inputText: prompt,
-        source: 'goal-deep-pursuit',
-        goalPursuitContext: {
-          parentGoalId: current.id,
-          rootGoalId: rootId,
-        },
-        graphSessionIdForPipelineRun: getGraphSessionIdForPersistence(),
-        task: null,
-        onSseEvent: onPipelineSse,
-        abortSignal: signal,
-        mirrorCooperativePauseToGraphSession: false,
-      };
-      if (resume.initialFullSharedMemory && resume.executionResume) {
-        oneShotOpts.initialFullSharedMemory = resume.initialFullSharedMemory;
-        oneShotOpts.executionResume = resume.executionResume;
-      }
-      const ui = getGoalPagePursuitSnapshot().pursuits?.[current.id]?.goalPipelineUi;
-      if (ui) {
-        oneShotOpts.metacognitionOverrides = {
-          maxMetacognitionReruns: ui.metacognitionMaxReruns,
-          metacognitionRerunDelayMinutes: ui.metacognitionRerunDelayMinutes,
-        };
-      }
-      result = await runGraphPipelineOneShot(oneShotOpts);
-      const { voiceText, pipelineRunId, voiceDeferredToScheduledSupervisor } = result;
-
-      if (!voiceDeferredToScheduledSupervisor) {
-        await finalizePursuedGoalAfterGraph(current.id, voiceText, pipelineRunId);
-      }
-    } catch (e) {
-      await GoalItem.update(current.id, { status: 'open' }).catch(() => {});
+      await GoalItem.update(current.id, { status: 'pursuing' });
       notifyMindStorageChanged({ source: 'goals' });
-      throw e;
+
+      let result;
+      try {
+        const rootId = current.root_goal_id || current.id;
+        const prompt = buildGoalPursuitGraphPrompt(current);
+        const resume = await resolvePursuitResumeFromLastPipelineRun(current);
+        const oneShotOpts = {
+          inputText: prompt,
+          source: 'goal-deep-pursuit',
+          goalPursuitContext: {
+            parentGoalId: current.id,
+            rootGoalId: rootId,
+          },
+          graphSessionIdForPipelineRun: getGraphSessionIdForPersistence(),
+          task: null,
+          onSseEvent: onPipelineSse,
+          abortSignal: signal,
+          mirrorCooperativePauseToGraphSession: false,
+          mindStorageProfile: normalized,
+        };
+        if (resume.initialFullSharedMemory && resume.executionResume) {
+          oneShotOpts.initialFullSharedMemory = resume.initialFullSharedMemory;
+          oneShotOpts.executionResume = resume.executionResume;
+        }
+        const ui = getGoalPagePursuitSnapshot().pursuits?.[current.id]?.goalPipelineUi;
+        if (ui) {
+          oneShotOpts.metacognitionOverrides = {
+            maxMetacognitionReruns: ui.metacognitionMaxReruns,
+            metacognitionRerunDelayMinutes: ui.metacognitionRerunDelayMinutes,
+          };
+        }
+        result = await runGraphPipelineOneShot(oneShotOpts);
+        const { voiceText, pipelineRunId, voiceDeferredToScheduledSupervisor } = result;
+
+        setActiveMindEntityProfile(normalized);
+        if (!voiceDeferredToScheduledSupervisor) {
+          await finalizePursuedGoalAfterGraph(current.id, voiceText, pipelineRunId, {
+            rawOutputs: result.rawOutputs,
+            sharedMemory: result.sharedMemory,
+          });
+        }
+      } catch (e) {
+        setActiveMindEntityProfile(normalized);
+        await GoalItem.update(current.id, { status: 'open' }).catch(() => {});
+        notifyMindStorageChanged({ source: 'goals' });
+        throw e;
+      }
+      notifyMindStorageChanged({ source: 'goals' });
+
+      if (result.voiceDeferredToScheduledSupervisor) break;
+
+      if (isPipelinePauseOutcome(result)) {
+        pipelinePaused = true;
+        break;
+      }
+
+      if (runIndex >= maxRuns - 1) break;
+
+      const next = await pickNextDeepGoalChildFromParent(current.id, maxDepth);
+      if (next) {
+        current = next;
+      }
     }
-    notifyMindStorageChanged({ source: 'goals' });
-
-    if (result.voiceDeferredToScheduledSupervisor) break;
-
-    if (isPipelinePauseOutcome(result)) {
-      pipelinePaused = true;
-      break;
-    }
-
-    if (runIndex >= maxRuns - 1) break;
-
-    const next = await pickNextDeepGoalChildFromParent(current.id, maxDepth);
-    if (next) {
-      current = next;
-    }
+    return { pipelinePaused };
+  } finally {
+    setActiveMindEntityProfile(prev);
   }
-  return { pipelinePaused };
 }

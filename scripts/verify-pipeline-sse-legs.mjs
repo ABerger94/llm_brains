@@ -5,6 +5,7 @@
  * Run: node scripts/verify-pipeline-sse-legs.mjs
  */
 import { normalizeExecutionResume } from '../shared/pipelineExecutionResume.mjs';
+import { PIPELINE_SCHEMA_VERSION } from '../shared/pipelineModules.mjs';
 import { slimSharedMemoryForPipelinePost } from '../src/lib/slimSharedMemory.js';
 
 /** Mirrors pipelineSse.js synthetic pause result (keep in sync). */
@@ -15,7 +16,7 @@ function buildSyntheticPauseResult(pausedEvt) {
     ecRaw && typeof ecRaw === 'object'
       ? ecRaw
       : {
-          v: 1,
+          v: PIPELINE_SCHEMA_VERSION,
           phase: pausedEvt.phase,
           nextModuleName: pausedEvt.nextModuleName,
         };
@@ -80,7 +81,7 @@ async function consumeLegs({
   buildFetchInit,
   initialSlimSharedMemory = null,
   fetchImpl,
-  maxLegs = 25,
+  maxLegs = 14,
   treatFirstLegAsContinuation = false,
 }) {
   let slimSm = initialSlimSharedMemory;
@@ -150,7 +151,7 @@ let fetchLeg = 0;
 async function testChainedContinuationThenComplete() {
   fetchLeg = 0;
   const contSm = {
-    moduleOutputs: { Metacognition: 'PROCEED' },
+    moduleOutputs: { ExecutiveGate: 'PROCEED' },
     originalInput: 'verify-pipeline-sse-legs',
     metacognitionRerunsUsed: 1,
   };
@@ -164,11 +165,11 @@ async function testChainedContinuationThenComplete() {
     fetchLeg += 1;
     if (fetchLeg === 1) {
       return sseResponse([
-        { type: 'module_complete', moduleName: 'Metacognition', layer: 'layer5', output: 'PROCEED' },
+        { type: 'module_complete', moduleName: 'ExecutiveGate', layer: 'layer5', output: 'PROCEED' },
         {
           type: 'pipeline_continuation',
           sharedMemory: contSm,
-          supervisor: 'Metacognition',
+          supervisor: 'ExecutiveGate',
           reason: 'unit-test',
         },
       ]);
@@ -225,7 +226,7 @@ async function testContinuationMissingSharedMemoryThrows() {
   const fetchImpl = async () => {
     fetchLeg += 1;
     return sseResponse([
-      { type: 'pipeline_continuation', supervisor: 'Metacognition', reason: 'bad', sharedMemory: null },
+      { type: 'pipeline_continuation', supervisor: 'ExecutiveGate', reason: 'bad', sharedMemory: null },
     ]);
   };
 
@@ -260,9 +261,9 @@ async function testContinuationMissingSharedMemoryThrows() {
 
 async function testPausedLegCarriesExecutionCursorAndReruns() {
   fetchLeg = 0;
-  const executionCursor = { v: 1, phase: 'layer14', nextModuleName: 'Memory' };
+  const executionCursor = { v: PIPELINE_SCHEMA_VERSION, phase: 'layer14', nextModuleName: 'ContextMemory' };
   const pausedSm = {
-    moduleOutputs: { Perception: 'ok' },
+    moduleOutputs: { SensorySalience: 'ok' },
     metacognitionRerunsUsed: 2,
     lastProviderUsed: 'openrouter',
     lastModelUsed: 'x/y',
@@ -272,7 +273,7 @@ async function testPausedLegCarriesExecutionCursorAndReruns() {
     return sseResponse([
       {
         type: 'paused',
-        nextModuleName: 'Memory',
+        nextModuleName: 'ContextMemory',
         phase: 'layer14',
         executionCursor,
         sharedMemory: pausedSm,

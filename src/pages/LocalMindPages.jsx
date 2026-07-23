@@ -1,5 +1,6 @@
 /** Many local-mind routes live here; prefer extracting new sections into colocated components. */
 import {
+  forwardRef,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -8,6 +9,7 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react';
+import { createPortal } from 'react-dom';
 import { Link, useSearchParams } from 'react-router-dom';
 import moment from 'moment';
 import {
@@ -39,6 +41,7 @@ import {
   Search,
   Settings,
   Sparkles,
+  Merge,
   ScanSearch,
   ThumbsDown,
   ThumbsUp,
@@ -46,8 +49,10 @@ import {
   Zap,
 } from 'lucide-react';
 import CognitiveHealthSnapshotPanels from '../components/cognitiveHealth/CognitiveHealthSnapshotPanels';
+import PageShell from '../components/PageShell';
 import { Button, Input, Textarea, toast } from '../components/ui';
 import { computeCognitiveHealthDerived } from '../lib/cognitiveHealthDerived';
+import { curiosityUiStatus } from '../lib/curiosityQueueMetrics';
 import { emergenceReviewState } from '../lib/emergenceReviewState';
 import { invokeLLM } from '../lib/llm';
 import {
@@ -58,24 +63,16 @@ import {
 } from '../lib/priorityUtils';
 import { llmService } from '../services/llmService';
 import {
-  BeliefStore,
-  CuriosityItem,
-  GoalItem,
   ScheduledTask,
   Dataset,
-  DreamRun,
   EmergenceEvent,
   FeedbackItem,
-  ConversationMessage,
-  LongTermMemory,
-  MindBiography,
   PipelineRun,
-  TemporalEvent,
   TrainingRun,
-  WorldModel,
 } from '../lib/data';
 import {
   DEFAULT_RUNTIME_SETTINGS,
+  getPipelineIdentityRuntimeSlice,
   getRuntimeSettings,
   saveRuntimeSettings,
   buildModulePromptOverridesForSave,
@@ -94,6 +91,7 @@ function pipelineModulesToDefaultsList(modules) {
   return modules.map(({ name, systemPrompt }) => ({ name, systemPrompt }));
 }
 import { MIND_PHASE_OPTIONS } from '../lib/mindPersistence';
+import { consolidateDuplicateCuriosityItemsInStore } from '../lib/consolidateMindEntities';
 import {
   runCuriosityDeepPursuitChain,
   runCuriosityPursuitLlmOnly,
@@ -107,6 +105,7 @@ import {
   computeCuriosityPipelineMinimapSnapshot,
   freshPursuitPipelineUiForNewGraphRun,
   initialCuriosityPipelineUi,
+  pursuitShowsLivePipelineChrome,
   reduceCuriosityPipelineSse,
 } from '../lib/curiosityPipelineSseUi';
 import {
@@ -118,8 +117,10 @@ import {
   updateCuriosityPursuitPipelineUiForId,
   upsertCuriosityPursuit,
 } from '../lib/curiosityPagePursuitStore';
+import { getGoalPagePursuitSnapshot, subscribeGoalPagePursuit } from '../lib/goalPagePursuitStore';
 import { formatPursuitThreadProgressLine } from '../lib/pursuitThreadStatusFormat';
 import {
+  PIPELINE_LOG_EMPTY_IDLE,
   PIPELINE_LOG_EMPTY_RUNNING,
   PIPELINE_LOG_PURSUIT_OUTSIDE_TAB,
   PIPELINE_MINIMAP_STRIP_LABEL,
@@ -130,6 +131,7 @@ import PursuitMetacognitionLimitsRow from '../components/pipeline/PursuitMetacog
 import PursuitPipelinePrepSelect from '../components/pipeline/PursuitPipelinePrepSelect';
 import NeuralNetworkViz from '../components/NeuralNetworkViz';
 import { scheduleTask } from '../lib/schedulerStore';
+import { normalizeScheduledTaskMindStorageProfile } from '../lib/mindEntityContext';
 import {
   isCooperativePauseAllExternalHoldActive,
   setCooperativePauseAllExternalHold,
@@ -141,7 +143,14 @@ import {
 } from '../lib/pipelineBusyGate';
 import { finalizeNewCuriosityRoot } from '../lib/curiosityLineage';
 import { generateMindBiographyViaLlm, persistMindBiographyVersion } from '../lib/mindBiographyLlm';
+import {
+  MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR,
+  MIND_STORAGE_PROFILE_PRIMARY,
+  setActiveMindEntityProfile,
+} from '../lib/mindEntityContext';
 import { useMindStorageRefresh, notifyMindStorageChanged } from '../lib/mindStorageEvents';
+import { useMindScope, useScopedEntities } from '../context/MindScopeContext';
+import MindScopeTabs from '../components/MindScopeTabs';
 import { LOCAL_LLM_SETUP_TEXT } from '../lib/localLlmGuide';
 import { searchLongTermMemory } from '../lib/longTermMemorySearch';
 import { cn } from '../lib/utils';
@@ -226,28 +235,6 @@ function LongTermMemoryCard({ mem, onDelete }) {
           </div>
         </div>
       </button>
-    </div>
-  );
-}
-
-function PageShell({ icon: Icon, title, description, actions, children }) {
-  return (
-    <div className="min-h-screen p-4 sm:p-6">
-      <div className="mx-auto max-w-7xl">
-        <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-          <div className="min-w-0">
-            <div className="mb-2 flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/15">
-                <Icon className="h-5 w-5 text-primary" />
-              </div>
-              <h1 className="text-2xl font-bold">{title}</h1>
-            </div>
-            <p className="max-w-2xl text-sm text-muted-foreground">{description}</p>
-          </div>
-          {actions ? <div className="flex flex-wrap gap-2">{actions}</div> : null}
-        </div>
-        {children}
-      </div>
     </div>
   );
 }
@@ -459,13 +446,17 @@ function emergenceEvidenceKey(ev) {
  * Recompute heuristic emergence quotes from saved PipelineRun rows when evidence_items were missing (e.g. legacy data).
  */
 /** @returns {Promise<boolean>} true if any row was updated */
-async function backfillEmergenceEvidenceFromPipelineRuns(events) {
+async function backfillEmergenceEvidenceFromPipelineRuns(
+  events,
+  stores = { PipelineRun, EmergenceEvent }
+) {
+  const { PipelineRun: RunStore, EmergenceEvent: EmergenceStore } = stores;
   const empty = events.filter((e) => e.pipeline_run_id && normalizeEmergenceEvidenceItems(e).length === 0);
   const runIds = [...new Set(empty.map((e) => e.pipeline_run_id))].slice(0, 40);
   const cache = new Map();
   for (const rid of runIds) {
     try {
-      const run = await PipelineRun.retrieve(rid);
+      const run = await RunStore.retrieve(rid);
       if (!run) continue;
       const mo = run.module_outputs || {};
       const sm = run.shared_memory && typeof run.shared_memory === 'object' ? run.shared_memory : {};
@@ -490,7 +481,7 @@ async function backfillEmergenceEvidenceFromPipelineRuns(events) {
       if (isHeuristic && pack.markers?.length) {
         patch.details = truncate(`Detected: ${pack.markers.join(', ')}`, 2000);
       }
-      await EmergenceEvent.update(e.id, patch);
+      await EmergenceStore.update(e.id, patch);
       updatedAny = true;
     } catch (err) {
       console.warn('[emergence] backfill update failed', e.id, err);
@@ -512,6 +503,8 @@ function healthDisplayTagList(field) {
 }
 
 export function LongTermMemoryPage() {
+  const { isMirror } = useMindScope();
+  const { LongTermMemory, PipelineRun } = useScopedEntities();
   const [memories, setMemories] = useState([]);
   const [query, setQuery] = useState('');
   const [filterType, setFilterType] = useState('all');
@@ -528,7 +521,7 @@ export function LongTermMemoryPage() {
     const data = await LongTermMemory.list('-created_date', 100);
     setMemories(data);
     setLoading(false);
-  }, []);
+  }, [LongTermMemory]);
 
   useEffect(() => {
     load();
@@ -543,7 +536,7 @@ export function LongTermMemoryPage() {
     }
     setSearching(true);
     try {
-      const results = await searchLongTermMemory(query, 20);
+      const results = await searchLongTermMemory(query, 20, LongTermMemory);
       setMemories(results);
     } finally {
       setSearching(false);
@@ -608,10 +601,18 @@ export function LongTermMemoryPage() {
   const filtered = filterType === 'all' ? memories : memories.filter((m) => (m.memory_type || '') === filterType);
 
   return (
-    <div className="min-h-screen p-4 sm:p-6">
+    <div className="w-full min-h-0 p-4 sm:p-6">
       <div className="mx-auto max-w-5xl">
         <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0">
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <MindScopeTabs />
+              {isMirror ? (
+                <span className="rounded-md border border-border bg-muted/40 px-2 py-0.5 text-[10px] text-muted-foreground">
+                  System B mirror store
+                </span>
+              ) : null}
+            </div>
             <h1 className="flex items-center gap-2 text-2xl font-bold text-foreground">
               <Brain className="h-6 w-6 text-blue-400" />
               Long-Term Memory
@@ -742,6 +743,8 @@ export function LongTermMemoryPage() {
 }
 
 export function MindBiographyPage() {
+  const { isMirror } = useMindScope();
+  const { MindBiography: MindBiographyStore } = useScopedEntities();
   const [biographies, setBiographies] = useState([]);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
@@ -749,7 +752,7 @@ export function MindBiographyPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    const data = await MindBiography.list('-created_date', 50);
+    const data = await MindBiographyStore.list('-created_date', 50);
     setBiographies(data);
     if (data.length > 0) {
       setExpandedId((prev) => (prev && data.some((b) => b.id === prev) ? prev : data[0].id));
@@ -757,7 +760,7 @@ export function MindBiographyPage() {
       setExpandedId(null);
     }
     setLoading(false);
-  }, []);
+  }, [MindBiographyStore]);
 
   useEffect(() => {
     load();
@@ -768,38 +771,45 @@ export function MindBiographyPage() {
   const generateBiography = async () => {
     setGenerating(true);
     try {
-      const prevBioList = await MindBiography.list('-created_date', 1);
-      const prevBio = prevBioList[0];
-
-      let gen;
-      try {
-        gen = await generateMindBiographyViaLlm(prevBio, {});
-      } catch (err) {
-        console.error('[biography] generation failed', err);
-        toast({
-          title: 'Biography generation failed',
-          description:
-            'The model did not return a usable AUTOBIOGRAPHY section (it may have echoed JSON context). Try again, use a stronger model, or reduce context. ' +
-            (err instanceof Error ? err.message : String(err)).slice(0, 220),
-          variant: 'destructive',
-        });
-        return;
+      if (isMirror) {
+        setActiveMindEntityProfile(MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR);
       }
+      try {
+        const prevBioList = await MindBiographyStore.list('-created_date', 1);
+        const prevBio = prevBioList[0];
 
-      await persistMindBiographyVersion({
-        sessionNumber: gen.sessionNumber,
-        fullText: gen.fullText,
-        summary: gen.summary,
-        keywords: gen.keywords,
-        values: gen.values,
-        changes: gen.changes,
-        memoriesCount: gen.memoriesCount,
-        beliefCount: gen.beliefCount,
-        sessionId: gen.runs[0]?.id || 'manual',
-        source: 'biography',
-      });
+        let gen;
+        try {
+          gen = await generateMindBiographyViaLlm(prevBio, {});
+        } catch (err) {
+          console.error('[biography] generation failed', err);
+          toast({
+            title: 'Biography generation failed',
+            description:
+              'The model did not return a usable AUTOBIOGRAPHY section (it may have echoed JSON context). Try again, use a stronger model, or reduce context. ' +
+              (err instanceof Error ? err.message : String(err)).slice(0, 220),
+            variant: 'destructive',
+          });
+          return;
+        }
 
-      await load();
+        await persistMindBiographyVersion({
+          sessionNumber: gen.sessionNumber,
+          fullText: gen.fullText,
+          summary: gen.summary,
+          keywords: gen.keywords,
+          values: gen.values,
+          changes: gen.changes,
+          memoriesCount: gen.memoriesCount,
+          beliefCount: gen.beliefCount,
+          sessionId: gen.runs[0]?.id || 'manual',
+          source: 'biography',
+        });
+
+        await load();
+      } finally {
+        setActiveMindEntityProfile(MIND_STORAGE_PROFILE_PRIMARY);
+      }
     } finally {
       setGenerating(false);
     }
@@ -807,7 +817,7 @@ export function MindBiographyPage() {
 
   const deleteBiography = async (id) => {
     if (!window.confirm('Delete this biography version? This cannot be undone.')) return;
-    await MindBiography.delete(id);
+    await MindBiographyStore.delete(id);
     if (expandedId === id) setExpandedId(null);
     toast({
       title: 'Biography deleted',
@@ -828,8 +838,16 @@ export function MindBiographyPage() {
   };
 
   return (
-    <div className="min-h-screen p-4 sm:p-6">
+    <div className="w-full min-h-0 p-4 sm:p-6">
       <div className="mx-auto max-w-4xl">
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <MindScopeTabs />
+        </div>
+        {isMirror ? (
+          <p className="mb-4 rounded-lg border border-border/80 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+            System B: isolated mirror biography store — “Write New Version” saves to this mirror mind only.
+          </p>
+        ) : null}
         <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0">
             <h1 className="flex items-center gap-2 text-2xl font-bold text-foreground">
@@ -847,7 +865,11 @@ export function MindBiographyPage() {
               <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
               Refresh
             </Button>
-            <Button onClick={() => void generateBiography()} disabled={generating || loading} className="gap-2">
+            <Button
+              onClick={() => void generateBiography()}
+              disabled={generating || loading}
+              className="gap-2"
+            >
               {generating ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
               Write New Version
             </Button>
@@ -1042,8 +1064,9 @@ function WorldModelEntryCard({ item, historyOpen, onToggleHistory, onRemove }) {
               {item.evidence}
             </p>
           ) : null}
-          <div className="mt-1 text-[10px] text-muted-foreground/80">
-            Key <code className="rounded bg-muted/50 px-1 font-mono text-[10px]">{item.key || itemKeyForRecord(item)}</code>
+          <div className="mt-1 break-words text-[10px] text-muted-foreground/80">
+            Key{' '}
+            <code className="break-all rounded bg-muted/50 px-1 font-mono text-[10px]">{item.key || itemKeyForRecord(item)}</code>
             {when ? ` · updated ${moment(when).fromNow()}` : null}
           </div>
         </div>
@@ -1103,6 +1126,7 @@ function WorldModelEntryCard({ item, historyOpen, onToggleHistory, onRemove }) {
 }
 
 export function WorldModelPage() {
+  const { WorldModel, BeliefStore, PipelineRun, LongTermMemory, TemporalEvent } = useScopedEntities();
   const [items, setItems] = useState([]);
   const [showArchived, setShowArchived] = useState(false);
   const [form, setForm] = useState({
@@ -1125,7 +1149,7 @@ export function WorldModelPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [WorldModel]);
 
   useEffect(() => {
     load();
@@ -1184,7 +1208,7 @@ export function WorldModelPage() {
       const events = temporalEventsExcludingPauseNoise(eventsRaw);
       let current = [...existingRows];
       const result = await invokeLLM({
-        prompt: `Build or refine this mind's world model for MyBrain (graph pipeline, long-term memory, beliefs, temporal timeline, consolidation).
+        prompt: `Build or refine this mind's world model for MetaSelf-CognitiveStack (graph pipeline, long-term memory, beliefs, temporal timeline, consolidation).
 
 Sources:
 - Recent Voice outputs from pipeline runs
@@ -1355,6 +1379,9 @@ ${events.map((e) => `- ${e.title}: ${truncate(e.details, 140)}`).join('\n').slic
         </div>
       }
     >
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <MindScopeTabs />
+      </div>
       <Panel className="mb-6 border-border/80 bg-muted/10">
         <p className="text-sm leading-relaxed text-muted-foreground">
           Entries use categories <strong className="text-foreground/90">self</strong>,{' '}
@@ -1430,7 +1457,7 @@ ${events.map((e) => `- ${e.title}: ${truncate(e.details, 140)}`).join('\n').slic
         </Panel>
       ) : null}
 
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
+      <div className="grid min-w-0 grid-cols-1 gap-6 xl:grid-cols-[minmax(0,360px)_minmax(0,1fr)]">
         <Panel className="space-y-3">
           <div className="text-sm font-semibold">Add world-model entry</div>
           <Input
@@ -1512,19 +1539,6 @@ const CURIOSITY_QUESTION_FILTER_OPTIONS = [
   { value: 'pursuing', label: 'Pursuing' },
   { value: 'resolved', label: 'Resolved' },
 ];
-
-function curiosityNormStatus(s) {
-  const v = s || 'open';
-  if (v === 'pursuing' || v === 'resolved' || v === 'dormant') return v;
-  return 'open';
-}
-
-/** DB `pursuing` without a live page slot is stale (e.g. reload mid-run) — treat as `open` in the UI. */
-function curiosityUiStatus(item, pursuits) {
-  const norm = curiosityNormStatus(item.status);
-  if (norm === 'pursuing' && !pursuits[String(item.id)]?.running) return 'open';
-  return norm;
-}
 
 /** True if any item in this thread cluster has a live full/quick pursue slot (page store). */
 function curiosityClusterHasActivePursuit(clusterItems, pursuitsState) {
@@ -1625,7 +1639,7 @@ function CuriosityCollapsibleThread({ text }) {
       <summary className="cursor-pointer select-none px-2 py-1.5 text-xs font-medium text-muted-foreground hover:bg-muted/35">
         Pursuit thread <span className="font-normal opacity-70">· expand ({s.length} chars)</span>
       </summary>
-      <div className="max-h-[min(45vh,24rem)] overflow-y-auto border-t border-border/40 px-2 py-2 text-xs leading-relaxed text-muted-foreground">
+      <div className="max-h-[min(45svh,24rem)] overflow-y-auto border-t border-border/40 px-2 py-2 text-xs leading-relaxed text-muted-foreground">
         <p className="whitespace-pre-wrap break-words">{s}</p>
       </div>
     </details>
@@ -1647,7 +1661,7 @@ function CuriosityCollapsibleResolution({ text }) {
       <summary className="cursor-pointer select-none px-2 py-1.5 text-xs font-medium text-green-800 dark:text-green-300/90 hover:bg-green-500/15">
         Answer / reflection <span className="font-normal opacity-70">· expand ({s.length} chars)</span>
       </summary>
-      <div className="max-h-[min(50vh,28rem)] overflow-y-auto border-t border-green-500/20 p-2 text-xs leading-relaxed text-green-900 dark:text-green-300/95">
+      <div className="max-h-[min(50svh,28rem)] overflow-y-auto border-t border-green-500/20 p-2 text-xs leading-relaxed text-green-900 dark:text-green-300/95">
         <p className="whitespace-pre-wrap break-words">{s}</p>
       </div>
     </details>
@@ -1669,20 +1683,49 @@ function CuriosityCollapsibleLogDetail({ detail }) {
       <summary className="cursor-pointer font-mono text-[10px] text-muted-foreground hover:text-foreground/80">
         Module output · expand ({s.length} chars)
       </summary>
-      <pre className="mt-1 max-h-[min(36vh,18rem)] overflow-y-auto whitespace-pre-wrap break-words text-[11px] text-muted-foreground/90">
+      <pre className="mt-1 max-h-[min(36svh,18rem)] overflow-y-auto whitespace-pre-wrap break-words text-[11px] text-muted-foreground/90">
         {s}
       </pre>
     </details>
   );
 }
 
+/**
+ * Mobile expanded curiosity pipeline must render above AppLayout’s sticky header (z-30); `main` is z-20 so
+ * fixed descendants cannot win — portal to `document.body` with a higher z-index.
+ */
+const CuriosityPipelineMobilePortal = forwardRef(function CuriosityPipelineMobilePortal(
+  { portal, className, children },
+  ref
+) {
+  const el = (
+    <div ref={ref} className={className}>
+      {children}
+    </div>
+  );
+  return portal ? createPortal(el, document.body) : el;
+});
+
+function subscribeMaxWidthLg(listener) {
+  const mq = window.matchMedia('(max-width: 1023px)');
+  mq.addEventListener('change', listener);
+  return () => mq.removeEventListener('change', listener);
+}
+function getMaxWidthLgSnapshot() {
+  return typeof window !== 'undefined' && window.matchMedia('(max-width: 1023px)').matches;
+}
+
 export function CuriosityPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const { isMirror, profile: mindStorageProfile } = useMindScope();
+  const se = useScopedEntities();
+  const curiosityStore = se.CuriosityItem;
   const dashboardFocusConsumedRef = useRef(null);
   const [items, setItems] = useState([]);
   const [draft, setDraft] = useState('');
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
+  const [consolidatingQuestions, setConsolidatingQuestions] = useState(false);
   const [addingCuriosity, setAddingCuriosity] = useState(false);
   const { pursuits } = useSyncExternalStore(
     subscribeCuriosityPagePursuit,
@@ -1707,11 +1750,15 @@ export function CuriosityPage() {
     () => Object.values(pursuits).some((p) => p.running),
     [pursuits]
   );
+  const pageSystemAccent = isMirror ? 'b' : 'a';
+  const entryAccent = (entry) =>
+    entry?.mindStorageProfile === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR ? 'b' : 'a';
   const [pipelineCarouselIndex, setPipelineCarouselIndex] = useState(0);
   const curiosityPipelineLogRef = useRef(null);
   const curiosityPipelinePanelRef = useRef(null);
   const curiosityPipelineCarouselRef = useRef(null);
   const prevAnyPursuitRunningRef = useRef(false);
+  const curiosityPipelineLayoutSyncMountedRef = useRef(false);
   const prevPursuitCountRef = useRef(0);
   /** Synchronous guard so two rapid clicks cannot start two group runs before React re-renders. */
   const threadGroupPursueLockedRef = useRef(false);
@@ -1719,11 +1766,16 @@ export function CuriosityPage() {
   const [threadGroupPursueRootId, setThreadGroupPursueRootId] = useState(null);
   /** Default collapsed on small screens so the fixed fullscreen pipeline layer (z-50) does not cover the list and block "Pursue group". */
   const [curiosityMobileSheetExpanded, setCuriosityMobileSheetExpanded] = useState(false);
+  const isMaxLg = useSyncExternalStore(subscribeMaxWidthLg, getMaxWidthLgSnapshot, () => false);
+  /** When true, fullscreen panel is portaled so it stacks above the app chrome (see CuriosityPipelineMobilePortal). */
+  const portalMobileCuriosityPipeline = curiosityMobileSheetExpanded && isMaxLg;
   /** Desktop: entire pipeline panel starts collapsed so the question list is front-and-centre on page load. */
   const [curiosityPipelinePanelOpen, setCuriosityPipelinePanelOpen] = useState(false);
   /** Desktop only: execution log starts collapsed so the pipeline panel does not dominate the page. */
   const [curiosityDesktopLogExpanded, setCuriosityDesktopLogExpanded] = useState(false);
   const [curiosityQuestionFilter, setCuriosityQuestionFilter] = useState('open');
+  /** Which thread roots are expanded; default none = collapsed (root + sub-count only). */
+  const [expandedCuriosityThreadRoots, setExpandedCuriosityThreadRoots] = useState(() => new Set());
   const cognitiveModuleCount = useMemo(() => COGNITIVE_MODULES.length, []);
 
   const activePursuitId = pursuitIds[pipelineCarouselIndex] ?? null;
@@ -1731,13 +1783,41 @@ export function CuriosityPage() {
     if (!activePursuitId) return null;
     return pursuits[activePursuitId] ?? fallbackCuriosityPursuitEntryFromItems(activePursuitId, items);
   }, [activePursuitId, pursuits, items]);
-  const activeCuriosityPipelineUi = activePursuit?.curiosityPipelineUi;
+  const activeCuriosityPipelineUi = useMemo(() => {
+    if (!activePursuit) return null;
+    const raw = activePursuit.curiosityPipelineUi;
+    if (pursuitShowsLivePipelineChrome(activePursuit)) return raw;
+    return freshPursuitPipelineUiForNewGraphRun(raw);
+  }, [activePursuit]);
   const activePursuitProgress = activePursuit?.pursuitProgress ?? null;
 
   const interruptedResumeCuriosityItem = useMemo(
     () => (activePursuitId ? items.find((i) => String(i.id) === String(activePursuitId)) : null),
     [activePursuitId, items]
   );
+
+  const curiosityPipelineRootClassName = useMemo(
+    () =>
+      portalMobileCuriosityPipeline
+        ? 'min-w-0 fixed inset-0 z-[70] flex min-h-0 flex-col bg-background pt-[env(safe-area-inset-top,0px)] pb-[env(safe-area-inset-bottom,0px)]'
+        : cn(
+            'min-w-0',
+            curiosityMobileSheetExpanded
+              ? 'max-lg:fixed max-lg:inset-0 max-lg:z-50 max-lg:flex max-lg:flex-col max-lg:bg-background max-lg:pt-[env(safe-area-inset-top,0px)]'
+              : 'max-lg:fixed max-lg:inset-x-0 max-lg:bottom-0 max-lg:z-40 max-lg:px-2 max-lg:pt-1',
+            'lg:relative lg:z-auto lg:bg-transparent lg:pt-0 lg:scroll-mt-[calc(env(safe-area-inset-top,0px)+4.5rem)]'
+          ),
+    [portalMobileCuriosityPipeline, curiosityMobileSheetExpanded]
+  );
+
+  useEffect(() => {
+    if (!portalMobileCuriosityPipeline) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [portalMobileCuriosityPipeline]);
 
   const pipelineLogScrollRef = useRef({ pursuitId: null, len: 0 });
 
@@ -1842,9 +1922,24 @@ export function CuriosityPage() {
             pursuitProgress: null,
             curiosityPipelineUi: initialCuriosityPipelineUi(),
             question: String(item.question || '').trim() || undefined,
+            mindStorageProfile,
           });
         }
       }
+      if (dashboardFocusConsumedRef.current === focusId) return;
+      dashboardFocusConsumedRef.current = focusId;
+      setCuriosityMobileSheetExpanded(true);
+      requestAnimationFrame(() => {
+        document.getElementById(`curiosity-focus-${focusId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+      setSearchParams(
+        (p) => {
+          const n = new URLSearchParams(p);
+          n.delete('focus');
+          return n;
+        },
+        { replace: true }
+      );
       return;
     }
 
@@ -1938,6 +2033,11 @@ export function CuriosityPage() {
   }, [pursuitIds.length, handlePipelineCarouselScroll]);
 
   useLayoutEffect(() => {
+    if (!curiosityPipelineLayoutSyncMountedRef.current) {
+      curiosityPipelineLayoutSyncMountedRef.current = true;
+      prevAnyPursuitRunningRef.current = anyPursuitRunning;
+      return;
+    }
     if (anyPursuitRunning && !prevAnyPursuitRunningRef.current) {
       /* Mobile uses a fixed bottom dock; scrollIntoView cannot bring it into the main column. */
       if (typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches) {
@@ -1947,18 +2047,11 @@ export function CuriosityPage() {
     prevAnyPursuitRunningRef.current = anyPursuitRunning;
   }, [anyPursuitRunning]);
 
-  useEffect(() => {
-    if (anyPursuitRunning) {
-      setCuriosityMobileSheetExpanded(true);
-      setCuriosityPipelinePanelOpen(true);
-    }
-  }, [anyPursuitRunning]);
-
   const scheduleBlocked = interactiveGraphOrStreamBusy || anyPursuitRunning;
 
   const load = useCallback(async () => {
     setLoading(true);
-    const raw = await CuriosityItem.list('-created_date', 100);
+    const raw = await curiosityStore.listAll('-created_date');
     const sorted = [...raw].sort((a, b) => {
       const pa = effectiveItemPriority(a);
       const pb = effectiveItemPriority(b);
@@ -1967,7 +2060,7 @@ export function CuriosityPage() {
     });
     setItems(sorted);
     setLoading(false);
-  }, []);
+  }, [curiosityStore]);
 
   useEffect(() => {
     load();
@@ -1979,7 +2072,7 @@ export function CuriosityPage() {
     if (!draft.trim()) return;
     setAddingCuriosity(true);
     try {
-      const created = await CuriosityItem.create({
+      const created = await curiosityStore.create({
         question: draft.trim(),
         status: 'open',
         priority: 0.5,
@@ -1987,7 +2080,7 @@ export function CuriosityPage() {
         source: 'manual',
       });
       try {
-        await finalizeNewCuriosityRoot(created);
+        await finalizeNewCuriosityRoot(created, curiosityStore);
       } catch {
         /* ignore */
       }
@@ -2003,15 +2096,15 @@ export function CuriosityPage() {
     setGenerating(true);
     try {
       const [memories, beliefs, runs, existingOpen] = await Promise.all([
-        LongTermMemory.list('-created_date', 20),
-        BeliefStore.filter({ status: 'active' }, '-created_date', 25),
-        PipelineRun.list('-created_date', 10),
-        CuriosityItem.filter({ status: 'open' }, '-created_date', 30),
+        se.LongTermMemory.list('-created_date', 20),
+        se.BeliefStore.filter({ status: 'active' }, '-created_date', 25),
+        se.PipelineRun.list('-created_date', 10),
+        curiosityStore.filter({ status: 'open' }, '-created_date', 30),
       ]);
 
       const beliefsForPrompt = beliefs.length
         ? beliefs.slice(0, 12)
-        : (await BeliefStore.list('-created_date', 15)).slice(0, 12);
+        : (await se.BeliefStore.list('-created_date', 15)).slice(0, 12);
 
       const runsText = runs
         .map((run) => truncate(String(run.final_output || ''), 500))
@@ -2071,7 +2164,7 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
           typeof c.priority === 'number' && !Number.isNaN(c.priority)
             ? clampPriority(c.priority, DEFAULT_MANUAL_LIKE_PRIORITY)
             : DEFAULT_MANUAL_LIKE_PRIORITY;
-        const created = await CuriosityItem.create({
+        const created = await curiosityStore.create({
           question: q,
           pursuit_thread: String(c.pursuit_thread || '').trim(),
           priority,
@@ -2080,7 +2173,7 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
           times_returned_to: 0,
         });
         try {
-          await finalizeNewCuriosityRoot(created);
+          await finalizeNewCuriosityRoot(created, curiosityStore);
         } catch {
           /* ignore */
         }
@@ -2088,7 +2181,7 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
       }
 
       if (n > 0) {
-        await TemporalEvent.create({
+        await se.TemporalEvent.create({
           title: 'curiosity_sparked',
           details: `${n} new curiosity thread(s) generated`,
           source: 'curiosity',
@@ -2112,6 +2205,34 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
     }
   };
 
+  const consolidateCuriosityQuestions = async () => {
+    if (isMirror) return;
+    setConsolidatingQuestions(true);
+    try {
+      const snap = getCuriosityPagePursuitSnapshot();
+      const skipRunningIds = new Set();
+      for (const [id, e] of Object.entries(snap.pursuits)) {
+        if (e?.running) skipRunningIds.add(id);
+      }
+      const result = await consolidateDuplicateCuriosityItemsInStore({ skipRunningIds });
+      const extra =
+        result.skippedRunning != null && result.skippedRunning > 0
+          ? ` (${result.skippedRunning} cluster(s) skipped — active pursuit.)`
+          : '';
+      toast({ title: 'Questions consolidated', description: `${result.message}${extra}` });
+      await load();
+    } catch (e) {
+      console.error(e);
+      toast({
+        title: 'Consolidate failed',
+        description: e instanceof Error ? e.message : String(e),
+        variant: 'destructive',
+      });
+    } finally {
+      setConsolidatingQuestions(false);
+    }
+  };
+
   const pursueItemFull = async (item) => {
     if (isCooperativePauseAllExternalHoldActive()) {
       setCooperativePauseAllExternalHold(false);
@@ -2128,10 +2249,12 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
       pursuitProgress: 'Starting…',
       curiosityPipelineUi: freshPursuitPipelineUiForNewGraphRun(prevUi),
       question: String(item.question || '').trim() || undefined,
+      mindStorageProfile,
     });
     let pipelinePaused = false;
     try {
       const { pipelinePaused: didPause } = await runCuriosityDeepPursuitChain(item, {
+        mindStorageProfile,
         signal: ac.signal,
         onProgress: (label) => {
           patchCuriosityPursuitEntry(cid, { pursuitProgress: label });
@@ -2161,7 +2284,7 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
         description: e instanceof Error ? e.message : String(e),
       });
       try {
-        await CuriosityItem.update(item.id, { status: 'open' });
+        await curiosityStore.update(item.id, { status: 'open' });
       } catch {
         /* ignore */
       }
@@ -2209,8 +2332,9 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
       pursuitProgress: null,
       question: String(item.question || '').trim() || undefined,
       curiosityPipelineUi: freshPursuitPipelineUiForNewGraphRun(prev?.curiosityPipelineUi),
+      mindStorageProfile,
     });
-  }, []);
+  }, [mindStorageProfile]);
 
   /** Ensures the slot exists, selects it in the carousel, and reveals the panel (desktop + mobile) so run-limit inputs apply to this question. */
   const focusCuriosityPursuitSlot = useCallback(
@@ -2245,11 +2369,12 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
       pursuitProgress: 'Quick reflect…',
       curiosityPipelineUi: initialCuriosityPipelineUi(),
       question: String(item.question || '').trim() || undefined,
+      mindStorageProfile,
     });
     try {
-      await CuriosityItem.update(item.id, { status: 'pursuing' });
+      await curiosityStore.update(item.id, { status: 'pursuing' });
       await load();
-      await runCuriosityPursuitLlmOnly(item);
+      await runCuriosityPursuitLlmOnly(item, { mindStorageProfile });
       await load();
     } catch (e) {
       console.error(e);
@@ -2257,7 +2382,7 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
         title: 'Quick reflect failed',
         description: e instanceof Error ? e.message : String(e),
       });
-      await CuriosityItem.update(item.id, { status: 'open' });
+      await curiosityStore.update(item.id, { status: 'open' });
       await load();
     } finally {
       removeCuriosityPursuit(cid);
@@ -2266,11 +2391,13 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
 
   async function hasPendingPursuitForTarget(targetId) {
     const all = await ScheduledTask.list('-created_date', 120);
+    const wantProfile = normalizeScheduledTaskMindStorageProfile(mindStorageProfile);
     return all.some(
       (t) =>
         t.task_type === 'curiosity_pursuit' &&
         (t.status || 'pending') === 'pending' &&
-        t.target_curiosity_id === targetId
+        t.target_curiosity_id === targetId &&
+        normalizeScheduledTaskMindStorageProfile(t.mind_storage_profile) === wantProfile
     );
   }
 
@@ -2294,6 +2421,7 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
       target_curiosity_id: item.id,
       reason: `Curiosity: ${truncate(item.question, 120)}`,
       scheduled_by: 'user',
+      mind_storage_profile: mindStorageProfile,
       ...(pursUi && pursUi.metacognitionMaxReruns != null
         ? { metacognition_max_reruns_override: pursUi.metacognitionMaxReruns }
         : {}),
@@ -2394,13 +2522,13 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
   };
 
   const setStatus = async (id, status) => {
-    await CuriosityItem.update(id, { status });
+    await curiosityStore.update(id, { status });
     await load();
     notifyMindStorageChanged({ source: 'curiosity' });
   };
 
   const deleteItem = async (id) => {
-    await CuriosityItem.delete(id);
+    await curiosityStore.delete(id);
     await load();
     notifyMindStorageChanged({ source: 'curiosity' });
   };
@@ -2469,6 +2597,16 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
       });
   }, [filteredCuriosityClusters, pursuits]);
 
+  const toggleCuriosityThreadExpanded = useCallback((rootId) => {
+    const k = String(rootId);
+    setExpandedCuriosityThreadRoots((prev) => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+  }, []);
+
   return (
     <PageShell
       icon={ScanSearch}
@@ -2483,23 +2621,52 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
           <Button
             type="button"
             onClick={() => void generateItems()}
-            disabled={generating || addingCuriosity}
+            disabled={generating || addingCuriosity || consolidatingQuestions}
             className="gap-2 border border-sky-500/30 bg-sky-500/10 text-sky-900 hover:bg-sky-500/20 dark:text-sky-200"
           >
             {generating ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
             Generate Questions
           </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => void consolidateCuriosityQuestions()}
+            disabled={isMirror || consolidatingQuestions || loading || generating || addingCuriosity}
+            className="gap-2"
+            title="Merge duplicate or paraphrased questions in the store"
+          >
+            {consolidatingQuestions ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Merge className="h-4 w-4" />
+            )}
+            Consolidate Questions
+          </Button>
         </div>
       }
     >
       <div className="mx-auto max-w-4xl space-y-6">
+        <div className="flex flex-wrap items-center gap-2">
+          <MindScopeTabs />
+          {isMirror ? (
+            <span className="rounded-md border border-border bg-muted/40 px-2 py-0.5 text-[10px] text-muted-foreground">
+              System B mirror — full graph pursuit and scheduled runs use the isolated mirror mind store.
+            </span>
+          ) : null}
+        </div>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <div className="rounded-xl border border-sky-500/20 bg-sky-500/5 p-4 text-center">
             <div className="text-2xl font-bold text-sky-800 dark:text-sky-300">{openItems.length}</div>
             <div className="text-xs text-muted-foreground">Open questions</div>
           </div>
-          <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 text-center">
-            <div className="text-2xl font-bold text-primary">{pursuingItems.length}</div>
+          <div className={cn(
+            'rounded-xl border p-4 text-center',
+            pageSystemAccent === 'b'
+              ? 'border-red-500/20 bg-red-500/5'
+              : 'border-primary/20 bg-primary/5'
+          )}>
+            <div className={cn('text-2xl font-bold', pageSystemAccent === 'b' ? 'text-red-400' : 'text-primary')}>{pursuingItems.length}</div>
             <div className="text-xs text-muted-foreground">Actively pursuing</div>
           </div>
           <div className="rounded-xl border border-green-500/20 bg-green-500/5 p-4 text-center">
@@ -2524,29 +2691,28 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
           ))}
         </div>
 
-        {pursuitIds.length > 0 || pursuitPrepCandidates.length > 0 ? (
-          <div
+        {(pursuitIds.length > 0 || pursuitPrepCandidates.length > 0) ? (
+          <CuriosityPipelineMobilePortal
             ref={curiosityPipelinePanelRef}
-            className={cn(
-              'min-w-0',
-              /* Sticky was relative to <main>; the mobile header sits outside main, so the panel often vanished. */
-              curiosityMobileSheetExpanded
-                ? 'max-lg:fixed max-lg:inset-0 max-lg:z-50 max-lg:flex max-lg:flex-col max-lg:bg-background max-lg:pt-[env(safe-area-inset-top,0px)]'
-                : 'max-lg:fixed max-lg:inset-x-0 max-lg:bottom-0 max-lg:z-40 max-lg:px-2 max-lg:pt-1',
-              'lg:relative lg:z-auto lg:bg-transparent lg:pt-0 lg:scroll-mt-[calc(env(safe-area-inset-top,0px)+4.5rem)]'
-            )}
+            portal={portalMobileCuriosityPipeline}
+            className={curiosityPipelineRootClassName}
           >
             <div
               className={cn(
-                'space-y-3 rounded-xl border border-primary/25 bg-card p-3 shadow-sm sm:p-4',
+                'space-y-3 rounded-xl border bg-card p-3 shadow-sm sm:p-4',
+                pageSystemAccent === 'b'
+                  ? 'border-red-500/40 shadow-[inset_4px_0_0_0_rgba(239,68,68,0.45)]'
+                  : 'border-primary/25',
                 curiosityMobileSheetExpanded
-                  ? 'max-lg:mx-0 max-lg:mb-0 max-lg:flex max-lg:h-full max-lg:min-h-0 max-lg:flex-1 max-lg:flex-col max-lg:gap-3 max-lg:overflow-hidden max-lg:rounded-none max-lg:border-0 max-lg:shadow-none max-lg:max-h-none max-lg:pb-[env(safe-area-inset-bottom,0px)]'
+                  ? 'max-lg:mx-0 max-lg:mb-0 max-lg:flex max-lg:h-full max-lg:min-h-0 max-lg:flex-1 max-lg:flex-col max-lg:gap-3 max-lg:overflow-x-hidden max-lg:rounded-none max-lg:border-0 max-lg:shadow-none max-lg:max-h-none max-lg:pb-[env(safe-area-inset-bottom,0px)]'
                   : 'max-lg:mx-auto max-lg:space-y-0 max-lg:overflow-x-hidden max-lg:rounded-b-none max-lg:rounded-t-2xl max-lg:border-x-0 max-lg:border-b-0 max-lg:px-2 max-lg:py-1.5 max-lg:pb-[max(0.5rem,env(safe-area-inset-bottom,0px))] max-lg:shadow-[0_-6px_28px_rgba(0,0,0,0.14)] dark:max-lg:shadow-[0_-6px_28px_rgba(0,0,0,0.45)]'
               )}
             >
               <div
                 className={cn(
                   'flex shrink-0 flex-wrap items-start justify-between gap-2',
+                  curiosityMobileSheetExpanded &&
+                    'max-lg:relative max-lg:z-[70] max-lg:border-b max-lg:border-border/60 max-lg:bg-background max-lg:pb-2',
                   !curiosityMobileSheetExpanded && 'max-lg:flex-nowrap max-lg:items-center max-lg:gap-1.5'
                 )}
               >
@@ -2557,7 +2723,7 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
                       !curiosityMobileSheetExpanded && 'max-lg:text-xs'
                     )}
                   >
-                    <Layers className="h-4 w-4 shrink-0 text-primary" />
+                    <Layers className={cn('h-4 w-4 shrink-0', pageSystemAccent === 'b' ? 'text-red-400' : 'text-primary')} />
                     <span className="truncate">Curiosity pipeline</span>
                     {pursuitIds.length > 1 ? (
                       <span className="shrink-0 text-[10px] font-normal tabular-nums text-muted-foreground">
@@ -2675,12 +2841,16 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
                     variant="ghost"
                     size="icon"
                     className={cn(
-                      'h-9 w-9 shrink-0 lg:hidden',
+                      'relative z-[80] h-9 w-9 shrink-0 touch-manipulation lg:hidden',
                       !curiosityMobileSheetExpanded && 'max-lg:h-8 max-lg:w-8'
                     )}
                     aria-expanded={curiosityMobileSheetExpanded}
                     aria-label={curiosityMobileSheetExpanded ? 'Collapse pipeline panel' : 'Expand pipeline panel'}
-                    onClick={() => setCuriosityMobileSheetExpanded((v) => !v)}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setCuriosityMobileSheetExpanded((v) => !v);
+                    }}
                   >
                     {curiosityMobileSheetExpanded ? (
                       <ChevronDown className="h-5 w-5" />
@@ -2783,14 +2953,17 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
                   className={cn(
                     'flex w-full flex-nowrap overflow-x-auto overscroll-x-contain scroll-smooth snap-x snap-mandatory',
                     '[scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden',
-                    'touch-pan-x [-webkit-overflow-scrolling:touch]',
+                    /* pan-x alone blocks vertical scrolling on nested overflow-y (mobile “stuck”); allow both axes */
+                    '[touch-action:pan-x_pan-y] [-webkit-overflow-scrolling:touch]',
                     curiosityMobileSheetExpanded && 'max-lg:min-h-0 max-lg:flex-1'
                   )}
                 >
                   {pursuitIds.map((pid) => {
                     const storedEntry = pursuits[pid];
                     const entry = storedEntry ?? fallbackCuriosityPursuitEntryFromItems(pid, items);
-                    const pipelineUi = entry.curiosityPipelineUi;
+                    const pipelineUi = pursuitShowsLivePipelineChrome(entry)
+                      ? entry.curiosityPipelineUi
+                      : freshPursuitPipelineUiForNewGraphRun(entry.curiosityPipelineUi);
                     const slideMinimap = computeCuriosityPipelineMinimapSnapshot(
                       pipelineUi.moduleStatuses,
                       entry.running
@@ -2815,13 +2988,19 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
                           >
                             <div
                               className={cn(
-                                'relative h-[min(280px,40vh)] min-h-[13rem] min-w-0 overflow-hidden rounded-lg border border-border bg-muted/10',
+                                'relative h-[min(280px,40svh)] min-h-[13rem] min-w-0 overflow-hidden rounded-lg border',
+                                entry.running && entryAccent(entry) === 'b'
+                                  ? 'border-red-500/45 bg-red-500/[0.08] shadow-[inset_0_0_80px_rgba(239,68,68,0.10)] dark:bg-red-500/10 dark:shadow-[inset_0_0_90px_rgba(239,68,68,0.14)]'
+                                  : entry.running && entryAccent(entry) === 'a'
+                                    ? 'border-blue-500/45 bg-blue-500/[0.08] shadow-[inset_0_0_80px_rgba(59,130,246,0.10)] dark:bg-blue-500/10 dark:shadow-[inset_0_0_90px_rgba(59,130,246,0.14)]'
+                                    : 'border-border bg-muted lg:bg-muted/10',
                                 curiosityDesktopLogExpanded ? 'lg:col-span-2' : 'lg:col-span-1'
                               )}
                             >
                               <NeuralNetworkViz
                                 variant="embedded"
                                 activeModuleId={activeModuleId}
+                                runAccent={entry.running ? entryAccent(entry) : null}
                                 ariaLabel="Curiosity pursuit pipeline modules"
                               />
                             </div>
@@ -2829,7 +3008,7 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
                               className={cn(
                                 'flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-card',
                                 curiosityDesktopLogExpanded
-                                  ? 'lg:max-h-[min(72vh,520px)] lg:min-h-[min(240px,32vh)]'
+                                  ? 'lg:max-h-[min(72svh,520px)] lg:min-h-[min(240px,32svh)]'
                                   : 'lg:max-h-none lg:min-h-0 lg:shrink-0'
                               )}
                             >
@@ -2883,7 +3062,11 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
                                 <div className="space-y-2 p-3">
                                   {pipelineUi.executionLog.length === 0 ? (
                                     <p className="text-xs text-muted-foreground">
-                                      {storedEntry ? PIPELINE_LOG_EMPTY_RUNNING : PIPELINE_LOG_PURSUIT_OUTSIDE_TAB}
+                                      {storedEntry
+                                        ? pursuitShowsLivePipelineChrome(entry)
+                                          ? PIPELINE_LOG_EMPTY_RUNNING
+                                          : PIPELINE_LOG_EMPTY_IDLE
+                                        : PIPELINE_LOG_PURSUIT_OUTSIDE_TAB}
                                     </p>
                                   ) : (
                                     pipelineUi.executionLog.map((logEntry, i) => (
@@ -2915,7 +3098,7 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
               </div>
               ) : null}
             </div>
-          </div>
+          </CuriosityPipelineMobilePortal>
         ) : null}
 
         <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,320px)_minmax(0,1fr)]">
@@ -2976,44 +3159,111 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
                   const clusterPursuitBusy = curiosityClusterHasActivePursuit(fullClusterForRoot, pursuits);
                   const threadPursueDisabled =
                     batchRunningOther || batchRunningHere || clusterPursuitBusy;
+                  const hasMultiItemThread = fullClusterForRoot.length > 1;
+                  const subQuestionCount = Math.max(0, fullClusterForRoot.length - 1);
+                  const threadListExpanded = expandedCuriosityThreadRoots.has(rootKey);
+                  const pursueThreadTitle =
+                    batchRunningHere
+                      ? 'Running pursuits for this thread…'
+                      : batchRunningOther
+                        ? 'Another thread batch is still running'
+                        : clusterPursuitBusy
+                          ? 'A pursue in this thread is still running'
+                          : 'Run every open/dormant lead in this thread in order (full thread, not only rows visible under the filter). Pipeline panel defaults to a bottom strip on phones so this stays tappable.';
+
                   return (
                     <div key={rootId} className="space-y-2">
-                      <div className="relative z-10 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/60 bg-muted/15 px-3 py-2">
-                        <div className="min-w-0">
-                          <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                            Root thread
+                      {hasMultiItemThread && !threadListExpanded ? (
+                        <div className="rounded-lg border border-border/60 bg-muted/15 px-3 py-2.5">
+                          <div className="flex flex-wrap items-start justify-between gap-2">
+                            <button
+                              type="button"
+                              className="flex min-w-0 flex-1 items-start gap-2 rounded-md p-1 text-left transition-colors hover:bg-muted/40 -m-1"
+                              onClick={() => toggleCuriosityThreadExpanded(rootKey)}
+                            >
+                              <ChevronRight className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+                              <div className="min-w-0">
+                                <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                                  Thread
+                                </div>
+                                <CuriosityClampedQuestion text={rootItem?.question || rootId} className="min-w-0" />
+                                <p className="mt-1 text-[11px] text-muted-foreground">
+                                  {subQuestionCount} sub-question{subQuestionCount === 1 ? '' : 's'}
+                                </p>
+                              </div>
+                            </button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="shrink-0"
+                              disabled={threadPursueDisabled}
+                              title={pursueThreadTitle}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void runThreadGroupPursuit(fullClusterForRoot, rootId);
+                              }}
+                            >
+                              {batchRunningHere ? (
+                                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+                              ) : (
+                                <Play className="mr-1.5 h-3.5 w-3.5 opacity-80" aria-hidden />
+                              )}
+                              Pursue thread
+                            </Button>
                           </div>
-                          <CuriosityClampedQuestion text={rootItem?.question || rootId} className="min-w-0" />
                         </div>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="shrink-0"
-                          disabled={threadPursueDisabled}
-                          title={
-                            batchRunningHere
-                              ? 'Running pursuits for this thread…'
-                              : batchRunningOther
-                                ? 'Another thread batch is still running'
-                                : clusterPursuitBusy
-                                  ? 'A pursue in this thread is still running'
-                                  : 'Run every open/dormant lead in this thread in order (full thread, not only rows visible under the filter). Pipeline panel defaults to a bottom strip on phones so this stays tappable.'
-                          }
-                          onClick={() => void runThreadGroupPursuit(fullClusterForRoot, rootId)}
-                        >
-                          {batchRunningHere ? (
-                            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
-                          ) : (
-                            <Play className="mr-1.5 h-3.5 w-3.5 opacity-80" aria-hidden />
-                          )}
-                          Pursue thread
-                        </Button>
-                      </div>
-                      <div className="space-y-2 border-l-2 border-sky-500/25 pl-3">
+                      ) : (
+                        <>
+                          {hasMultiItemThread ? (
+                            <div className="relative z-10 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/60 bg-muted/15 px-3 py-2">
+                              <div className="flex min-w-0 flex-1 items-start gap-2">
+                                <button
+                                  type="button"
+                                  className="mt-0.5 shrink-0 rounded p-0.5 hover:bg-muted"
+                                  onClick={() => toggleCuriosityThreadExpanded(rootKey)}
+                                  title="Collapse thread"
+                                  aria-expanded="true"
+                                >
+                                  <ChevronDown className="h-4 w-4 text-muted-foreground" aria-hidden />
+                                </button>
+                                <div className="min-w-0">
+                                  <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                                    Root thread
+                                  </div>
+                                  <CuriosityClampedQuestion text={rootItem?.question || rootId} className="min-w-0" />
+                                </div>
+                              </div>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                className="shrink-0"
+                                disabled={threadPursueDisabled}
+                                title={pursueThreadTitle}
+                                onClick={() => void runThreadGroupPursuit(fullClusterForRoot, rootId)}
+                              >
+                                {batchRunningHere ? (
+                                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+                                ) : (
+                                  <Play className="mr-1.5 h-3.5 w-3.5 opacity-80" aria-hidden />
+                                )}
+                                Pursue thread
+                              </Button>
+                            </div>
+                          ) : null}
+                          <div
+                            className={cn(
+                              'space-y-2',
+                              hasMultiItemThread && 'border-l-2 border-sky-500/25 pl-3'
+                            )}
+                          >
                         {clusterItems.map((item) => {
                           const st = curiosityUiStatus(item, pursuits);
-                          const styleCls = CURIOSITY_STATUS_STYLES[st] || CURIOSITY_STATUS_STYLES.open;
+                          const itemPursuitEntry = pursuits[String(item.id)];
+                          const styleCls = st === 'pursuing' && entryAccent(itemPursuitEntry) === 'b'
+                            ? 'border-red-500/30 bg-red-500/5 text-red-400'
+                            : (CURIOSITY_STATUS_STYLES[st] || CURIOSITY_STATUS_STYLES.open);
                           const p = effectiveItemPriority(item);
                           const depth = Number(item.pursuit_depth ?? 0);
                           const parent = item.parent_curiosity_id
@@ -3159,7 +3409,9 @@ For each item include "priority" (0.0–1.0): use the full range. At least one i
                             </div>
                           );
                         })}
-                      </div>
+                          </div>
+                        </>
+                      )}
                     </div>
                   );
                 })}
@@ -3187,6 +3439,7 @@ function isPipelineTimelineEvent(event) {
 }
 
 export function TemporalPage() {
+  const { TemporalEvent, PipelineRun } = useScopedEntities();
   const [events, setEvents] = useState([]);
   const [label, setLabel] = useState('');
   const [details, setDetails] = useState('');
@@ -3216,7 +3469,7 @@ export function TemporalPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [TemporalEvent, PipelineRun]);
 
   useEffect(() => {
     load();
@@ -3284,7 +3537,10 @@ export function TemporalPage() {
         </Button>
       }
     >
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <MindScopeTabs />
+      </div>
+      <div className="grid min-w-0 grid-cols-1 gap-6 xl:grid-cols-[minmax(0,360px)_minmax(0,1fr)]">
         <Panel className="space-y-3">
           <div className="text-sm font-semibold">Log Timeline Event</div>
           <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Event title" />
@@ -3373,6 +3629,18 @@ export function TemporalPage() {
 }
 
 export function HealthPage() {
+  const { isMirror } = useMindScope();
+  const {
+    PipelineRun,
+    BeliefStore,
+    LongTermMemory,
+    CuriosityItem,
+    GoalItem,
+    FeedbackItem,
+    DreamRun,
+    EmergenceEvent,
+    MindBiography,
+  } = useScopedEntities();
   const [snapshot, setSnapshot] = useState(null);
   const [loading, setLoading] = useState(true);
   const [identityLogOpen, setIdentityLogOpen] = useState(true);
@@ -3381,7 +3649,7 @@ export function HealthPage() {
   const load = useCallback(async () => {
     setLoading(true);
     const [
-      runs,
+      runsRaw,
       beliefs,
       memories,
       curiosities,
@@ -3391,19 +3659,22 @@ export function HealthPage() {
       emergences,
       biographies,
     ] = await Promise.all([
-      PipelineRun.list('-created_date', 800),
-      BeliefStore.list('-created_date', 1200),
-      LongTermMemory.list('-created_date', 1200),
-      CuriosityItem.list('-created_date', 400),
-      GoalItem.list('-created_date', 400),
-      FeedbackItem.list('-created_date', 200),
-      DreamRun.list('-created_date', 200),
-      EmergenceEvent.list('-created_date', 200),
-      MindBiography.list('-created_date', 48),
+      PipelineRun.listAll('-created_date'),
+      BeliefStore.listAll('-created_date'),
+      LongTermMemory.listAll('-created_date'),
+      CuriosityItem.listAll('-created_date'),
+      GoalItem.listAll('-created_date'),
+      FeedbackItem.listAll('-created_date'),
+      DreamRun.listAll('-created_date'),
+      EmergenceEvent.listAll('-created_date'),
+      MindBiography.listAll('-created_date'),
     ]);
 
     const positiveRatings = feedback.filter((item) => item.rating === 'up').length;
     const negativeRatings = feedback.filter((item) => item.rating === 'down').length;
+
+    /** Incremental module checkpoints are extra PipelineRun rows — omit from growth-over-runs so counts match completed legs. */
+    const runs = excludeCheckpointPipelineRuns(runsRaw);
 
     setSnapshot({
       runs,
@@ -3419,7 +3690,17 @@ export function HealthPage() {
       negativeRatings,
     });
     setLoading(false);
-  }, []);
+  }, [
+    PipelineRun,
+    BeliefStore,
+    LongTermMemory,
+    CuriosityItem,
+    GoalItem,
+    FeedbackItem,
+    DreamRun,
+    EmergenceEvent,
+    MindBiography,
+  ]);
 
   useEffect(() => {
     load();
@@ -3427,30 +3708,49 @@ export function HealthPage() {
 
   useMindStorageRefresh(load);
 
+  const curiosityPursuits = useSyncExternalStore(
+    subscribeCuriosityPagePursuit,
+    () => getCuriosityPagePursuitSnapshot().pursuits,
+    () => ({})
+  );
+
+  const goalPursuits = useSyncExternalStore(
+    subscribeGoalPagePursuit,
+    () => getGoalPagePursuitSnapshot().pursuits,
+    () => ({})
+  );
+
   const derived = useMemo(
-    () => (snapshot ? computeCognitiveHealthDerived(snapshot) : null),
-    [snapshot]
+    () => (snapshot ? computeCognitiveHealthDerived(snapshot, curiosityPursuits, goalPursuits) : null),
+    [snapshot, curiosityPursuits, goalPursuits]
   );
 
   return (
     <PageShell
       icon={Activity}
       title="Cognitive Health"
-      description="Proxies for cognitive depth — derived from pipeline runs, beliefs, memory, curiosity, Mind Biography (including identity keywords and core values merged from each pipeline), and emergence events stored locally. The /api/health endpoint also exposes embedding cache stats and calibrated threshold values. Emergence totals and the recent list exclude items you rejected on the Emergence Log."
+      description={
+        isMirror
+          ? 'System B (playground mirror) store — same metrics as Primary, scoped to the isolated mirror mind used in System Chat. Curiosity/goal pursuit slots still reflect Primary live UI state.'
+          : 'Proxies for cognitive depth — counts use the full local store (no row cap). Curiosity and goal status breakdowns match the Curiosity Queue and Goals stack (live pursuit slots). Pipeline runs are saved graph/stream runs. The /api/health endpoint also exposes embedding cache stats and calibrated threshold values. Emergence totals and the recent list exclude items you rejected on the Emergence Log.'
+      }
       actions={
-        <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => load()} disabled={loading}>
-          <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
-          Refresh
-        </Button>
+        <>
+          <MindScopeTabs />
+          <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => load()} disabled={loading}>
+            <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
+            Refresh
+          </Button>
+        </>
       }
     >
-      <div className="mx-auto max-w-6xl space-y-6">
+      <div className="mx-auto w-full min-w-0 max-w-6xl space-y-6">
         <CognitiveHealthSnapshotPanels derived={derived} loading={loading} />
 
         {!loading && derived ? (
           <>
-            <div className="rounded-xl border border-sky-500/20 bg-card p-4">
-              <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+            <div className="min-w-0 rounded-xl border border-sky-500/20 bg-card p-4">
+              <div className="mb-1 flex min-w-0 flex-wrap items-center justify-between gap-2">
                 <button
                   type="button"
                   aria-expanded={identityLogOpen}
@@ -3474,7 +3774,7 @@ export function HealthPage() {
                   </span>
                 </button>
                 <Link
-                  to="/biography"
+                  to={isMirror ? '/biography/mirror' : '/biography'}
                   className="text-[11px] font-medium text-sky-400/90 hover:text-sky-300 hover:underline"
                 >
                   Mind Biography →
@@ -3588,7 +3888,7 @@ export function HealthPage() {
                               <li key={`${e.id}-id-${marker}`} className="text-[11px] text-muted-foreground">
                                 <span className="font-medium text-foreground/90">{marker}</span>
                                 {items[0]?.quote ? (
-                                  <pre className="mt-1 max-h-[min(40vh,22rem)] overflow-y-auto whitespace-pre-wrap break-words font-sans text-[10px] leading-relaxed text-muted-foreground/95">
+                                  <pre className="mt-1 max-h-[min(40svh,22rem)] overflow-y-auto whitespace-pre-wrap break-words font-sans text-[10px] leading-relaxed text-muted-foreground/95">
                                     {items[0].source ? `${items[0].source}: ` : ''}
                                     {items[0].quote}
                                   </pre>
@@ -3620,8 +3920,8 @@ export function HealthPage() {
             </div>
 
             {derived.emergencePreview.length > 0 ? (
-              <div className="rounded-xl border border-pink-500/20 bg-card p-4">
-                <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0 rounded-xl border border-pink-500/20 bg-card p-4">
+                <div className="mb-1 flex min-w-0 flex-wrap items-center justify-between gap-2">
                   <button
                     type="button"
                     aria-expanded={emergencePreviewOpen}
@@ -3685,14 +3985,14 @@ export function HealthPage() {
                             Severity: {e.severity}
                           </div>
                         ) : null}
-                        <p className="text-foreground/85">{e.details || 'No details.'}</p>
+                        <p className="break-words text-foreground/85">{e.details || 'No details.'}</p>
                         {byFlag ? (
                           <ul className="mt-2 space-y-2 border-l-2 border-pink-500/25 pl-2">
                             {byFlag.map(({ marker, items }) => (
                               <li key={`${e.id}-p-${marker}`} className="text-[11px] text-muted-foreground">
                                 <span className="font-medium text-foreground/90">{marker}</span>
                                 {items[0]?.quote ? (
-                                  <pre className="mt-1 max-h-[min(40vh,22rem)] overflow-y-auto whitespace-pre-wrap break-words font-sans text-[10px] leading-relaxed text-muted-foreground/95">
+                                  <pre className="mt-1 max-h-[min(40svh,22rem)] overflow-y-auto whitespace-pre-wrap break-words font-sans text-[10px] leading-relaxed text-muted-foreground/95">
                                     {items[0].source ? `${items[0].source}: ` : ''}
                                     {items[0].quote}
                                   </pre>
@@ -3845,7 +4145,7 @@ function EmergenceEventCard({
           {event.title && !event.description ? (
             <div className="text-sm font-semibold text-foreground">{event.title}</div>
           ) : null}
-          <p className="max-h-[min(45vh,26rem)] overflow-y-auto text-sm leading-relaxed text-foreground break-words">
+          <p className="max-h-[min(45svh,26rem)] overflow-y-auto text-sm leading-relaxed text-foreground break-words">
             {description || event.title || '—'}
           </p>
           {event.pattern_broken ? (
@@ -3859,7 +4159,7 @@ function EmergenceEventCard({
               <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                 Trigger (graph input)
               </p>
-              <pre className="mt-1 max-h-[min(50vh,28rem)] overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border/60 bg-muted/20 p-2 font-sans text-[11px] leading-relaxed text-muted-foreground">
+              <pre className="mt-1 max-h-[min(50svh,28rem)] overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border/60 bg-muted/20 p-2 font-sans text-[11px] leading-relaxed text-muted-foreground">
                 {trigger}
               </pre>
             </div>
@@ -3889,7 +4189,7 @@ function EmergenceEventCard({
                           <div className="mb-0.5 text-[10px] text-muted-foreground">
                             <span className="font-medium text-foreground/85">{ev.source}</span>
                           </div>
-                          <q className="not-italic block max-h-[min(55vh,32rem)] overflow-y-auto whitespace-pre-wrap break-words">
+                          <q className="not-italic block max-h-[min(55svh,32rem)] overflow-y-auto whitespace-pre-wrap break-words">
                             {ev.quote}
                           </q>
                         </blockquote>
@@ -3912,7 +4212,7 @@ function EmergenceEventCard({
                         <span className="font-medium text-foreground/80">{ev.marker}</span>
                         <span className="text-muted-foreground/80"> · {ev.source}</span>
                       </div>
-                      <q className="not-italic block max-h-[min(55vh,32rem)] overflow-y-auto whitespace-pre-wrap break-words">
+                      <q className="not-italic block max-h-[min(55svh,32rem)] overflow-y-auto whitespace-pre-wrap break-words">
                         {ev.quote}
                       </q>
                     </blockquote>
@@ -3932,7 +4232,7 @@ function EmergenceEventCard({
                     <span className="font-medium text-foreground/80">{ev.marker}</span>
                     <span className="text-muted-foreground/80"> · {ev.source}</span>
                   </div>
-                  <q className="not-italic block max-h-[min(55vh,32rem)] overflow-y-auto whitespace-pre-wrap break-words">
+                  <q className="not-italic block max-h-[min(55svh,32rem)] overflow-y-auto whitespace-pre-wrap break-words">
                     {ev.quote}
                   </q>
                 </blockquote>
@@ -3940,7 +4240,7 @@ function EmergenceEventCard({
             </div>
           ) : null}
           {expanded && snapshot ? (
-            <div className="mt-3 max-h-[min(70vh,40rem)] overflow-y-auto whitespace-pre-wrap rounded-lg bg-muted/30 p-3 text-xs leading-relaxed text-foreground/80 break-words">
+            <div className="mt-3 max-h-[min(70svh,40rem)] overflow-y-auto whitespace-pre-wrap rounded-lg bg-muted/30 p-3 text-xs leading-relaxed text-foreground/80 break-words">
               {snapshot}
             </div>
           ) : null}
@@ -3983,26 +4283,27 @@ function EmergenceEventCard({
 }
 
 export function EmergencePage() {
+  const { EmergenceEvent, PipelineRun, ConversationMessage } = useScopedEntities();
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [reviewingId, setReviewingId] = useState(null);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
       let list = await EmergenceEvent.list('-created_date', 100);
-      await backfillEmergenceEvidenceFromPipelineRuns(list);
+      await backfillEmergenceEvidenceFromPipelineRuns(list, { PipelineRun, EmergenceEvent });
       list = await EmergenceEvent.list('-created_date', 100);
       setEvents(list);
     } finally {
       setLoading(false);
     }
-  };
+  }, [EmergenceEvent, PipelineRun]);
 
   useEffect(() => {
-    load();
-  }, []);
+    void load();
+  }, [load]);
 
   const scanForEmergence = async () => {
     setScanning(true);
@@ -4076,7 +4377,7 @@ export function EmergencePage() {
       }
 
       const result = await invokeLLM({
-        prompt: `You analyze MyBrain cognitive output from two sources: (1) saved Graph Pipeline chat turns (User and Voice) with Voice sometimes including per-module traces; (2) saved PipelineRun records from graph runs (module outputs and a final voice line). Metacognitive reruns are normal.
+        prompt: `You analyze MetaSelf-CognitiveStack cognitive output from two sources: (1) saved Graph Pipeline chat turns (User and Voice) with Voice sometimes including per-module traces; (2) saved PipelineRun records from graph runs (module outputs and a final voice line). Metacognitive reruns are normal.
 
 Detect EMERGENCE EVENTS — moments where RECENT material differs meaningfully from the BASELINE (style, reasoning, self-model, novel connections, emotional depth, or metacognitive texture). Weight saved pipeline chat heavily when it is the richer record of interaction. Module bundles prioritize Identity and Narrative when present — treat shifts in self-model, values, name, or boundaries as especially salient.
 
@@ -4254,6 +4555,9 @@ Return JSON only, schema as given.`,
         </div>
       }
     >
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <MindScopeTabs />
+      </div>
       <div className="mx-auto max-w-4xl space-y-6">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <div className="rounded-xl border border-pink-500/20 bg-pink-500/5 p-4 text-center">
@@ -4337,7 +4641,7 @@ export function DatasetPage() {
   const [fromFeedbackBusy, setFromFeedbackBusy] = useState(false);
 
   const load = async () => {
-    setDatasets(await Dataset.list('-created_date', 100));
+    setDatasets(await Dataset.listAll('-created_date'));
   };
 
   useEffect(() => {
@@ -4434,22 +4738,24 @@ export function DatasetPage() {
 const DREAM_SOURCE_LIMIT = 6;
 
 export function DreamingPage() {
+  const { isMirror } = useMindScope();
+  const { DreamRun, LongTermMemory, BeliefStore } = useScopedEntities();
   const [dreams, setDreams] = useState([]);
   const [running, setRunning] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [source, setSource] = useState({ memoryCount: 0, beliefCount: 0 });
 
-  const loadDreams = async () => {
+  const loadDreams = useCallback(async () => {
     setDreams(await DreamRun.list('-created_date', 50));
-  };
+  }, [DreamRun]);
 
-  const refreshSources = async () => {
+  const refreshSources = useCallback(async () => {
     const [memories, beliefs] = await Promise.all([
       LongTermMemory.list('-created_date', DREAM_SOURCE_LIMIT),
       BeliefStore.list('-created_date', DREAM_SOURCE_LIMIT),
     ]);
     setSource({ memoryCount: memories.length, beliefCount: beliefs.length });
-  };
+  }, [LongTermMemory, BeliefStore]);
 
   const refreshDreamPage = async () => {
     setRefreshing(true);
@@ -4462,9 +4768,9 @@ export function DreamingPage() {
   };
 
   useEffect(() => {
-    loadDreams();
-    refreshSources();
-  }, []);
+    void loadDreams();
+    void refreshSources();
+  }, [loadDreams, refreshSources]);
 
   const runDream = async () => {
     const [memories, beliefs] = await Promise.all([
@@ -4511,13 +4817,22 @@ export function DreamingPage() {
 
   const canDream = source.memoryCount > 0 || source.beliefCount > 0;
 
+  const memPath = isMirror ? '/memory/mirror' : '/memory';
+  const beliefsPath = isMirror ? '/beliefs/mirror' : '/beliefs';
+  const healthPath = isMirror ? '/health/mirror' : '/health';
+
   return (
     <PageShell
       icon={Moon}
       title="Dreaming Mode"
-      description="Idle-style synthesis: one LLM pass that recombines your six newest long-term memories and six beliefs into a reflection, stores a DreamRun, and appends a dream-type memory. This is not the full graph pipeline — use Graph Pipeline or Playground for per-module cycles."
+      description={
+        isMirror
+          ? 'System B mirror: DreamRun and dream memories persist to the isolated mirror store.'
+          : 'Idle-style synthesis: one LLM pass that recombines your six newest long-term memories and six beliefs into a reflection, stores a DreamRun, and appends a dream-type memory. This is not the full graph pipeline — use Graph Pipeline or System Chat for per-module cycles.'
+      }
       actions={
         <>
+          <MindScopeTabs />
           <Button
             variant="outline"
             type="button"
@@ -4562,7 +4877,7 @@ export function DreamingPage() {
                 </Link>{' '}
                 /{' '}
                 <Link className="text-primary underline-offset-4 hover:underline" to="/playground">
-                  Playground
+                  System Chat
                 </Link>
                 ).
               </li>
@@ -4574,11 +4889,11 @@ export function DreamingPage() {
             </ol>
             <div className="border-t border-border pt-3 text-xs text-muted-foreground">
               <span className="font-medium text-foreground/80">Related:</span>{' '}
-              <Link className="text-primary underline-offset-4 hover:underline" to="/memory">
+              <Link className="text-primary underline-offset-4 hover:underline" to={memPath}>
                 Long-Term Memory
               </Link>
               {' · '}
-              <Link className="text-primary underline-offset-4 hover:underline" to="/beliefs">
+              <Link className="text-primary underline-offset-4 hover:underline" to={beliefsPath}>
                 Belief Map
               </Link>
               {' · '}
@@ -4586,7 +4901,7 @@ export function DreamingPage() {
                 Scheduler
               </Link>
               {' · '}
-              <Link className="text-primary underline-offset-4 hover:underline" to="/health">
+              <Link className="text-primary underline-offset-4 hover:underline" to={healthPath}>
                 Cognitive Health
               </Link>{' '}
               (dream runs count toward readiness snapshots).
@@ -4745,7 +5060,7 @@ export function TrainingPage() {
   const [statusUpdatingId, setStatusUpdatingId] = useState(null);
 
   const load = async () => {
-    setRuns(await TrainingRun.list('-created_date', 100));
+    setRuns(await TrainingRun.listAll('-created_date'));
   };
 
   useEffect(() => {
@@ -4783,9 +5098,9 @@ export function TrainingPage() {
     <PageShell
       icon={Brain}
       title="Training Config"
-      description="Track local fine-tuning experiments, objectives, and status changes. Use Training and Playground in the sidebar for the run log and per-module prompts."
+      description="Track local fine-tuning experiments, objectives, and status changes. Use Training and System Chat in the sidebar for the run log and per-module prompts."
     >
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
+      <div className="grid min-w-0 grid-cols-1 gap-6 xl:grid-cols-[minmax(0,360px)_minmax(0,1fr)]">
         <Panel className="space-y-3">
           <div className="text-sm font-semibold">New Training Run</div>
           <Input value={form.name} onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))} placeholder="Run name" />
@@ -4841,22 +5156,28 @@ export function TrainingPage() {
 }
 
 /** Keys shown under Settings → “Mind constitution & user model” — re-sync from IndexedDB when pipeline persistence updates them. */
-function pickMindConstitutionPanelFromRuntime(rs) {
+function pickMindConstitutionPanelFromRuntime(rs, isMirror) {
   if (!rs || typeof rs !== 'object') return {};
-  const wm = rs.pinnedWorkingMemory;
+  const profile = isMirror ? MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR : MIND_STORAGE_PROFILE_PRIMARY;
+  const slice = getPipelineIdentityRuntimeSlice(rs, profile);
+  const umDefault = isMirror ? DEFAULT_RUNTIME_SETTINGS.userModelPlaygroundMirror : DEFAULT_RUNTIME_SETTINGS.userModel;
+  const pinnedDefault = isMirror
+    ? DEFAULT_RUNTIME_SETTINGS.pinnedWorkingMemoryPlaygroundMirror
+    : DEFAULT_RUNTIME_SETTINGS.pinnedWorkingMemory;
   return {
     defaultMindPhase: rs.defaultMindPhase,
-    pinnedWorkingMemory: Array.isArray(wm) ? [...wm] : DEFAULT_RUNTIME_SETTINGS.pinnedWorkingMemory,
-    mindConstitution: rs.mindConstitution,
-    mindDisplayName: rs.mindDisplayName,
+    pinnedWorkingMemory: Array.isArray(slice.pinnedWorkingMemory) ? [...slice.pinnedWorkingMemory] : [...pinnedDefault],
+    mindConstitution: slice.mindConstitution ?? '',
+    mindDisplayName: slice.mindDisplayName ?? '',
     userModel: {
-      ...DEFAULT_RUNTIME_SETTINGS.userModel,
-      ...(rs.userModel && typeof rs.userModel === 'object' ? rs.userModel : {}),
+      ...umDefault,
+      ...(slice.userModel && typeof slice.userModel === 'object' ? slice.userModel : {}),
     },
   };
 }
 
 export function SettingsPage() {
+  const { isMirror } = useMindScope();
   const [settings, setSettings] = useState(DEFAULT_RUNTIME_SETTINGS);
   const [savedAt, setSavedAt] = useState(null);
   const [moduleDefaults, setModuleDefaults] = useState([]);
@@ -4876,15 +5197,19 @@ export function SettingsPage() {
 
   const refreshMindConstitutionPanelFromStorage = useCallback(() => {
     const rs = getRuntimeSettings();
-    setSettings((prev) => ({ ...prev, ...pickMindConstitutionPanelFromRuntime(rs) }));
+    setSettings((prev) => ({ ...prev, ...pickMindConstitutionPanelFromRuntime(rs, isMirror) }));
     setMindConstitutionPanelKey((k) => k + 1);
-  }, []);
+  }, [isMirror]);
 
   useMindStorageRefresh(refreshMindConstitutionPanelFromStorage);
 
   useEffect(() => {
     setSettings(getRuntimeSettings());
   }, []);
+
+  useEffect(() => {
+    refreshMindConstitutionPanelFromStorage();
+  }, [isMirror, refreshMindConstitutionPanelFromStorage]);
 
   useEffect(() => {
     let cancelled = false;
@@ -4922,19 +5247,46 @@ export function SettingsPage() {
   useEffect(() => {
     if (moduleDefaults.length === 0) return;
     const rs = getRuntimeSettings();
-    setModuleDrafts(initializeModulePromptDrafts(moduleDefaults, rs.modulePromptOverrides));
-  }, [moduleDefaults]);
+    const ov = isMirror ? rs.modulePromptOverridesPlaygroundMirror : rs.modulePromptOverrides;
+    setModuleDrafts(initializeModulePromptDrafts(moduleDefaults, ov));
+  }, [moduleDefaults, isMirror]);
 
   const persistSettings = () => {
     const modulePromptOverrides =
       moduleDefaults.length > 0
         ? buildModulePromptOverridesForSave(moduleDefaults, moduleDrafts)
-        : settings.modulePromptOverrides || {};
+        : (isMirror ? settings.modulePromptOverridesPlaygroundMirror : settings.modulePromptOverrides) || {};
+
+    /** Form state maps both scopes onto `mindConstitution` / `userModel` etc.; restore the inactive scope from storage so we never cross-write. */
+    const cur = getRuntimeSettings();
+    const crossScopeRestore = isMirror
+      ? {
+          mindConstitution: cur.mindConstitution,
+          mindDisplayName: cur.mindDisplayName,
+          userModel: cur.userModel,
+          pinnedWorkingMemory: cur.pinnedWorkingMemory,
+          modulePromptOverrides: cur.modulePromptOverrides,
+        }
+      : {
+          mindConstitutionPlaygroundMirror: cur.mindConstitutionPlaygroundMirror,
+          mindDisplayNamePlaygroundMirror: cur.mindDisplayNamePlaygroundMirror,
+          userModelPlaygroundMirror: cur.userModelPlaygroundMirror,
+          pinnedWorkingMemoryPlaygroundMirror: cur.pinnedWorkingMemoryPlaygroundMirror,
+          modulePromptOverridesPlaygroundMirror: cur.modulePromptOverridesPlaygroundMirror,
+        };
 
     const next = saveRuntimeSettings({
       ...settings,
+      ...crossScopeRestore,
       pipelineDelayMs: Number(settings.pipelineDelayMs) || DEFAULT_RUNTIME_SETTINGS.pipelineDelayMs,
       pipelineMaxTokens: Number(settings.pipelineMaxTokens) || DEFAULT_RUNTIME_SETTINGS.pipelineMaxTokens,
+      pipelineProfile: ['unified', 'classic'].includes(String(settings.pipelineProfile))
+        ? settings.pipelineProfile
+        : DEFAULT_RUNTIME_SETTINGS.pipelineProfile,
+      pipelineGating: ['off', 'aggressive', 'default'].includes(String(settings.pipelineGating))
+        ? settings.pipelineGating
+        : DEFAULT_RUNTIME_SETTINGS.pipelineGating,
+      forkJoinWave: settings.forkJoinWave === true,
       maxMetacognitionReruns: resolveMaxMetacognitionReruns({
         maxMetacognitionReruns: Number(settings.maxMetacognitionReruns),
       }),
@@ -5025,15 +5377,69 @@ export function SettingsPage() {
             DEFAULT_RUNTIME_SETTINGS.schedulerAutoRetryMaxDelayMinutes
         )
       ),
-      userModel: {
-        ...DEFAULT_RUNTIME_SETTINGS.userModel,
-        ...(settings.userModel || {}),
-      },
-      modulePromptOverrides,
+      staleRunningScheduledTaskMinutes: Math.max(
+        5,
+        Math.min(
+          1440,
+          Math.floor(
+            Number(settings.staleRunningScheduledTaskMinutes) ||
+              DEFAULT_RUNTIME_SETTINGS.staleRunningScheduledTaskMinutes
+          )
+        )
+      ),
+      schedulerHeartbeatIntervalMs: Math.max(
+        0,
+        Math.min(
+          3_600_000,
+          Math.floor(
+            Number(settings.schedulerHeartbeatIntervalMs) ??
+              DEFAULT_RUNTIME_SETTINGS.schedulerHeartbeatIntervalMs
+          )
+        )
+      ),
+      schedulerMaxConcurrentRunningTasks: (() => {
+        const raw = settings.schedulerMaxConcurrentRunningTasks;
+        const n =
+          raw === '' || raw == null
+            ? DEFAULT_RUNTIME_SETTINGS.schedulerMaxConcurrentRunningTasks
+            : Number(raw);
+        if (!Number.isFinite(n) || n <= 0) {
+          return DEFAULT_RUNTIME_SETTINGS.schedulerMaxConcurrentRunningTasks;
+        }
+        return Math.min(32, Math.floor(n));
+      })(),
+      ...(isMirror
+        ? {
+            userModelPlaygroundMirror: {
+              ...DEFAULT_RUNTIME_SETTINGS.userModelPlaygroundMirror,
+              ...(settings.userModel || {}),
+            },
+            mindConstitutionPlaygroundMirror: settings.mindConstitution ?? '',
+            mindDisplayNamePlaygroundMirror: settings.mindDisplayName ?? '',
+            pinnedWorkingMemoryPlaygroundMirror: Array.isArray(settings.pinnedWorkingMemory)
+              ? settings.pinnedWorkingMemory
+              : [],
+            modulePromptOverridesPlaygroundMirror: modulePromptOverrides,
+          }
+        : {
+            userModel: {
+              ...DEFAULT_RUNTIME_SETTINGS.userModel,
+              ...(settings.userModel || {}),
+            },
+            mindConstitution: settings.mindConstitution,
+            mindDisplayName: settings.mindDisplayName,
+            pinnedWorkingMemory: settings.pinnedWorkingMemory,
+            modulePromptOverrides,
+          }),
     });
-    setSettings(next);
+    /** Map persisted primary vs mirror identity back onto form keys (`mindConstitution` etc.); avoid showing primary text on System B after save. */
+    setSettings({
+      ...next,
+      ...pickMindConstitutionPanelFromRuntime(next, isMirror),
+    });
     if (moduleDefaults.length > 0) {
-      setModuleDrafts(initializeModulePromptDrafts(moduleDefaults, next.modulePromptOverrides));
+      const ovNext = isMirror ? next.modulePromptOverridesPlaygroundMirror : next.modulePromptOverrides;
+      setModuleDrafts(initializeModulePromptDrafts(moduleDefaults, ovNext));
     }
     setSavedAt(new Date().toISOString());
   };
@@ -5042,7 +5448,8 @@ export function SettingsPage() {
     try {
       persistSettings();
       const rs = getRuntimeSettings();
-      const overrideCount = Object.keys(rs.modulePromptOverrides || {}).length;
+      const ovKey = isMirror ? rs.modulePromptOverridesPlaygroundMirror : rs.modulePromptOverrides;
+      const overrideCount = Object.keys(ovKey || {}).length;
       toast({
         title: 'Module prompts saved',
         description:
@@ -5067,10 +5474,20 @@ export function SettingsPage() {
     setModuleDrafts((prev) => ({ ...prev, [name]: m.systemPrompt }));
   };
 
-  const um = settings.userModel || DEFAULT_RUNTIME_SETTINGS.userModel;
+  const umDefault = isMirror ? DEFAULT_RUNTIME_SETTINGS.userModelPlaygroundMirror : DEFAULT_RUNTIME_SETTINGS.userModel;
+  const um = settings.userModel || umDefault;
 
   return (
     <PageShell icon={Settings} title="Settings" description="Adjust runtime preferences that affect the graph pipeline and related local behavior.">
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <MindScopeTabs />
+      </div>
+      {isMirror ? (
+        <p className="mb-4 rounded-lg border border-border/80 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+          System B: core values, user model, pinned working memory, and module prompt overrides below apply only to the
+          playground mirror mind — not the primary pipeline.
+        </p>
+      ) : null}
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
         <Panel className="space-y-2 border-dashed xl:col-span-2">
           <div className="text-sm font-semibold">Epistemic note</div>
@@ -5139,6 +5556,44 @@ export function SettingsPage() {
             </p>
           </div>
           <div>
+            <div className="mb-1 text-xs font-medium text-muted-foreground">Pipeline profile</div>
+            <select
+              value={settings.pipelineProfile ?? DEFAULT_RUNTIME_SETTINGS.pipelineProfile}
+              onChange={(e) => setSettings((prev) => ({ ...prev, pipelineProfile: e.target.value }))}
+              className="h-9 w-full rounded-md border border-border bg-background px-2 text-sm"
+            >
+              <option value="unified">Unified (one early call for layers 1–4, faster)</option>
+              <option value="classic">Classic (separate LLM per module, debug / compatibility)</option>
+            </select>
+            <p className="mt-1 text-xs text-muted-foreground">
+              <span className="font-mono">PIPELINE_PROFILE</span> in <code className="text-[10px]">.env</code> can force classic
+              for the whole server.
+            </p>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium text-muted-foreground">Pipeline gating</div>
+            <select
+              value={settings.pipelineGating ?? DEFAULT_RUNTIME_SETTINGS.pipelineGating}
+              onChange={(e) => setSettings((prev) => ({ ...prev, pipelineGating: e.target.value }))}
+              className="h-9 w-full rounded-md border border-border bg-background px-2 text-sm"
+            >
+              <option value="default">Default (no skipping)</option>
+              <option value="aggressive">Aggressive (may skip self-relation on very short turns)</option>
+              <option value="off">Off (same as default)</option>
+            </select>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              id="forkJoinWave"
+              type="checkbox"
+              checked={settings.forkJoinWave === true}
+              onChange={(e) => setSettings((prev) => ({ ...prev, forkJoinWave: e.target.checked }))}
+            />
+            <label htmlFor="forkJoinWave" className="text-sm text-foreground/90">
+              Parallel epistemic similarity at Integration (finalize) — <span className="font-mono">forkJoinWave</span>
+            </label>
+          </div>
+          <div>
             <div className="mb-1 text-xs font-medium text-muted-foreground">
               Max supervisor reruns before Voice (0–20)
             </div>
@@ -5151,11 +5606,12 @@ export function SettingsPage() {
               className="bg-muted/30"
             />
             <p className="mt-1 text-xs text-muted-foreground">
-              How many full supervisor rework legs (replay layers 1–4 via inline/continuation/deferred schedule) Metacognition
-              and Workspace Metacognition may trigger before the run must finish through Voice. At{' '}
-              <span className="font-mono">0</span>, explicit RERUN does not start another leg—the pipeline continues toward Voice
-              in the same HTTP leg. Structural gaps over the cap still log “would rerun” and continue. When a counted rerun runs,
-              delay below chooses a scheduled task (minutes &gt; 0) or immediate chained SSE legs (0).
+              Total supervisor rework legs allowed for <strong>one user message</strong> (replay layers 1–4 via inline, chained SSE,
+              or deferred schedule)—the count carries across continuation POSTs; it is not reset each leg. Metacognition and
+              Workspace Metacognition share this budget. At <span className="font-mono">0</span>, explicit RERUN does not start
+              another leg—the pipeline continues toward Voice in the same HTTP leg. Structural gaps over the cap still log “would
+              rerun” and continue. When a counted rerun runs, delay below chooses a scheduled task (minutes &gt; 0) or immediate
+              chained SSE legs (0).
             </p>
           </div>
           <div>
@@ -5182,6 +5638,69 @@ export function SettingsPage() {
               <span className="font-mono">1</span> is treated as <span className="font-mono">2</span>) with the same input +
               shared memory—Mind graph, curiosity/goal pursuits, and every other graph entry path. Keep the app open near the
               due time when using delayed mode.
+            </p>
+          </div>
+          <div className="space-y-2 rounded-md border border-border/60 bg-muted/10 p-3">
+            <div className="text-xs font-medium text-muted-foreground">Scheduled task runner (stale detection)</div>
+            <div className="grid gap-2 sm:grid-cols-3">
+              <div>
+                <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Stale threshold (min)
+                </div>
+                <Input
+                  value={String(
+                    settings.staleRunningScheduledTaskMinutes ??
+                      DEFAULT_RUNTIME_SETTINGS.staleRunningScheduledTaskMinutes
+                  )}
+                  onChange={(e) =>
+                    setSettings((prev) => ({ ...prev, staleRunningScheduledTaskMinutes: e.target.value }))
+                  }
+                  placeholder="120"
+                  className="h-8 bg-muted/30 text-sm"
+                />
+              </div>
+              <div>
+                <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Progress heartbeat (ms)
+                </div>
+                <Input
+                  value={String(
+                    settings.schedulerHeartbeatIntervalMs ??
+                      DEFAULT_RUNTIME_SETTINGS.schedulerHeartbeatIntervalMs
+                  )}
+                  onChange={(e) =>
+                    setSettings((prev) => ({ ...prev, schedulerHeartbeatIntervalMs: e.target.value }))
+                  }
+                  placeholder="300000"
+                  className="h-8 bg-muted/30 text-sm"
+                />
+              </div>
+              <div>
+                <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Max concurrent runs
+                </div>
+                <Input
+                  value={String(
+                    settings.schedulerMaxConcurrentRunningTasks ??
+                      DEFAULT_RUNTIME_SETTINGS.schedulerMaxConcurrentRunningTasks
+                  )}
+                  onChange={(e) =>
+                    setSettings((prev) => ({ ...prev, schedulerMaxConcurrentRunningTasks: e.target.value }))
+                  }
+                  placeholder="3"
+                  className="h-8 bg-muted/30 text-sm"
+                />
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              If a task stays <span className="font-mono">running</span> longer than the stale threshold without finishing,
+              the runner treats it as a crashed tab (or hung pipeline) and fails or auto-requeues it. Heartbeats update{' '}
+              <span className="font-mono text-[10px]">scheduler_last_progress_at</span> while SSE is active so long graph runs
+              are not cut off at the threshold. Set <span className="font-mono">0</span> heartbeat to disable bumps (not
+              recommended). Max concurrent caps how many due tasks start at once (empty or invalid falls back to default{' '}
+              <span className="font-mono">3</span>; use <span className="font-mono">1</span> to serialize). Also tune{' '}
+              <span className="font-mono">LOCAL_LLM_TIMEOUT_MS</span> in <span className="font-mono">.env</span> for per-module
+              caps.
             </p>
           </div>
           <div className="space-y-2 rounded-md border border-border/60 bg-muted/10 p-3">
@@ -5529,8 +6048,9 @@ export function SettingsPage() {
             </div>
             <div className="mt-4 border-t border-border/60 pt-3 text-sm font-semibold">API reconnect recovery</div>
             <p className="text-xs text-muted-foreground">
-              After the local API was unreachable and comes back, the app can resume an interrupted graph/stream run without
-              adding a second user line (rate-limited per tab).
+              When the API was down and returns, or after a tab reload with an interrupted run, the app tries saved
+              checkpoints first, then reconnect replay — without a second user line (rate-limited per tab). Cooperative
+              pauses (Continue) are unchanged.
             </p>
             <label className="flex items-center gap-2 text-sm">
               <input
@@ -5540,7 +6060,7 @@ export function SettingsPage() {
                   setSettings((prev) => ({ ...prev, autoResumeGraphPipelineOnReconnect: e.target.checked }))
                 }
               />
-              Silently resume interrupted graph/stream pipeline on reconnect
+              Auto-resume checkpoints on reconnect / reload (interrupted runs)
             </label>
             <div className="grid gap-3 sm:grid-cols-2">
               <div>
@@ -5570,7 +6090,7 @@ export function SettingsPage() {
         </Panel>
         <Panel key={mindConstitutionPanelKey} className="space-y-4 xl:col-span-2">
           <div className="flex flex-wrap items-start justify-between gap-2">
-            <div className="text-sm font-semibold">Mind constitution & user model</div>
+            <div className="text-sm font-semibold">Core values & user model</div>
             <Button
               type="button"
               variant="outline"
@@ -5586,7 +6106,7 @@ export function SettingsPage() {
               }}
             >
               <RefreshCw className="h-3.5 w-3.5" />
-              Sync Mind constitution & user model
+              Sync core values & user model
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
@@ -5638,7 +6158,7 @@ export function SettingsPage() {
             </p>
           </div>
           <div>
-            <div className="mb-1 text-xs font-medium text-muted-foreground">Constitution (values & boundaries)</div>
+            <div className="mb-1 text-xs font-medium text-muted-foreground">Core values (norms & boundaries)</div>
             <Textarea
               value={settings.mindConstitution ?? ''}
               onChange={(e) => setSettings((prev) => ({ ...prev, mindConstitution: e.target.value }))}
@@ -5646,8 +6166,8 @@ export function SettingsPage() {
               className="min-h-[120px] bg-muted/30 text-sm"
             />
             <p className="mt-1 text-xs text-muted-foreground">
-              Binding text for Identity and Voice: stable norms, refusals, and priorities. Also used in boundary checks against
-              final output. After each run, Identity may append or replace this via{' '}
+              This mind's evolved norms, refusals, and priorities — shaped through prior runs and human collaboration. Used by
+              Identity and Voice, and in boundary checks against final output. After each run, Identity may append or replace via{' '}
               <code className="text-[10px]">CONSTITUTION_DELTA</code> (same storage as this field).
             </p>
           </div>
@@ -5682,7 +6202,7 @@ export function SettingsPage() {
                     setSettings((prev) => ({
                       ...prev,
                       userModel: {
-                        ...DEFAULT_RUNTIME_SETTINGS.userModel,
+                        ...umDefault,
                         ...prev.userModel,
                         display_name: e.target.value,
                       },
@@ -5702,7 +6222,7 @@ export function SettingsPage() {
                   onChange={(e) =>
                     setSettings((prev) => ({
                       ...prev,
-                      userModel: { ...DEFAULT_RUNTIME_SETTINGS.userModel, ...prev.userModel, goals: e.target.value },
+                      userModel: { ...umDefault, ...prev.userModel, goals: e.target.value },
                     }))
                   }
                   placeholder="What they are trying to accomplish"
@@ -5718,7 +6238,7 @@ export function SettingsPage() {
                   onChange={(e) =>
                     setSettings((prev) => ({
                       ...prev,
-                      userModel: { ...DEFAULT_RUNTIME_SETTINGS.userModel, ...prev.userModel, expertise: e.target.value },
+                      userModel: { ...umDefault, ...prev.userModel, expertise: e.target.value },
                     }))
                   }
                   placeholder="Domain familiarity, jargon level"
@@ -5736,7 +6256,7 @@ export function SettingsPage() {
                   onChange={(e) =>
                     setSettings((prev) => ({
                       ...prev,
-                      userModel: { ...DEFAULT_RUNTIME_SETTINGS.userModel, ...prev.userModel, emotional_state: e.target.value },
+                      userModel: { ...umDefault, ...prev.userModel, emotional_state: e.target.value },
                     }))
                   }
                   placeholder="e.g. stressed, curious, grieving"
@@ -5755,7 +6275,7 @@ export function SettingsPage() {
                     setSettings((prev) => ({
                       ...prev,
                       userModel: {
-                        ...DEFAULT_RUNTIME_SETTINGS.userModel,
+                        ...umDefault,
                         ...prev.userModel,
                         communication_style: e.target.value,
                       },
@@ -5791,7 +6311,7 @@ export function SettingsPage() {
           {moduleDefaults.length === 0 ? (
             <div className="text-sm text-muted-foreground">Loading module list…</div>
           ) : null}
-          <div className="max-h-[min(70vh,720px)] space-y-2 overflow-y-auto pr-1">
+          <div className="max-h-[min(70svh,720px)] space-y-2 overflow-y-auto pr-1">
             {moduleDefaults.map((m) => {
               const meta = moduleMetaByName[m.name];
               const value = moduleDrafts[m.name] ?? m.systemPrompt;

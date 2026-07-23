@@ -32,7 +32,15 @@ import {
   insertWorkspaceSnapshot,
   getWorkspaceDbStatus,
   getLatestWorkspaceSnapshot,
+  buildPipelineProgressRecord,
+  insertScheduledTask,
+  listScheduledTasks,
+  deleteScheduledTask,
+  setSchedulerPaused,
+  isSchedulerPaused,
 } from './workspaceDb.js';
+import { startServerScheduler, stopServerScheduler } from './serverScheduler.js';
+import { normalizeExecutionResume } from '../shared/pipelineExecutionResume.mjs';
 import {
   mergeMindRuntimeIntoSharedMemory,
   buildMindContextForModule,
@@ -58,12 +66,85 @@ import {
 import { getEmbeddings, embeddingCacheStats } from './embeddingService.js';
 import { recalibrateThresholds } from './calibration.js';
 import { getAllThresholds } from './thresholdStore.js';
+import { buildAttachmentBlockWithGlmOcr } from './glmOcrInference.js';
+import { mountMindSnapshotSync } from './mindSnapshotSync.js';
 
 const app = express();
-/** Open CORS is fine for default local dev; for hosted or LAN exposure, set `cors({ origin: [...] })`. */
-app.use(cors());
+
+const MIND_SNAPSHOT_DATA_DIR = String(process.env.MIND_SNAPSHOT_DATA_DIR || '').trim()
+  ? path.resolve(String(process.env.MIND_SNAPSHOT_DATA_DIR).trim())
+  : path.join(__dirname, '..', '.data');
+const MIND_SNAPSHOT_SYNC_TOKEN = String(process.env.MIND_SNAPSHOT_SYNC_TOKEN || '').trim();
+
+/** Browsers send `Origin` when the UI and API are different sites (e.g. direct :8787 calls). Vite’s same-port proxy often omits cross-origin checks. */
+function parseExtraCorsOrigins() {
+  const raw = String(process.env.CORS_ORIGINS || '').trim();
+  if (!raw) return [];
+  return raw.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function defaultCorsOrigins() {
+  const ports = [5174, 3000];
+  const origins = [];
+  for (const p of ports) {
+    origins.push(
+      `http://localhost:${p}`,
+      `http://127.0.0.1:${p}`,
+      `http://[::1]:${p}`
+    );
+  }
+  origins.push('http://localhost:3001', 'http://127.0.0.1:3001', 'http://[::1]:3001');
+  return origins;
+}
+
+const corsAllowedOrigins = new Set([...defaultCorsOrigins(), ...parseExtraCorsOrigins()]);
+
+const CORS_DEV_PORTS = new Set(['5174', '3000', '3001']);
+
+/** Allow typical single-user dev UIs: localhost, Tailscale 100.x, LAN private IPs, *.ts.net — only on Vite/preview ports. */
+function isLikelyLocalBrainUiOrigin(origin) {
+  let u;
+  try {
+    u = new URL(origin);
+  } catch {
+    return false;
+  }
+  const scheme = u.protocol;
+  if (scheme !== 'http:' && scheme !== 'https:') return false;
+  const port = u.port || (scheme === 'https:' ? '443' : '80');
+  if (!CORS_DEV_PORTS.has(port)) return false;
+
+  const host = u.hostname;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+  if (host.endsWith('.ts.net')) return true;
+  if (/^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  return false;
+}
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true);
+      if (corsAllowedOrigins.has(origin)) return callback(null, true);
+      if (isLikelyLocalBrainUiOrigin(origin)) return callback(null, true);
+      console.warn('[cors] blocked origin:', origin);
+      return callback(null, false);
+    },
+  })
+);
 // Pipeline continuations POST the full sharedMemory snapshot; default 2mb is too small.
-app.use(express.json({ limit: '32mb' }));
+// Mind snapshot PUT sends raw octet-stream (often 50–300MB+). If `express.json` runs first, some
+// stacks mis-handle the body and the 32mb JSON cap yields HTTP 413 — so skip JSON parsing for that route.
+const jsonParser = express.json({ limit: '32mb' });
+app.use((req, res, next) => {
+  if (req.method === 'PUT' && req.path === '/api/mind-snapshot') return next();
+  return jsonParser(req, res, next);
+});
+
+mountMindSnapshotSync(app, { dataDir: MIND_SNAPSHOT_DATA_DIR, syncToken: MIND_SNAPSHOT_SYNC_TOKEN });
 
 const ATTACHMENT_MAX_FILES = 24;
 const attachmentUpload = multer({
@@ -135,6 +216,7 @@ function attachmentUploadStack(fieldName) {
             uploadedAt: nowIso(),
             caption: null,
             captionProvider: null,
+            buffer: Buffer.isBuffer(f.buffer) ? Buffer.from(f.buffer) : null,
           });
 
           attachments.push(record);
@@ -223,6 +305,9 @@ const DEFAULT_OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 const DEFAULT_OPENROUTER_MODEL =
   'cognitivecomputations/dolphin-mistral-24b-venice-edition:free,mistralai/mistral-small-24b-instruct-2501';
 
+/** Hugging Face router: fast lane for early bundle / small instruct (OpenAI client model id with :featherless-ai). */
+const DEFAULT_LLM_FAST_HF_MODEL = 'meta-llama/Llama-3.1-8B-Instruct:featherless-ai';
+
 /** Comma-separated model ids; `fallbackSingle` may also be comma-separated. */
 function parseCommaModelList(raw, fallbackSingle) {
   if (raw && raw.trim()) {
@@ -285,7 +370,7 @@ function buildProviderList(opts = {}) {
     const titleRaw = requiredEnv('OPENROUTER_APP_TITLE');
     const extraHeaders = {};
     if (ref) extraHeaders['HTTP-Referer'] = ref;
-    if (ref || titleRaw) extraHeaders['X-Title'] = titleRaw || 'MyBrain';
+    if (ref || titleRaw) extraHeaders['X-Title'] = titleRaw || 'MetaSelf-CognitiveStack';
     openrouterProvider = {
       id: 'openrouter',
       getKey: () => envOpenrouterKey || clientOpenrouterKey,
@@ -316,6 +401,41 @@ function buildProviderList(opts = {}) {
   }
 
   return providers;
+}
+
+/**
+ * Fast LLM path: Hugging Face router only, models from `LLM_FAST_HF_MODEL` (comma-separated) or
+ * default {@link DEFAULT_LLM_FAST_HF_MODEL}.
+ * @returns {ReturnType<typeof buildProviderList>|null}
+ */
+function buildFastHfProviderOnly() {
+  const hfToken = resolveHuggingfaceToken();
+  if (!hfToken) return null;
+  const hfBaseRaw = requiredEnv('HF_INFERENCE_BASE_URL') || DEFAULT_HF_INFERENCE_BASE;
+  const hfBase = String(hfBaseRaw || '').trim().replace(/\/+$/, '');
+  const models = parseCommaModelList(requiredEnv('LLM_FAST_HF_MODEL'), DEFAULT_LLM_FAST_HF_MODEL);
+  if (!models.length) return null;
+  return [
+    {
+      id: 'huggingface',
+      getKey: () => hfToken,
+      type: 'openai_compat',
+      baseURL: normalizeOpenAiCompatBase(hfBase),
+      models,
+    },
+  ];
+}
+
+/**
+ * @param {string} providerId
+ * @param {string} model
+ * @param {{ openrouterApiKey?: string }} [opts]
+ */
+function buildNarrowedProviderList(providerId, model, opts = {}) {
+  const all = buildProviderList(opts);
+  const p = all.find((x) => x.id === providerId);
+  if (!p) return null;
+  return [{ ...p, models: [model] }];
 }
 
 function computeBackendProfile(providerIds) {
@@ -375,6 +495,38 @@ function hydratePriorWorkspaceFromDb(sharedMemory) {
     console.warn('[workspaceDb] hydrate skipped:', e?.message || e);
   }
   return sharedMemory;
+}
+
+/**
+ * When the client reconnects without options.executionResume / rerun counts, merge the last SQLite
+ * pipeline_progress snapshot for this session (cooperative pause, continuation, or completed leg).
+ */
+function applyServerPipelineProgressFromDb(sharedMemory, options) {
+  if (!sharedMemory || typeof sharedMemory !== 'object' || !options || typeof options !== 'object') {
+    return;
+  }
+  const sid = sharedMemory.sessionId;
+  if (!sid || !getWorkspaceDbStatus().enabled) return;
+  try {
+    const latest = getLatestWorkspaceSnapshot(String(sid).slice(0, 200));
+    const p = latest?.pipelineProgress;
+    if (!p || typeof p !== 'object') return;
+    if (!options.executionResume && p.executionCursor) {
+      const n = normalizeExecutionResume(p.executionCursor);
+      if (n) options.executionResume = n;
+    }
+    if (p.metacognitionRerunsUsed != null && sharedMemory.metacognitionRerunsUsed == null) {
+      sharedMemory.metacognitionRerunsUsed = p.metacognitionRerunsUsed;
+    }
+    if (options.maxMetacognitionReruns == null && p.maxMetacognitionReruns != null) {
+      options.maxMetacognitionReruns = p.maxMetacognitionReruns;
+    }
+    if (p.iterationCount != null && sharedMemory.iterationCount == null) {
+      sharedMemory.iterationCount = p.iterationCount;
+    }
+  } catch (e) {
+    console.warn('[workspaceDb] applyServerPipelineProgressFromDb:', e?.message || e);
+  }
 }
 
 function sleep(ms) {
@@ -703,19 +855,28 @@ async function streamOpenAICompatChat({ apiKey, baseURL, model, systemPrompt, us
   res.end();
 }
 
-async function executeCallLLM(systemPrompt, userContent, options = {}) {
-  const failures = [];
-  const openrouterApiKey = String(options.openrouterApiKey || '').trim();
-  const optionsNoSecret = { ...options };
-  delete optionsNoSecret.openrouterApiKey;
-  const timeoutMs = optionsNoSecret.timeoutMs ?? resolveDefaultLlmTimeoutMs();
-  const budgeted = applyContextBudgetToCallOptions(
-    systemPrompt,
-    userContent,
-    optionsNoSecret,
-    resolveDefaultLocalMaxTokens()
-  );
-  const PROVIDERS = buildProviderList({ openrouterApiKey });
+function stripLlmRoutingFromOptions(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const o = { ...obj };
+  delete o.llmRoute;
+  delete o.onlyProviderId;
+  delete o.onlyModel;
+  return o;
+}
+
+/**
+ * @param {any[]} PROVIDERS
+ * @param {object} rest - contains failures (mutated), runWithProvider, tryProviders local state
+ */
+async function executeCallLLMWithProviderList(
+  systemPrompt,
+  userContent,
+  options,
+  budgeted,
+  timeoutMs,
+  PROVIDERS,
+  failures
+) {
   if (!PROVIDERS.length) {
     const err = new Error(
       'No LLM configured. Set HF_TOKEN and HF_INFERENCE_MODELS (router; e.g. model:featherless-ai), OPENROUTER_API_KEY and/or OpenRouter key in Settings, and/or LOCAL_LLM_BASE_URL and LOCAL_LLM_MODELS. Restart the backend after editing .env.'
@@ -742,93 +903,115 @@ async function executeCallLLM(systemPrompt, userContent, options = {}) {
     throw new Error(`Unknown provider type: ${provider.type}`);
   };
 
-  for (const provider of providersAvailableNow(PROVIDERS)) {
-    const apiKey = provider.getKey();
-    if (!apiKey) {
-      failures.push({ provider: provider.id, error: { message: 'Missing API key' } });
-      continue;
-    }
+  const tryProviders = async (providerList) => {
+    for (const provider of providerList) {
+      const apiKey = provider.getKey();
+      if (!apiKey) {
+        failures.push({ provider: provider.id, error: { message: 'Missing API key' } });
+        continue;
+      }
 
-    let skipRestOfProvider = false;
+      let skipRestOfProvider = false;
 
-    for (const model of provider.models) {
-      if (skipRestOfProvider) break;
+      for (const model of provider.models) {
+        if (skipRestOfProvider) break;
 
-      const attemptTag = `${provider.id}:${model}`;
-      const startedAt = Date.now();
+        const attemptTag = `${provider.id}:${model}`;
+        const startedAt = Date.now();
 
-      let callOpts = { ...budgeted };
-      let contextRetries = 0;
-      const maxContextRetries = 2;
+        let callOpts = { ...budgeted };
+        let contextRetries = 0;
+        const maxContextRetries = 2;
 
-      for (;;) {
-        let timeoutId;
-        try {
-          const slow = new Promise((_, reject) => {
-            timeoutId = setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms`)), timeoutMs);
-          });
-          const realWork = runWithProvider(provider, model, callOpts);
-          realWork.catch(() => {});
-          slow.catch(() => {});
-          const raced = await Promise.race([realWork, slow]);
-          if (timeoutId) clearTimeout(timeoutId);
-          timeoutId = undefined;
+        for (;;) {
+          let timeoutId;
+          try {
+            const slow = new Promise((_, reject) => {
+              timeoutId = setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms`)), timeoutMs);
+            });
+            const realWork = runWithProvider(provider, model, callOpts);
+            realWork.catch(() => {});
+            slow.catch(() => {});
+            const raced = await Promise.race([realWork, slow]);
+            if (timeoutId) clearTimeout(timeoutId);
+            timeoutId = undefined;
 
-          providerCooldownUntil.delete(provider.id);
+            providerCooldownUntil.delete(provider.id);
 
-          const resolved = (raced?.text ?? raced ?? '').toString();
-          const partialDueToSoftTimeout = Boolean(raced?.partialDueToSoftTimeout);
-          console.log(
-            `[callLLM] used ${attemptTag} in ${Date.now() - startedAt}ms` +
-              (partialDueToSoftTimeout ? ' (soft timeout partial)' : '')
-          );
-          lastSuccessfulLlmCall = {
-            provider: provider.id,
-            model,
-            at: new Date().toISOString(),
-          };
-          return {
-            text: resolved,
-            provider: provider.id,
-            model,
-            partialDueToSoftTimeout,
-          };
-        } catch (err) {
-          if (timeoutId) clearTimeout(timeoutId);
-
-          const status = extractHttpStatus(err);
-
-          if (isContextLengthError(err) && contextRetries < maxContextRetries) {
-            const cur = callOpts.max_tokens ?? budgeted.max_tokens ?? resolveDefaultLocalMaxTokens();
-            callOpts = {
-              ...callOpts,
-              max_tokens: Math.max(200, Math.floor(cur * 0.42)),
-            };
-            contextRetries += 1;
-            console.warn(
-              `[callLLM] context/token limit for ${attemptTag}, retry with max_tokens=${callOpts.max_tokens}`
+            const resolved = (raced?.text ?? raced ?? '').toString();
+            const partialDueToSoftTimeout = Boolean(raced?.partialDueToSoftTimeout);
+            console.log(
+              `[callLLM] used ${attemptTag} in ${Date.now() - startedAt}ms` +
+                (partialDueToSoftTimeout ? ' (soft timeout partial)' : '')
             );
-            await sleep(200);
-            continue;
+            lastSuccessfulLlmCall = {
+              provider: provider.id,
+              model,
+              at: new Date().toISOString(),
+            };
+            return {
+              text: resolved,
+              provider: provider.id,
+              model,
+              partialDueToSoftTimeout,
+            };
+          } catch (err) {
+            if (timeoutId) clearTimeout(timeoutId);
+
+            const status = extractHttpStatus(err);
+
+            if (isContextLengthError(err) && contextRetries < maxContextRetries) {
+              const cur = callOpts.max_tokens ?? budgeted.max_tokens ?? resolveDefaultLocalMaxTokens();
+              callOpts = {
+                ...callOpts,
+                max_tokens: Math.max(200, Math.floor(cur * 0.42)),
+              };
+              contextRetries += 1;
+              console.warn(
+                `[callLLM] context/token limit for ${attemptTag}, retry with max_tokens=${callOpts.max_tokens}`
+              );
+              await sleep(200);
+              continue;
+            }
+
+            failures.push({ provider: provider.id, model, error: normalizeError(err) });
+            console.warn(`[callLLM] failed ${attemptTag} (${status ?? 'no-status'})`);
+
+            if (shouldRestProviderAfterError(status, err)) {
+              const ms = cooldownMsForProvider(status, err);
+              providerCooldownUntil.set(provider.id, Date.now() + ms);
+              console.warn(`[callLLM] cooling down ${provider.id} for ~${Math.round(ms / 1000)}s`);
+              skipRestOfProvider = true;
+            } else if (isModelNotFoundError(err)) {
+              /* try next model, no provider-wide cooldown */
+            }
+
+            const wait = backoffAfterFailureMs(status, err, options);
+            if (wait > 0) await sleep(wait);
+            break;
           }
-
-          failures.push({ provider: provider.id, model, error: normalizeError(err) });
-          console.warn(`[callLLM] failed ${attemptTag} (${status ?? 'no-status'})`);
-
-          if (shouldRestProviderAfterError(status, err)) {
-            const ms = cooldownMsForProvider(status, err);
-            providerCooldownUntil.set(provider.id, Date.now() + ms);
-            console.warn(`[callLLM] cooling down ${provider.id} for ~${Math.round(ms / 1000)}s`);
-            skipRestOfProvider = true;
-          } else if (isModelNotFoundError(err)) {
-            /* try next model, no provider-wide cooldown */
-          }
-
-          const wait = backoffAfterFailureMs(status, err, options);
-          if (wait > 0) await sleep(wait);
-          break;
         }
       }
+    }
+    return null;
+  };
+
+  const readyProviders = providersAvailableNow(PROVIDERS);
+  const result = await tryProviders(readyProviders);
+  if (result) return result;
+
+  /* If every ready provider failed with a connection error (unreachable, not rate-limited),
+     try cooled-down providers before giving up — a 429-throttled remote API is better than nothing. */
+  const triedIds = new Set(readyProviders.map((p) => p.id));
+  const cooledDown = PROVIDERS.filter((p) => !triedIds.has(p.id));
+  if (cooledDown.length > 0) {
+    const allConnectionErrors = failures.every(
+      (f) => !f.error?.status && /connect|ECONNREFUSED|ENOTFOUND|network/i.test(f.error?.message ?? '')
+    );
+    if (allConnectionErrors) {
+      console.warn(`[callLLM] all ready providers unreachable — retrying cooled-down: ${cooledDown.map((p) => p.id).join(', ')}`);
+      const fallback = await tryProviders(cooledDown);
+      if (fallback) return fallback;
     }
   }
 
@@ -849,6 +1032,80 @@ async function executeCallLLM(systemPrompt, userContent, options = {}) {
   const error = new Error(msg);
   error.failures = failures;
   throw error;
+}
+
+async function executeCallLLM(systemPrompt, userContent, options = {}) {
+  const openrouterApiKey = String(options.openrouterApiKey || '').trim();
+  const route = String(options.llmRoute || 'default').toLowerCase();
+  const onlyPid = String(options.onlyProviderId || '').trim();
+  const onlyMod = String(options.onlyModel || '').trim();
+
+  const optionsNoSecret = stripLlmRoutingFromOptions({ ...options });
+  delete optionsNoSecret.openrouterApiKey;
+  const timeoutMs = optionsNoSecret.timeoutMs ?? resolveDefaultLlmTimeoutMs();
+  const budgeted = applyContextBudgetToCallOptions(
+    systemPrompt,
+    userContent,
+    optionsNoSecret,
+    resolveDefaultLocalMaxTokens()
+  );
+
+  if (onlyPid && onlyMod) {
+    const narrowed = buildNarrowedProviderList(onlyPid, onlyMod, { openrouterApiKey });
+    if (narrowed?.length) {
+      return await executeCallLLMWithProviderList(
+        systemPrompt,
+        userContent,
+        options,
+        budgeted,
+        timeoutMs,
+        narrowed,
+        []
+      );
+    }
+  }
+
+  if (route === 'fast') {
+    const fastP = buildFastHfProviderOnly();
+    if (fastP?.length) {
+      try {
+        return await executeCallLLMWithProviderList(
+          systemPrompt,
+          userContent,
+          options,
+          budgeted,
+          timeoutMs,
+          fastP,
+          []
+        );
+      } catch (e) {
+        if (/^1|true|yes$/i.test(String(process.env.LLM_FAST_FALLBACK_TO_DEFAULT || '').trim())) {
+          console.warn('[callLLM] fast route failed — falling back to default providers:', e?.message || e);
+          return await executeCallLLMWithProviderList(
+            systemPrompt,
+            userContent,
+            options,
+            budgeted,
+            timeoutMs,
+            buildProviderList({ openrouterApiKey }),
+            []
+          );
+        }
+        throw e;
+      }
+    }
+    console.warn('[callLLM] fast route unavailable (no HF token or LLM_FAST_HF_MODEL) — using default list');
+  }
+
+  return await executeCallLLMWithProviderList(
+    systemPrompt,
+    userContent,
+    options,
+    budgeted,
+    timeoutMs,
+    buildProviderList({ openrouterApiKey }),
+    []
+  );
 }
 
 export async function callLLM(systemPrompt, userContent, options = {}) {
@@ -873,6 +1130,7 @@ app.get('/api/health', (req, res) => {
   const hasOpenrouterProvider = providerIds.includes('openrouter');
   const localFirst = /^1|true|yes$/i.test(String(process.env.LLM_LOCAL_FIRST || '').trim());
   const hfFirst = /^1|true|yes$/i.test(String(process.env.LLM_HF_FIRST || '').trim());
+  const fastHfProvider = buildFastHfProviderOnly();
   res.json({
     ok: true,
     now: nowIso(),
@@ -923,6 +1181,13 @@ app.get('/api/health', (req, res) => {
       providerIds,
       localFirst,
       hfFirst,
+      fastRoute: {
+        /** Same base as `HF_INFERENCE_BASE_URL`; `llmRoute: "fast"` uses only this tier + `LLM_FAST_HF_MODEL`. */
+        defaultModel: DEFAULT_LLM_FAST_HF_MODEL,
+        effectiveModels: fastHfProvider?.[0]?.models ?? [],
+        configured: Boolean(fastHfProvider?.length),
+        fallbackToDefaultOnFailure: /^1|true|yes$/i.test(String(process.env.LLM_FAST_FALLBACK_TO_DEFAULT || '').trim()),
+      },
       ...healthContextBudgetFields(),
     },
     workspaceDb: getWorkspaceDbStatus(),
@@ -943,6 +1208,9 @@ app.post('/api/llm/text', async (req, res) => {
       max_tokens = resolveDefaultLocalMaxTokens(),
       top_p = 0.9,
       timeoutMs,
+      llmRoute,
+      onlyProviderId,
+      onlyModel,
     } = req.body || {};
 
     if (!prompt || !String(prompt).trim()) {
@@ -965,6 +1233,9 @@ app.post('/api/llm/text', async (req, res) => {
       timeoutMs,
       providerBackoffMs: 400,
       ...(orKey ? { openrouterApiKey: orKey } : {}),
+      ...(llmRoute != null && String(llmRoute).trim() ? { llmRoute: String(llmRoute).trim() } : {}),
+      ...(onlyProviderId != null && String(onlyProviderId).trim() ? { onlyProviderId: String(onlyProviderId).trim() } : {}),
+      ...(onlyModel != null && String(onlyModel).trim() ? { onlyModel: String(onlyModel).trim() } : {}),
     });
 
     res.json({ text: result.text, provider: result.provider, model: result.model });
@@ -1217,15 +1488,9 @@ async function postPipelineSseStream(req, res) {
       return;
     }
 
-    const attachmentBlock = attachments.length
-      ? [
-          'ATTACHMENTS:',
-          ...attachments.map((a, idx) => {
-            const cap = a.caption ? `caption: ${a.caption}` : 'caption: (not available)';
-            return `- [${idx + 1}] ${a.kind} ${a.filename} (${a.mimeType}, ${a.size} bytes) · ${cap}`;
-          }),
-        ].join('\n')
-      : '';
+    if (safeShared) applyServerPipelineProgressFromDb(safeShared, options);
+
+    const attachmentBlock = attachments.length ? await buildAttachmentBlockWithGlmOcr(attachments) : '';
 
     const composedInput = buildPipelineUserInput(inputText, attachmentBlock, options?.recentDialogue);
 
@@ -1245,12 +1510,48 @@ async function postPipelineSseStream(req, res) {
     });
 
     if (pipelineResult.pipelinePaused) {
+      try {
+        insertWorkspaceSnapshot({
+          sessionId: pipelineResult.sharedMemory?.sessionId,
+          globalWorkspace: pipelineResult.sharedMemory?.globalWorkspace,
+          rerunsUsed: pipelineResult.rerunsUsed,
+          voiceOutput: '',
+          pipelineProgress: buildPipelineProgressRecord({
+            sharedMemory: pipelineResult.sharedMemory,
+            rerunsUsed: pipelineResult.rerunsUsed,
+            executionCursor: pipelineResult.executionCursor,
+            maxMetacognitionReruns: options.maxMetacognitionReruns,
+            pipelinePaused: true,
+            continuationRequired: false,
+          }),
+        });
+      } catch (e) {
+        console.warn('[workspaceDb] insertWorkspaceSnapshot:', e?.message || e);
+      }
       sseSend(res, { type: 'attachments', attachments });
       res.end();
       return;
     }
 
     if (pipelineResult.continuationRequired) {
+      try {
+        insertWorkspaceSnapshot({
+          sessionId: pipelineResult.sharedMemory?.sessionId,
+          globalWorkspace: pipelineResult.sharedMemory?.globalWorkspace,
+          rerunsUsed: pipelineResult.rerunsUsed,
+          voiceOutput: '',
+          pipelineProgress: buildPipelineProgressRecord({
+            sharedMemory: pipelineResult.sharedMemory,
+            rerunsUsed: pipelineResult.rerunsUsed,
+            executionCursor: null,
+            maxMetacognitionReruns: options.maxMetacognitionReruns,
+            pipelinePaused: false,
+            continuationRequired: true,
+          }),
+        });
+      } catch (e) {
+        console.warn('[workspaceDb] insertWorkspaceSnapshot:', e?.message || e);
+      }
       sseSend(res, {
         type: 'pipeline_continuation',
         sharedMemory: slimSharedMemoryForSse(pipelineResult.sharedMemory),
@@ -1268,6 +1569,14 @@ async function postPipelineSseStream(req, res) {
         globalWorkspace: pipelineResult.sharedMemory?.globalWorkspace,
         rerunsUsed: pipelineResult.rerunsUsed,
         voiceOutput: pipelineResult.voiceOutput,
+        pipelineProgress: buildPipelineProgressRecord({
+          sharedMemory: pipelineResult.sharedMemory,
+          rerunsUsed: pipelineResult.rerunsUsed,
+          executionCursor: null,
+          maxMetacognitionReruns: options.maxMetacognitionReruns,
+          pipelinePaused: false,
+          continuationRequired: false,
+        }),
       });
     } catch (e) {
       console.warn('[workspaceDb] insertWorkspaceSnapshot:', e?.message || e);
@@ -1324,7 +1633,8 @@ app.post('/api/mind/voice-context-blocks', (req, res) => {
 
 app.post('/api/pipeline/run', async (req, res) => {
   try {
-    const { input, sharedMemory, options, attachmentIds } = req.body || {};
+    const { input, sharedMemory, options: rawOpts, attachmentIds } = req.body || {};
+    const opts = { ...(rawOpts && typeof rawOpts === 'object' ? rawOpts : {}) };
     const inputText = String(input || '');
     const ids = Array.isArray(attachmentIds) ? attachmentIds : [];
     const attachments = ids
@@ -1336,27 +1646,65 @@ app.post('/api/pipeline/run', async (req, res) => {
       return;
     }
 
-    const attachmentBlock = attachments.length
-      ? [
-          'ATTACHMENTS:',
-          ...attachments.map((a, idx) => {
-            const cap = a.caption ? `caption: ${a.caption}` : 'caption: (not available)';
-            return `- [${idx + 1}] ${a.kind} ${a.filename} (${a.mimeType}, ${a.size} bytes) · ${cap}`;
-          }),
-        ].join('\n')
-      : '';
+    const attachmentBlock = attachments.length ? await buildAttachmentBlockWithGlmOcr(attachments) : '';
 
-    let cont = pipelineContinuationMemory(sharedMemory, options);
+    let cont = pipelineContinuationMemory(sharedMemory, opts);
     if (cont) cont = hydratePriorWorkspaceFromDb(cont);
+    if (cont) applyServerPipelineProgressFromDb(cont, opts);
     const orKeyRun = extractOpenrouterApiKeyFromRequest(req);
     const result = await runPipeline({
-      input: buildPipelineUserInput(inputText, attachmentBlock, options?.recentDialogue),
+      input: buildPipelineUserInput(inputText, attachmentBlock, opts?.recentDialogue),
       existingSharedMemory: cont,
       callLLM: (sp, uc, o) => executeCallLLM(sp, uc, { ...o, ...(orKeyRun ? { openrouterApiKey: orKeyRun } : {}) }),
-      options: options || {},
+      options: opts,
     });
 
     if (result.continuationRequired) {
+      try {
+        insertWorkspaceSnapshot({
+          sessionId: result.sharedMemory?.sessionId,
+          globalWorkspace: result.sharedMemory?.globalWorkspace,
+          rerunsUsed: result.rerunsUsed,
+          voiceOutput: '',
+          pipelineProgress: buildPipelineProgressRecord({
+            sharedMemory: result.sharedMemory,
+            rerunsUsed: result.rerunsUsed,
+            executionCursor: null,
+            maxMetacognitionReruns: opts.maxMetacognitionReruns,
+            pipelinePaused: false,
+            continuationRequired: true,
+          }),
+        });
+      } catch (e) {
+        console.warn('[workspaceDb] insertWorkspaceSnapshot:', e?.message || e);
+      }
+      res.json({
+        ...result,
+        sharedMemory: slimSharedMemoryForSse(result.sharedMemory),
+        attachments,
+      });
+      return;
+    }
+
+    if (result.pipelinePaused) {
+      try {
+        insertWorkspaceSnapshot({
+          sessionId: result.sharedMemory?.sessionId,
+          globalWorkspace: result.sharedMemory?.globalWorkspace,
+          rerunsUsed: result.rerunsUsed,
+          voiceOutput: '',
+          pipelineProgress: buildPipelineProgressRecord({
+            sharedMemory: result.sharedMemory,
+            rerunsUsed: result.rerunsUsed,
+            executionCursor: result.executionCursor,
+            maxMetacognitionReruns: opts.maxMetacognitionReruns,
+            pipelinePaused: true,
+            continuationRequired: false,
+          }),
+        });
+      } catch (e) {
+        console.warn('[workspaceDb] insertWorkspaceSnapshot:', e?.message || e);
+      }
       res.json({
         ...result,
         sharedMemory: slimSharedMemoryForSse(result.sharedMemory),
@@ -1371,6 +1719,14 @@ app.post('/api/pipeline/run', async (req, res) => {
         globalWorkspace: result.sharedMemory?.globalWorkspace,
         rerunsUsed: result.rerunsUsed,
         voiceOutput: result.voiceOutput,
+        pipelineProgress: buildPipelineProgressRecord({
+          sharedMemory: result.sharedMemory,
+          rerunsUsed: result.rerunsUsed,
+          executionCursor: null,
+          maxMetacognitionReruns: opts.maxMetacognitionReruns,
+          pipelinePaused: false,
+          continuationRequired: false,
+        }),
       });
     } catch (e) {
       console.warn('[workspaceDb] insertWorkspaceSnapshot:', e?.message || e);
@@ -1486,6 +1842,78 @@ function resolveDevBackendPortFilePath() {
   return path.join(repoRoot, raw);
 }
 
+// ─── Server-Side Scheduler API ─────────────────────────────────────────
+app.post('/api/scheduler/enqueue', (req, res) => {
+  try {
+    const {
+      taskType, scheduledAt, inputText, reason, mindStorageProfile,
+      scheduledBy, recurrence, recurrenceInterval, recurrenceUnit, recurrenceEndDate,
+    } = req.body || {};
+    if (!taskType) return res.status(400).json({ error: 'taskType required' });
+    const delayMinutes = req.body.delayMinutes;
+    const at = scheduledAt || (delayMinutes
+      ? new Date(Date.now() + Math.max(1, Number(delayMinutes) || 5) * 60_000).toISOString()
+      : new Date().toISOString());
+    const id = insertScheduledTask({
+      taskType, scheduledAt: at, inputText, reason, mindStorageProfile,
+      scheduledBy: scheduledBy || 'client',
+      recurrence, recurrenceInterval, recurrenceUnit, recurrenceEndDate,
+    });
+    if (!id) return res.status(503).json({ error: 'Database not available' });
+    res.json({ ok: true, id, scheduledAt: at });
+  } catch (e) {
+    console.error('[scheduler/enqueue]', e);
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+app.get('/api/scheduler/tasks', (_req, res) => {
+  try {
+    const status = typeof _req.query.status === 'string' ? _req.query.status : undefined;
+    const limit = Math.min(500, Math.max(1, Number(_req.query.limit) || 100));
+    const tasks = listScheduledTasks({ status, limit });
+    res.json({ ok: true, tasks });
+  } catch (e) {
+    console.error('[scheduler/tasks]', e);
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+app.post('/api/scheduler/pause', (_req, res) => {
+  try {
+    setSchedulerPaused(true);
+    res.json({ ok: true, paused: true });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+app.post('/api/scheduler/resume', (_req, res) => {
+  try {
+    setSchedulerPaused(false);
+    res.json({ ok: true, paused: false });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+app.get('/api/scheduler/status', (_req, res) => {
+  try {
+    res.json({ ok: true, paused: isSchedulerPaused() });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+app.delete('/api/scheduler/tasks/:id', (req, res) => {
+  try {
+    const deleted = deleteScheduledTask(req.params.id);
+    res.json({ ok: true, deleted });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
 function startServer(port, attemptsLeft) {
   const server = http.createServer(app);
   /** Graph pipeline SSE can run a long time; Node defaults are usually 0, but set explicitly for clarity. */
@@ -1512,7 +1940,7 @@ function startServer(port, attemptsLeft) {
     console.error('Server failed to start:', err.message);
     if (err.code === 'EADDRINUSE') {
       console.error(
-        'Port is still in use after all fallback attempts. Stop another MyBrain / Node process on this port range, or set PORT to a free port.'
+        'Port is still in use after all fallback attempts. Stop another MetaSelf-CognitiveStack / Node process on this port range, or set PORT to a free port.'
       );
     }
     process.exit(1);
@@ -1534,7 +1962,7 @@ function startServer(port, attemptsLeft) {
         `[LLM] LOCAL_LLM_LOW_SPEC: context budget ${localLlmContextBudgetChars()} chars · default wait ${resolveDefaultLlmTimeoutMs()}ms per LLM call`
       );
     }
-    console.log(`MyBrain backend listening on http://127.0.0.1:${port} (bound ${HOST}:${port})`);
+    console.log(`MetaSelf-CognitiveStack backend listening on http://127.0.0.1:${port} (bound ${HOST}:${port})`);
     if (port !== preferredPort) {
       console.warn(
         `Note: wanted port ${preferredPort} but it was busy; using ${port}. Vite reads ${path.basename(resolveDevBackendPortFilePath())} (or VITE_API_PROXY) for the proxy.`
@@ -1547,5 +1975,6 @@ function startServer(port, attemptsLeft) {
 }
 
 initWorkspaceDb();
+startServerScheduler((sp, uc, o) => executeCallLLM(sp, uc, o || {}));
 startServer(preferredPort, portAttempts);
 

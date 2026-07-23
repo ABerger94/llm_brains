@@ -7,6 +7,11 @@ import {
 import { setGraphPipelineSessionId } from './graphPipelineSessionScope';
 import { graphPipelineStore } from './graphPipelineStore';
 import { consciousnessStreamStore } from './consciousnessStreamStore';
+import {
+  isPlaygroundDualOrchestrationActive,
+  PLAYGROUND_GRAPH_SESSION_A,
+  PLAYGROUND_GRAPH_SESSION_B,
+} from './playgroundDualGraphRunner';
 
 /**
  * True when the *specific* session has a live pipeline run:
@@ -17,7 +22,7 @@ import { consciousnessStreamStore } from './consciousnessStreamStore';
  * belong to whichever session is currently bound to the stores—not necessarily
  * the session being queried.
  */
-function isSessionPipelineLive(sessionId) {
+export function isSessionPipelineLive(sessionId) {
   const streamSid = getActiveConsciousnessStreamGraphSessionId();
   if (isInteractiveStreamFetchAlive() && streamSid === sessionId) return true;
   if (isBackgroundedRunAliveForSession(sessionId)) return true;
@@ -45,6 +50,38 @@ export function rehydrateGraphPipelineSessionStores(sessionId) {
 
   const streamSid = getActiveConsciousnessStreamGraphSessionId();
   const streamAlive = isInteractiveStreamFetchAlive();
+
+  /**
+   * Do not switch workspace KV or background the fetch while System Chat still owns the interactive
+   * SSE for playground-dual-a / playground-dual-b (covers orchestration gaps where depth is 0).
+   */
+  if (
+    streamAlive &&
+    streamSid &&
+    (streamSid === PLAYGROUND_GRAPH_SESSION_A || streamSid === PLAYGROUND_GRAPH_SESSION_B) &&
+    id !== streamSid
+  ) {
+    return;
+  }
+
+  /** Ditto while a backgrounded playground leg is still finishing. */
+  if (
+    (isBackgroundedRunAliveForSession(PLAYGROUND_GRAPH_SESSION_A) ||
+      isBackgroundedRunAliveForSession(PLAYGROUND_GRAPH_SESSION_B)) &&
+    id !== PLAYGROUND_GRAPH_SESSION_A &&
+    id !== PLAYGROUND_GRAPH_SESSION_B
+  ) {
+    return;
+  }
+
+  /** Avoid backgrounding System Chat’s interactive SSE when navigating to another workspace URL mid-run. */
+  if (
+    isPlaygroundDualOrchestrationActive() &&
+    id !== PLAYGROUND_GRAPH_SESSION_A &&
+    id !== PLAYGROUND_GRAPH_SESSION_B
+  ) {
+    return;
+  }
 
   if (isSessionPipelineLive(id) && (!streamAlive || streamSid === id)) {
     setGraphPipelineSessionId(id);
@@ -80,7 +117,28 @@ export function resetGraphPipelineSessionStoresAfterLeavingWorkspace(sessionId) 
   const sid = String(sessionId || '').trim();
   if (!sid) return;
 
+  if (isPlaygroundDualOrchestrationActive()) return;
+
+  /** URL workspace id may differ from playground A/B while System Chat still runs. */
+  if (isSessionPipelineLive(PLAYGROUND_GRAPH_SESSION_A)) return;
+  if (isSessionPipelineLive(PLAYGROUND_GRAPH_SESSION_B)) return;
+
   if (isSessionPipelineLive(sid)) return;
 
+  resetGraphPipelineSessionStoresForLobby();
+}
+
+/**
+ * System Chat (`/playground`) runs two graph sessions (A then B). Leaving the page or React Strict Mode
+ * remount must not clear in-memory stores while **either** session still has a live or backgrounded SSE,
+ * or the B leg appears to "crash" after A finishes (cleanup only checked A).
+ */
+export function resetPlaygroundDualGraphStoresAfterLeavingWorkspace() {
+  if (isPlaygroundDualOrchestrationActive()) return;
+  if (isSessionPipelineLive(PLAYGROUND_GRAPH_SESSION_A)) return;
+  if (isSessionPipelineLive(PLAYGROUND_GRAPH_SESSION_B)) return;
+  const gp = graphPipelineStore.getState();
+  const cs = consciousnessStreamStore.getState();
+  if (gp.isRunning || cs.isProcessing) return;
   resetGraphPipelineSessionStoresForLobby();
 }

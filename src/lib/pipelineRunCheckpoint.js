@@ -1,4 +1,4 @@
-import { MODULES, PIPELINE_LAYERS } from '../../shared/pipelineModules.mjs';
+import { MODULES, PIPELINE_LAYERS, PIPELINE_SCHEMA_VERSION } from '../../shared/pipelineModules.mjs';
 import { normalizeExecutionResume } from '../../shared/pipelineExecutionResume.mjs';
 
 const CANONICAL_MODULE_NAMES = new Set(MODULES.map((m) => m.name));
@@ -29,7 +29,28 @@ export function inferExecutionResumeFromPausedPipelineRun(row) {
   if (!CANONICAL_MODULE_NAMES.has(nextModuleName)) return null;
   const phase = phaseForCanonicalModuleName(nextModuleName);
   if (!phase) return null;
-  return normalizeExecutionResume({ v: 1, phase, nextModuleName });
+  return normalizeExecutionResume({ v: PIPELINE_SCHEMA_VERSION, phase, nextModuleName });
+}
+
+/**
+ * Incremental per-module checkpoints store `(Module checkpoint after … — resume at NextModule)` in `final_output`.
+ * When `execution_resume` is missing on the row, infer the cursor from that line.
+ * @param {object | null | undefined} row
+ * @returns {{ v: number, phase: string, nextModuleName: string } | null}
+ */
+export function inferExecutionResumeFromModuleCheckpointFinalOutput(row) {
+  if (!row || typeof row !== 'object' || !isCheckpointPipelineRun(row)) return null;
+  if (normalizeExecutionResume(row.execution_resume)) return null;
+  const fo = String(row.final_output || '');
+  if (!/module checkpoint after/i.test(fo)) return null;
+  const m = fo.match(/resume at\s+([^)]+)\)/i);
+  if (!m) return null;
+  const nextModuleName = m[1].trim();
+  if (!nextModuleName || nextModuleName === 'next') return null;
+  if (!CANONICAL_MODULE_NAMES.has(nextModuleName)) return null;
+  const phase = phaseForCanonicalModuleName(nextModuleName);
+  if (!phase) return null;
+  return normalizeExecutionResume({ v: PIPELINE_SCHEMA_VERSION, phase, nextModuleName });
 }
 
 /**

@@ -92,5 +92,26 @@ export function clampSharedMemoryForPipeline(sm, opts = {}) {
   if (typeof o.clientBiographyExcerpt === 'string' && o.clientBiographyExcerpt.length > 4000) {
     o.clientBiographyExcerpt = `${o.clientBiographyExcerpt.slice(0, 4000)}\n[truncated]`;
   }
+  if (Array.isArray(o.clientWorldEnvironmentDigest)) {
+    o.clientWorldEnvironmentDigest = o.clientWorldEnvironmentDigest.slice(0, 16).map((r) =>
+      r && typeof r === 'object'
+        ? {
+            ...r,
+            label: String(r.label || '').slice(0, 220),
+            description: String(r.description || '').slice(0, 1000),
+          }
+        : r
+    );
+  }
+  if (Array.isArray(o.clientCuriosityDigest)) {
+    o.clientCuriosityDigest = o.clientCuriosityDigest.slice(0, 12).map((r) =>
+      r && typeof r === 'object' ? { ...r, question: String(r.question || '').slice(0, 440) } : r
+    );
+  }
+  if (Array.isArray(o.clientGoalDigest)) {
+    o.clientGoalDigest = o.clientGoalDigest.slice(0, 10).map((r) =>
+      r && typeof r === 'object' ? { ...r, statement: String(r.statement || '').slice(0, 560) } : r
+    );
+  }
   return o;
 }

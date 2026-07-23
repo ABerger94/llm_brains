@@ -30,7 +30,7 @@ function tailscaleIPv4() {
   return line || null;
 }
 
-console.log('--- YourBrain + Tailscale (PC checks) ---\n');
+console.log('--- MetaSelf-CognitiveStack + Tailscale (PC checks) ---\n');
 
 const tsIp = tailscaleIPv4();
 if (tsIp) {

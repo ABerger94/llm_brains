@@ -46,6 +46,16 @@ export function initialCuriosityPipelineUi() {
  * (goal pipeline re-exports this as the same helper).
  * @param {Partial<ReturnType<typeof initialCuriosityPipelineUi>> | null | undefined} prevUi
  */
+/**
+ * Carousel / header should only show live minimap, neural highlight, and execution.log when the pursuit
+ * is actively running, cooperatively paused (resume path), or reload-interrupted — not when idle with stale KV.
+ * @param {{ running?: boolean, cooperativePaused?: boolean, interruptedByReload?: boolean } | null | undefined} entry
+ */
+export function pursuitShowsLivePipelineChrome(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  return Boolean(entry.running || entry.cooperativePaused || entry.interruptedByReload);
+}
+
 export function freshPursuitPipelineUiForNewGraphRun(prevUi) {
   const base = initialCuriosityPipelineUi();
   if (!prevUi || typeof prevUi !== 'object') return base;
@@ -64,14 +74,17 @@ export function freshPursuitPipelineUiForNewGraphRun(prevUi) {
   };
 }
 
+const MAX_PURSUIT_PIPELINE_LOG_LINES = 40;
+
 function pushLog(state, msg, detail) {
-  const trimmed = detail != null && String(detail).trim() ? String(detail).trim() : undefined;
+  const trimmed = detail != null && String(detail).trim() ? String(detail).trim().slice(0, 12_000) : undefined;
+  const m = String(msg || '').slice(0, 4000);
   return {
     ...state,
     executionLog: [
-      ...state.executionLog,
-      { time: Date.now(), msg, ...(trimmed ? { detail: trimmed } : {}) },
-    ],
+      ...(state.executionLog || []),
+      { time: Date.now(), msg: m, ...(trimmed ? { detail: trimmed } : {}) },
+    ].slice(-MAX_PURSUIT_PIPELINE_LOG_LINES),
   };
 }
 

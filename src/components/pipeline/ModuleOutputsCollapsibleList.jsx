@@ -53,7 +53,7 @@ export default function ModuleOutputsCollapsibleList({
                 <span className="hidden shrink-0 text-[10px] text-muted-foreground group-open:inline">Close</span>
               </summary>
               {text ? (
-                <pre className="mt-2 max-h-[min(50vh,420px)] overflow-auto whitespace-pre-wrap break-words font-sans text-[11px] leading-relaxed text-foreground/90">
+                <pre className="mt-2 max-h-[min(50svh,420px)] overflow-auto whitespace-pre-wrap break-words font-sans text-[11px] leading-relaxed text-foreground/90">
                   {text}
                 </pre>
               ) : emptyRecorded ? (

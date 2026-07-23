@@ -1,3 +1,4 @@
+import { PIPELINE_SCHEMA_VERSION } from '../../shared/pipelineModules.mjs';
 import { patchDashboardLlmFromPipelineSseEvent } from './graphPipelineStore';
 import { slimSharedMemoryForPipelinePost } from './slimSharedMemory';
 import { formatPipelineSseErrorPayload, stringifyJsonSafe } from './pipelineRunErrorFormat';
@@ -168,7 +169,7 @@ export async function consumePipelineSseWithMetacognitionContinuations({
   initialSlimSharedMemory = null,
   onEvent,
   fetchImpl = fetch,
-  maxLegs = 25,
+  maxLegs = 14,
   treatFirstLegAsContinuation = false,
   abortSignal,
 }) {
@@ -212,7 +213,7 @@ export async function consumePipelineSseWithMetacognitionContinuations({
         ecRaw && typeof ecRaw === 'object'
           ? ecRaw
           : {
-              v: 1,
+              v: PIPELINE_SCHEMA_VERSION,
               phase: pausedEvt.phase,
               nextModuleName: pausedEvt.nextModuleName,
             };

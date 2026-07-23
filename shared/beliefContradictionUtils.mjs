@@ -23,6 +23,16 @@ function jaccard(a, b) {
 }
 
 /**
+ * Token Jaccard similarity for two natural-language strings (layout / grouping).
+ * @param {string} sa
+ * @param {string} sb
+ * @returns {number}
+ */
+export function jaccardSimilarity(sa, sb) {
+  return jaccard(tokens(String(sa || '')), tokens(String(sb || '')));
+}
+
+/**
  * @param {Array<{ id?: string, statement?: string, belief?: string }>} rows
  * @param {{ maxPairs?: number, minJaccard?: number }} opts
  * @returns {Array<{ a: object, b: object, score: number, reason: string }>}

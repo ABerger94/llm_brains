@@ -21,6 +21,7 @@ import {
  *   runInterrupted: boolean,
  *   runError: string | null,
  *   cooperativePauseToken: string | null,
+ *   lastSharedMemory: object | null,
  * } | null}
  */
 export function peekGraphPipelineUiPersisted(sessionId) {
@@ -49,6 +50,8 @@ export function peekGraphPipelineUiPersisted(sessionId) {
       runInterrupted: Boolean(parsed.runInterrupted),
       runError: typeof parsed.runError === 'string' ? parsed.runError : null,
       cooperativePauseToken: coopTok || null,
+      lastSharedMemory:
+        parsed.lastSharedMemory && typeof parsed.lastSharedMemory === 'object' ? parsed.lastSharedMemory : null,
     };
   } catch {
     return null;

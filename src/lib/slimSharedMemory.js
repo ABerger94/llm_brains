@@ -21,6 +21,23 @@ const MAX_STRUCTURAL_SELF = 4000;
 const MAX_GLOBAL_WORKSPACE = 3500;
 
 /**
+ * For graph session KV (`pipelineCheckpoint`) and PipelineRun `shared_memory`: never persist raw SSE
+ * sharedMemory — ingest / large-context modules can embed multi‑MB strings. `graphPipelineStore`
+ * runs `JSON.stringify` synchronously on the main thread; oversized blobs freeze or crash WebKit tabs.
+ * Uses continuation-style caps (same as supervisor POST legs).
+ *
+ * @param {object|null|undefined} sm
+ * @returns {object|null|undefined}
+ */
+export function slimSharedMemoryForGraphCheckpoint(sm) {
+  if (sm == null || typeof sm !== 'object') return sm;
+  const a = slimSharedMemoryForPipelinePost(sm, { continuation: true });
+  if (a) return a;
+  const b = slimSharedMemoryForPipelinePost(sm);
+  return b || sm;
+}
+
+/**
  * @param {object|null|undefined} sm
  * @param {{ continuation?: boolean }} [opts] - when true, preserve long moduleOutputs for supervisor RERUN POSTs
  */
@@ -100,6 +117,9 @@ export function slimSharedMemoryForPipelinePost(sm, opts = {}) {
         broadcastWinners: Array.isArray(gw.broadcastWinners)
           ? gw.broadcastWinners.map((s) => String(s).slice(0, 220)).slice(0, 4)
           : [],
+        suppressedOrPeripheral: Array.isArray(gw.suppressedOrPeripheral)
+          ? gw.suppressedOrPeripheral.map((s) => String(s).slice(0, 200)).slice(0, 6)
+          : [],
         ...(ip
           ? {
               iitProxy: {
@@ -109,6 +129,29 @@ export function slimSharedMemoryForPipelinePost(sm, opts = {}) {
             }
           : {}),
       };
+    }
+    if (Array.isArray(o.workspaceHistory) && o.workspaceHistory.length) {
+      o.workspaceHistory = o.workspaceHistory.slice(-6).map((e) => {
+        if (!e || typeof e !== 'object') return e;
+        const snap = e.snapshot && typeof e.snapshot === 'object' ? e.snapshot : null;
+        return {
+          at: String(e.at || '').slice(0, 44),
+          label: String(e.label || '').slice(0, 48),
+          snapshot: snap
+            ? {
+                provisionalStance: String(snap.provisionalStance || '').slice(0, 800),
+                phenomenalUnity: String(snap.phenomenalUnity || '').slice(0, 16),
+                integrationConfidence:
+                  typeof snap.integrationConfidence === 'number' && Number.isFinite(snap.integrationConfidence)
+                    ? snap.integrationConfidence
+                    : undefined,
+                saliencePreview: Array.isArray(snap.salience)
+                  ? snap.salience.map((s) => String(s).slice(0, 160)).slice(0, 4)
+                  : [],
+              }
+            : null,
+        };
+      });
     }
     if (o.workspaceIgnition && typeof o.workspaceIgnition === 'object') {
       const ig = o.workspaceIgnition;
@@ -129,6 +172,18 @@ export function slimSharedMemoryForPipelinePost(sm, opts = {}) {
     if (o.epistemicFusion && typeof o.epistemicFusion === 'object') {
       o.epistemicFusion = slimEpistemicFusion(o.epistemicFusion);
     }
+    if (o.workspaceDelta && typeof o.workspaceDelta === 'object') {
+      const d = o.workspaceDelta;
+      o.workspaceDelta = {
+        ...(typeof d.stanceOverlapApprox === 'number' && Number.isFinite(d.stanceOverlapApprox)
+          ? { stanceOverlapApprox: d.stanceOverlapApprox }
+          : {}),
+        ...(typeof d.unityChange === 'string' && d.unityChange.trim() ? { unityChange: d.unityChange.slice(0, 48) } : {}),
+        ...(typeof d.note === 'string' && d.note.trim() ? { note: d.note.slice(0, 120) } : {}),
+        bullets: Array.isArray(d.bullets) ? d.bullets.map((b) => String(b).slice(0, 400)).slice(0, 6) : [],
+      };
+    }
+    if (o.globalWorkspaceFallback !== true) delete o.globalWorkspaceFallback;
     if (o.priorTurnGlobalWorkspace && typeof o.priorTurnGlobalWorkspace === 'object') {
       const pt = o.priorTurnGlobalWorkspace;
       const hy = Array.isArray(pt.hypotheses)

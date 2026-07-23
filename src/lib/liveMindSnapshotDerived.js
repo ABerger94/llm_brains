@@ -54,6 +54,19 @@ function parseJsonAfterMarker(text, marker) {
   }
 }
 
+/** @param {string} planningText */
+function parseUserStancePredictionFromPlanning(planningText) {
+  const parsed = parseJsonAfterMarker(String(planningText || ''), 'USER_STANCE_PREDICTION');
+  if (!parsed || typeof parsed !== 'object') return null;
+  const expectUserWants = String(parsed.expectUserWants || parsed.summary || '').trim();
+  if (!expectUserWants && parsed.confidence == null) return null;
+  return {
+    expectUserWants: expectUserWants || String(parsed.summary || '').trim(),
+    summary: parsed.summary != null ? String(parsed.summary) : undefined,
+    confidence: typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence) ? parsed.confidence : undefined,
+  };
+}
+
 function tokenize(text) {
   return String(text || '')
     .toLowerCase()
@@ -193,11 +206,13 @@ function pickRichestSourceForEmergence(sources) {
 /**
  * Same source list as {@link computeLiveMindSnapshot}: active rows, or idle graph store when empty.
  * @param {object[]} sources
+ * @param {{ idleGraphFallback?: boolean }} [opts] - When `idleGraphFallback` is false (e.g. System Chat per-system buckets), do not substitute the global graph store — an empty bucket stays empty so the mirror leg does not mirror the primary leg’s module outputs.
  * @returns {object[]}
  */
-export function resolveLivePipelineSourcesForMindSnapshot(sources) {
+export function resolveLivePipelineSourcesForMindSnapshot(sources, opts = {}) {
+  const idleGraphFallback = opts.idleGraphFallback !== false;
   let srcs = Array.isArray(sources) ? sources.filter(Boolean) : [];
-  if (!srcs.length) {
+  if (!srcs.length && idleGraphFallback) {
     const gp = graphPipelineStore.getState();
     const mo = gp.moduleOutputs && typeof gp.moduleOutputs === 'object' ? gp.moduleOutputs : {};
     const has =
@@ -233,22 +248,28 @@ export function computeLiveIdentityStabilityFromSources(sources, lastSharedMemor
         ? richestSource.moduleOutputs
         : null,
     fallbackDmn: dmnFromSm,
+    pipelineSources: srcs,
   });
 }
 
 /**
  * @param {object|null} lastSharedMemory
- * @param {{ fallbackModuleOutputs?: Record<string, string>|null, fallbackDmn?: string }} [options]
+ * @param {{
+ *   fallbackModuleOutputs?: Record<string, string>|null,
+ *   fallbackDmn?: string,
+ *   pipelineSources?: object[]|null,
+ * }} [options]
  */
 export function computeLiveIdentityStability(lastSharedMemory, options = {}) {
-  const { fallbackModuleOutputs = null, fallbackDmn = '' } = options;
+  const { fallbackModuleOutputs = null, fallbackDmn = '', pipelineSources = null } = options;
   let sm = lastSharedMemory && typeof lastSharedMemory === 'object' ? lastSharedMemory : null;
+  const graphComposerInput = String(graphPipelineStore.getState().input || '').trim();
 
   if (!sm && fallbackModuleOutputs && typeof fallbackModuleOutputs === 'object') {
     sm = {
       moduleOutputs: fallbackModuleOutputs,
       dmnCarryover: typeof fallbackDmn === 'string' ? fallbackDmn : '',
-      originalInput: '',
+      originalInput: graphComposerInput,
       userStancePrediction: null,
       priorTurnPredictionAudit: null,
     };
@@ -266,20 +287,41 @@ export function computeLiveIdentityStability(lastSharedMemory, options = {}) {
     };
   }
 
+  const mo = sm.moduleOutputs && typeof sm.moduleOutputs === 'object' ? sm.moduleOutputs : {};
+  const planningText = moduleOutputByName(mo, 'Planning');
+  const parsedPlanningPred = parseUserStancePredictionFromPlanning(planningText);
+  const predFromSm = sm.userStancePrediction && typeof sm.userStancePrediction === 'object' ? sm.userStancePrediction : null;
+  const expectFromSm = String(predFromSm?.expectUserWants || predFromSm?.summary || '').trim();
+  const effectivePred =
+    expectFromSm || parsedPlanningPred
+      ? {
+          expectUserWants: expectFromSm || String(parsedPlanningPred?.expectUserWants || '').trim(),
+          summary: predFromSm?.summary ?? parsedPlanningPred?.summary,
+          confidence:
+            typeof predFromSm?.confidence === 'number' && Number.isFinite(predFromSm.confidence)
+              ? predFromSm.confidence
+              : parsedPlanningPred?.confidence,
+        }
+      : null;
+  const expectUserWants = String(effectivePred?.expectUserWants || '').trim();
+
+  const originalInputMerged = String(sm.originalInput || graphComposerInput || '').trim();
+  const newPrimary = extractPrimaryTurnText(originalInputMerged);
+
   const audit = sm.priorTurnPredictionAudit;
   const auditOverlap =
     audit && typeof audit === 'object' && typeof audit.overlapScore === 'number' && Number.isFinite(audit.overlapScore)
       ? Math.min(1, Math.max(0, audit.overlapScore))
       : null;
 
-  const pred = sm.userStancePrediction;
-  const expectUserWants = String(pred?.expectUserWants || pred?.summary || '').trim();
-  const newPrimary = extractPrimaryTurnText(sm.originalInput || '');
   let overlap = null;
+  /** @type {'audit'|'primary'|'integration'|'voice'|null} */
+  let overlapSource = null;
   let stanceNote = '';
 
   if (auditOverlap != null) {
     overlap = auditOverlap;
+    overlapSource = 'audit';
     const pct = Math.round(overlap * 100);
     const align = String(audit.heuristicAlignment || 'unknown').trim() || 'unknown';
     stanceNote = `Cross-turn audit (prior Planning vs this primary turn): ${pct}% token overlap; heuristic ${align}.`;
@@ -301,26 +343,96 @@ export function computeLiveIdentityStability(lastSharedMemory, options = {}) {
       const newTokens = tokenize(newPrimary);
       overlap = jaccard(predTokens, newTokens);
     }
+    overlapSource = 'primary';
     const pct = Math.round(overlap * 100);
     const simMethod = embOverlapValid ? 'semantic' : 'token';
     if (overlap > 0.22) {
-      stanceNote = `Planning “expect user wants” vs this primary turn: ${pct}% ${simMethod} overlap (aligned).`;
+      stanceNote = `Planning “expect user wants” vs this leg’s primary turn: ${pct}% ${simMethod} overlap (aligned).`;
     } else if (overlap > 0.08) {
       stanceNote = `Planning expectation vs primary turn: ${pct}% ${simMethod} overlap (moderate drift).`;
     } else {
       stanceNote = `Planning expectation vs primary turn: ${pct}% ${simMethod} overlap (strong drift or new thread).`;
     }
   } else if (expectUserWants) {
-    stanceNote = 'Stance prediction present; primary turn text missing or too short to compare.';
+    stanceNote =
+      'Planning expectation text is present, but this leg’s primary turn is missing or too short — paste a message in Graph Pipeline or run a full leg so shared memory / composer input can be compared.';
   } else if (audit && typeof audit === 'object' && (audit.previousExpectUserWants || audit.newPrimaryTurnPreview)) {
     stanceNote =
       'Prior-turn prediction audit present but overlap score unavailable; see PRIOR_TURN_PREDICTION_AUDIT in shared memory.';
   } else {
     stanceNote =
-      'No cross-turn audit and no parseable USER_STANCE_PREDICTION from Planning for this leg (model may omit JSON).';
+      'No cross-turn audit yet. No USER_STANCE_PREDICTION JSON found in parsed Planning output (module may omit the line).';
   }
 
-  const mo = sm.moduleOutputs && typeof sm.moduleOutputs === 'object' ? sm.moduleOutputs : {};
+  const gwScanSources =
+    Array.isArray(pipelineSources) && pipelineSources.length > 0 ? pipelineSources : [{ moduleOutputs: mo }];
+  const gwSignals = extractGlobalWorkspaceSignalsFromSources(sm, gwScanSources);
+  const prov = String(gwSignals?.provisionalStance || '').trim();
+
+  if (overlap == null && expectUserWants && prov.length > 24) {
+    const o = jaccard(tokenize(expectUserWants), tokenize(prov));
+    overlap = o;
+    overlapSource = 'integration';
+    const pct = Math.round(o * 100);
+    if (o > 0.22) {
+      stanceNote = `Integration provisional stance vs Planning “expect user wants”: ${pct}% token overlap (aligned).`;
+    } else if (o > 0.08) {
+      stanceNote = `Integration provisional stance vs Planning expectation: ${pct}% overlap (moderate drift).`;
+    } else {
+      stanceNote = `Integration provisional stance vs Planning expectation: ${pct}% overlap (different emphasis or new thread).`;
+    }
+  }
+
+  if (overlap == null && expectUserWants) {
+    const voiceBlob = moduleOutputByName(mo, 'Voice') || '';
+    if (voiceBlob.trim().length > 48) {
+      const slice = voiceBlob.slice(0, 1600);
+      const o = jaccard(tokenize(expectUserWants), tokenize(slice));
+      overlap = o;
+      overlapSource = 'voice';
+      const pct = Math.round(o * 100);
+      if (o > 0.22) {
+        stanceNote = `Planning “expect user wants” vs Voice output (excerpt): ${pct}% token overlap (aligned).`;
+      } else if (o > 0.08) {
+        stanceNote = `Planning vs Voice excerpt: ${pct}% overlap (moderate).`;
+      } else {
+        stanceNote = `Planning vs Voice excerpt: ${pct}% overlap (Voice may elaborate beyond the expectation).`;
+      }
+    }
+  }
+
+  const diagnosticParts = [];
+  if (newPrimary.trim()) {
+    diagnosticParts.push(`Primary turn (this leg): ${clipTextComplete(newPrimary.trim(), 220, { ellipsis: true })}`);
+  } else if (!graphComposerInput) {
+    diagnosticParts.push('Graph composer is empty — open Graph Pipeline and type a message to anchor “primary turn”.');
+  }
+  if (
+    expectUserWants &&
+    overlapSource !== 'primary' &&
+    overlapSource !== 'audit'
+  ) {
+    diagnosticParts.push(
+      `Planning expectation: ${clipTextComplete(expectUserWants, 200, { ellipsis: true })}${parsedPlanningPred && !expectFromSm ? ' (parsed from Planning text)' : ''}`
+    );
+  } else if (!expectUserWants && planningText && String(planningText).trim().length > 40) {
+    diagnosticParts.push(
+      `Planning module ran (${String(planningText).trim().length} chars) but no USER_STANCE_PREDICTION JSON was parsed — check for a line USER_STANCE_PREDICTION: {"expectUserWants":"…","confidence":0.5}.`
+    );
+  }
+  if (prov.length > 16 && overlapSource !== 'integration') {
+    diagnosticParts.push(`Integration stance (excerpt): ${clipTextComplete(prov, 200, { ellipsis: true })}`);
+  }
+  if (overlapSource && overlapSource !== 'audit') {
+    stanceNote += ` Source: ${overlapSource === 'primary' ? 'user vs Planning' : overlapSource === 'integration' ? 'Integration vs Planning' : 'Voice vs Planning'}.`;
+  }
+
+  if (stanceNote && diagnosticParts.length) {
+    stanceNote = `${stanceNote} ${diagnosticParts.join(' ')}`;
+  } else if (diagnosticParts.length && !stanceNote) {
+    stanceNote = diagnosticParts.join(' ');
+  }
+
   const idText = moduleOutputByName(mo, 'Identity');
   const narText = moduleOutputByName(mo, 'Narrative');
   const dmn = typeof sm.dmnCarryover === 'string' ? sm.dmnCarryover : '';
@@ -343,6 +455,8 @@ export function computeLiveIdentityStability(lastSharedMemory, options = {}) {
     else headline = 'Stability: strong drift vs prediction';
   } else if (signals.length) {
     headline = 'Stability: identity / narrative signals (no stance compare)';
+  } else if (expectUserWants || prov.length > 20 || planningText?.trim()) {
+    headline = 'Stability: partial cues (see detail)';
   } else {
     headline = 'Stability: thin signals this leg';
   }
@@ -357,6 +471,7 @@ export function computeLiveIdentityStability(lastSharedMemory, options = {}) {
     else if (overlap > 0.08) tier = 'moderate';
     else tier = 'drift';
   } else if (signals.length) tier = 'identity_activity';
+  else if (expectUserWants || prov.length > 20 || planningText?.trim()) tier = 'partial';
 
   return {
     headline,
@@ -368,24 +483,12 @@ export function computeLiveIdentityStability(lastSharedMemory, options = {}) {
   };
 }
 
-/**
- * @param {object[]} sources - live pipeline source objects (moduleOutputs keyed by UI id or server name)
- * @param {object|null} lastSharedMemory - graphPipelineStore.lastSharedMemory
- */
 const FALLBACK_UNITY_SENTINEL = 'No valid INTEGRATION_JSON line was parsed';
 
 /**
- * Extract structured Integration / Global Workspace signals from lastSharedMemory
- * (primary) or by re-parsing INTEGRATION_JSON from the richest source's module outputs.
+ * @param {object|null|undefined} gw raw INTEGRATION_JSON / globalWorkspace object
  */
-export function extractGlobalWorkspaceSignals(lastSharedMemory, richestSource) {
-  let gw = lastSharedMemory?.globalWorkspace;
-  if (!gw || typeof gw !== 'object') {
-    const integrationText = moduleOutputByName(richestSource?.moduleOutputs || {}, 'Integration');
-    if (integrationText) {
-      gw = parseJsonAfterMarker(integrationText, 'INTEGRATION_JSON');
-    }
-  }
+function normalizeGlobalWorkspaceDto(gw) {
   if (!gw || typeof gw !== 'object') {
     return null;
   }
@@ -426,8 +529,52 @@ export function extractGlobalWorkspaceSignals(lastSharedMemory, richestSource) {
   };
 }
 
-export function computeLiveMindSnapshot(sources, lastSharedMemory) {
-  const srcs = resolveLivePipelineSourcesForMindSnapshot(sources);
+/**
+ * Extract structured Integration / Global Workspace signals from lastSharedMemory
+ * (primary) or by re-parsing INTEGRATION_JSON from one source's Integration output.
+ */
+export function extractGlobalWorkspaceSignals(lastSharedMemory, richestSource) {
+  let gw = lastSharedMemory?.globalWorkspace;
+  if (!gw || typeof gw !== 'object') {
+    const mo = richestSource?.moduleOutputs && typeof richestSource.moduleOutputs === 'object' ? richestSource.moduleOutputs : {};
+    const finalizeText = moduleOutputByName(mo, 'IntegrationFinalize');
+    const integrationText = moduleOutputByName(mo, 'Integration');
+    if (finalizeText) {
+      gw = parseJsonAfterMarker(finalizeText, 'INTEGRATION_JSON');
+    }
+    if ((!gw || typeof gw !== 'object') && integrationText) {
+      gw = parseJsonAfterMarker(integrationText, 'INTEGRATION_JSON');
+    }
+  }
+  return normalizeGlobalWorkspaceDto(gw);
+}
+
+/**
+ * Prefer `lastSharedMemory.globalWorkspace`; otherwise scan **every** active pipeline source for
+ * parseable INTEGRATION_JSON. Live Analytics used to only check the "richest" source (Voice+Narrative+Identity
+ * length), so Integration on Graph Pipeline could be missed when Curiosity/scheduler rows had longer Voice.
+ *
+ * @param {object|null} lastSharedMemory
+ * @param {object[]} sources merged pipeline rows (graph, curiosity, goal, scheduler, …)
+ */
+export function extractGlobalWorkspaceSignalsFromSources(lastSharedMemory, sources) {
+  const fromSm = extractGlobalWorkspaceSignals(lastSharedMemory, null);
+  if (fromSm) return fromSm;
+  const srcs = Array.isArray(sources) ? sources : [];
+  for (const s of srcs) {
+    const parsed = extractGlobalWorkspaceSignals(null, s);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+/**
+ * @param {object[]} sources - live pipeline source objects (moduleOutputs keyed by UI id or server name)
+ * @param {object|null} lastSharedMemory - graphPipelineStore.lastSharedMemory
+ * @param {{ idleGraphFallback?: boolean }} [opts] - Passed to {@link resolveLivePipelineSourcesForMindSnapshot}; set `idleGraphFallback: false` for System Chat per-system columns so an empty bucket does not read the bound graph session.
+ */
+export function computeLiveMindSnapshot(sources, lastSharedMemory, opts = {}) {
+  const srcs = resolveLivePipelineSourcesForMindSnapshot(sources, opts);
 
   const richestSource = pickRichestSourceForEmergence(srcs);
   const dmnFromSm = typeof lastSharedMemory?.dmnCarryover === 'string' ? lastSharedMemory.dmnCarryover : '';
@@ -437,13 +584,16 @@ export function computeLiveMindSnapshot(sources, lastSharedMemory) {
         ? richestSource.moduleOutputs
         : null,
     fallbackDmn: dmnFromSm,
+    pipelineSources: srcs,
   });
 
   /** @type {object[]} */
   const beliefSignals = [];
   const beliefSeen = new Set();
   for (const s of srcs) {
-    const t = moduleOutputByName(s.moduleOutputs || {}, 'Belief Store');
+    const t =
+      moduleOutputByName(s.moduleOutputs || {}, 'Beliefs') ||
+      moduleOutputByName(s.moduleOutputs || {}, 'Belief Store');
     if (!t) continue;
     for (const it of extractBeliefSignalsFromBeliefStoreText(t)) {
       const key = `${it.kind}|${(it.ref || it.text || '').toLowerCase().slice(0, 120)}`;
@@ -457,7 +607,8 @@ export function computeLiveMindSnapshot(sources, lastSharedMemory) {
   const emergence = collectPipelineEmergenceMarkers({
     voiceText: moduleOutputByName(emMo, 'Voice') || richestSource?.finalOutput || '',
     narrativeText: moduleOutputByName(emMo, 'Narrative'),
-    identityText: moduleOutputByName(emMo, 'Identity'),
+    identityText:
+      moduleOutputByName(emMo, 'SelfRelationTension') || moduleOutputByName(emMo, 'Identity'),
     dmnText: dmnFromSm,
   });
 
@@ -465,7 +616,9 @@ export function computeLiveMindSnapshot(sources, lastSharedMemory) {
   const curiosityItems = [];
   const curiositySeen = new Set();
   for (const s of srcs) {
-    const raw = moduleOutputByName(s.moduleOutputs || {}, 'Curiosity');
+    const raw =
+      moduleOutputByName(s.moduleOutputs || {}, 'Motivation') ||
+      moduleOutputByName(s.moduleOutputs || {}, 'Curiosity');
     if (!raw) continue;
     const main = curiosityMainQuestionFromOutput(raw);
     if (main) {
@@ -545,7 +698,7 @@ export function computeLiveMindSnapshot(sources, lastSharedMemory) {
     });
   }
 
-  const gwSignals = extractGlobalWorkspaceSignals(lastSharedMemory, richestSource);
+  const gwSignals = extractGlobalWorkspaceSignalsFromSources(lastSharedMemory, srcs);
 
   const hasAny =
     beliefSignals.length > 0 ||

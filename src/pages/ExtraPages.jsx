@@ -39,12 +39,19 @@ import {
   Zap,
 } from 'lucide-react';
 import { Button, Input, Textarea, toast } from '../components/ui';
-import { PipelineRun, ScheduledTask } from '../lib/data';
+import { ScheduledTask } from '../lib/data';
+import { useMindScope, useScopedEntities } from '../context/MindScopeContext';
+import MindScopeTabs from '../components/MindScopeTabs';
 import { DEFAULT_RUNTIME_SETTINGS, getRuntimeSettings } from '../lib/runtimeSettings';
 import { MIND_PHASE_OPTIONS } from '../lib/mindPersistence';
 import { useMindStorageRefresh, notifyMindStorageChanged } from '../lib/mindStorageEvents';
+import { shareOrDownloadBlob } from '../lib/triggerBlobDownload';
 import { cn } from '../lib/utils';
 import { APP_NAV_SECTIONS, APP_ROUTES } from '../lib/appSiteMap';
+import {
+  MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR,
+  MIND_STORAGE_PROFILE_PRIMARY,
+} from '../lib/mindEntityContext';
 import { scheduleTask } from '../lib/schedulerStore';
 import { getSchedulerSuggestions, suggestionUsesMindOptions } from '../lib/schedulerSuggestions';
 import {
@@ -61,30 +68,11 @@ import {
   subscribeCooperativePauseAllExternalHold,
   isCooperativePauseAllExternalHoldActive,
   setCooperativePauseAllExternalHold,
+  COOPERATIVE_PAUSE_HOLD_SCHEDULER_MESSAGE,
 } from '../lib/cooperativePauseAllExternalHold';
 import { SCHEDULER_TASK_GROUPS, SCHEDULER_TASK_LABELS } from '../lib/schedulerTaskLabels';
 import { clearPersistedSchedulerHeadlessFlightIfMatches } from '../lib/schedulerHeadlessFlightStore';
-function PageShell({ icon: Icon, title, description, actions, children }) {
-  return (
-    <div className="min-h-screen p-4 sm:p-6">
-      <div className="mx-auto max-w-7xl">
-        <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-          <div className="min-w-0">
-            <div className="mb-2 flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/15">
-                <Icon className="h-5 w-5 text-primary" />
-              </div>
-              <h1 className="text-2xl font-bold">{title}</h1>
-            </div>
-            <p className="max-w-2xl text-sm text-muted-foreground">{description}</p>
-          </div>
-          {actions ? <div className="flex flex-wrap gap-2">{actions}</div> : null}
-        </div>
-        {children}
-      </div>
-    </div>
-  );
-}
+import PageShell from '../components/PageShell';
 
 function Panel({ className, children }) {
   return <div className={cn('rounded-2xl border border-border bg-card p-4', className)}>{children}</div>;
@@ -126,6 +114,8 @@ function sharedMemoryRunMeta(run) {
 }
 
 export function SharedMemoryPage() {
+  const { isMirror } = useMindScope();
+  const { PipelineRun } = useScopedEntities();
   const [searchParams] = useSearchParams();
   const runFromUrl = String(searchParams.get('run') || '').trim();
 
@@ -137,7 +127,7 @@ export function SharedMemoryPage() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const list = await PipelineRun.list('-created_date', 200);
+      const list = await PipelineRun.listAll('-created_date');
       let merged = list;
       if (runFromUrl && !list.some((r) => r.id === runFromUrl)) {
         const extra = await PipelineRun.retrieve(runFromUrl);
@@ -157,7 +147,7 @@ export function SharedMemoryPage() {
     } finally {
       setLoading(false);
     }
-  }, [runFromUrl]);
+  }, [runFromUrl, PipelineRun]);
 
   useEffect(() => {
     load();
@@ -199,13 +189,26 @@ export function SharedMemoryPage() {
   };
 
   const exportJson = () => {
-    const blob = new Blob([draft || '{}'], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `mybrain-shared-memory-${selectedId || 'latest'}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    void (async () => {
+      try {
+        const blob = new Blob([draft || '{}'], { type: 'application/json' });
+        const mode = await shareOrDownloadBlob(
+          blob,
+          `metaself-cognitivestack-shared-memory-${selectedId || 'latest'}.json`
+        );
+        if (mode === 'cancelled') return;
+        toast({
+          title: mode === 'shared' ? 'JSON shared' : 'Export ready',
+          description: mode === 'shared' ? 'Use Save to Files or another app.' : 'Download started.',
+        });
+      } catch (e) {
+        toast({
+          title: 'Export failed',
+          description: e instanceof Error ? e.message : String(e),
+          variant: 'destructive',
+        });
+      }
+    })();
   };
 
   const importJson = () => {
@@ -287,10 +290,16 @@ export function SharedMemoryPage() {
         </>
       }
     >
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <MindScopeTabs />
+      </div>
       <Panel className="mb-6 space-y-3 text-sm text-foreground/85">
         <p>
           <strong className="text-foreground">What this is.</strong> Each time you use{' '}
-          <Link to="/graph-pipeline" className="text-primary underline-offset-2 hover:underline">
+          <Link
+            to={isMirror ? '/graph-pipeline/mirror' : '/graph-pipeline'}
+            className="text-primary underline-offset-2 hover:underline"
+          >
             Graph Pipeline
           </Link>
           , the server builds a single <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">shared_memory</code>{' '}
@@ -307,14 +316,14 @@ export function SharedMemoryPage() {
           <strong className="text-foreground">Continuation.</strong> When you send a follow-up message, the client can post
           a trimmed snapshot (<code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">slimSharedMemoryForPipelinePost</code>
           ) so the next pass starts from the last turn instead of a blank slate.{' '}
-          <Link to="/memory" className="text-primary underline-offset-2 hover:underline">
+          <Link to={isMirror ? '/memory/mirror' : '/memory'} className="text-primary underline-offset-2 hover:underline">
             Long-Term Memory
           </Link>{' '}
           and biography/consolidation are separate stores; they feed the pipeline, but this JSON is the per-turn workspace.
         </p>
         <p className="text-xs text-muted-foreground">
           Supervisor reruns (Metacognition and Workspace Metacognition) and flags are summarized on{' '}
-          <Link to="/iterations" className="text-primary underline-offset-2 hover:underline">
+          <Link to={isMirror ? '/iterations/mirror' : '/iterations'} className="text-primary underline-offset-2 hover:underline">
             Iterations
           </Link>
           . Editing JSON here overwrites that run’s stored snapshot only — use Save to persist.
@@ -427,6 +436,8 @@ function sessionIdForRun(run) {
 }
 
 export function IterationsPage() {
+  const { isMirror } = useMindScope();
+  const { PipelineRun } = useScopedEntities();
   const [runs, setRuns] = useState([]);
   const [expandedRunId, setExpandedRunId] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -434,13 +445,13 @@ export function IterationsPage() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setRuns(await PipelineRun.list('-created_date', 100));
+      setRuns(await PipelineRun.listAll('-created_date'));
     } catch (e) {
       console.error('[IterationsPage] load failed:', e);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [PipelineRun]);
 
   useEffect(() => {
     load();
@@ -528,11 +539,11 @@ export function IterationsPage() {
             <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
             Refresh
           </Button>
-          <Link to="/graph-pipeline" className={linkOutlineBtnSm}>
+          <Link to={isMirror ? '/graph-pipeline/mirror' : '/graph-pipeline'} className={linkOutlineBtnSm}>
             <Play className="h-4 w-4" />
             Graph Pipeline
           </Link>
-          <Link to="/shared-memory" className={linkOutlineBtnSm}>
+          <Link to={isMirror ? '/shared-memory/mirror' : '/shared-memory'} className={linkOutlineBtnSm}>
             <FileText className="h-4 w-4" />
             Shared memory
           </Link>
@@ -549,6 +560,9 @@ export function IterationsPage() {
         </div>
       }
     >
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <MindScopeTabs />
+      </div>
       <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Panel className="!p-4">
           <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Saved runs</div>
@@ -594,7 +608,7 @@ export function IterationsPage() {
         >
           <div className="mt-4 flex flex-wrap justify-center gap-2">
             <Button variant="outline" size="sm" className="gap-2" asChild>
-              <Link to="/graph-pipeline">
+              <Link to={isMirror ? '/graph-pipeline/mirror' : '/graph-pipeline'}>
                 <Play className="h-3.5 w-3.5" />
                 Open Graph Pipeline
               </Link>
@@ -775,7 +789,7 @@ export function ExperimentsPage() {
     >
       <Panel>
         <div className="text-sm text-foreground/80">
-          This page is wired for local experimentation workflows: use <strong>Playground</strong> for comparisons, and
+          This page is wired for local experimentation workflows: use <strong>System Chat</strong> for comparisons, and
           <strong> Datasets</strong>/<strong>Training</strong> for exporting structured results.
         </div>
       </Panel>
@@ -870,13 +884,13 @@ export function UserManualPage() {
     <PageShell
       icon={BookOpen}
       title="User Manual"
-      description="How MyBrain fits together: 23-module server pipeline in six layers (see below), dual supervisors, Graph Pipeline (unified transcript + graph), probabilistic integrations (embeddings, adaptive temperature, soft metacognition, stochastic policy, calibrated thresholds), optional web enrichment, persistence after each run, memory and mind pages, Output search, Training sidebar (Datasets, RLHF, Training log, Playground), full site index below, and local/cloud LLM setup."
+      description="How MetaSelf-CognitiveStack fits together: 23-module server pipeline in six layers (see below), dual supervisors, Graph Pipeline (unified transcript + graph), probabilistic integrations (embeddings, adaptive temperature, soft metacognition, stochastic policy, calibrated thresholds), optional web enrichment, persistence after each run, memory and mind pages, Output search, Training sidebar (Datasets, RLHF, Training log, System Chat), full site index below, and local/cloud LLM setup."
     >
       <div className="mx-auto max-w-4xl space-y-8">
         <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 text-sm leading-relaxed text-foreground/85">
-          <strong className="text-primary">What is this app?</strong> MyBrain is a local cognitive-architecture workbench: a
+          <strong className="text-primary">What is this app?</strong> MetaSelf-CognitiveStack is a local cognitive-architecture workbench: a
           graph of <strong className="text-foreground">23 specialized modules</strong> runs on each input in six sequential
-          layers (server-side for Graph Pipeline and scheduled full-stack tasks, or sequentially in the Playground), augmented
+          layers (server-side for Graph Pipeline and scheduled full-stack tasks, or sequentially in System Chat), augmented
           with probabilistic integrations (adaptive temperature, embedding-based similarity, soft metacognition thresholds,
           stochastic cognitive policy, and auto-calibrated decision thresholds). After a run that produces{' '}
           <strong className="text-foreground">Voice</strong>, the app writes a full snapshot to{' '}
@@ -1315,7 +1329,7 @@ export function UserManualPage() {
             <ManualNote>Works best once long-term memory already has material to recombine.</ManualNote>
           </ManualSection>
 
-          <ManualSection icon={Cpu} title="Training area — Datasets, RLHF, Training, Playground">
+          <ManualSection icon={Cpu} title="Training area — Datasets, RLHF, Training, System Chat">
             <p>
               Sidebar <strong className="text-foreground">TRAINING</strong> groups export and experiment tools; nothing here is a
               separate chat app — full SSE graph runs live under <strong className="text-foreground">Graph Pipeline</strong>.
@@ -1334,9 +1348,9 @@ export function UserManualPage() {
               transitions (draft → running → completed). It is an experiment log, not an on-device fine-tuner.
             </p>
             <p>
-              <strong className="text-foreground">Playground</strong> — Runs the cognitive modules sequentially in the browser on
-              one prompt (see the Playground section below for detail). Use it for quick module-level experiments, not as a
-              substitute for a saved graph run with full server context.
+              <strong className="text-foreground">System Chat</strong> — Dual sequential <strong className="text-foreground">graph
+              pipeline</strong> runs: System A uses your primary mind; System B uses an isolated mirror store. Voice from A becomes
+              the user line for B. Optional random topic; see the System Chat section below.
             </p>
             <ManualNote>
               Promoting models, loss curves, and GPU jobs happen outside this UI — export data and train in your own stack.
@@ -1366,13 +1380,15 @@ export function UserManualPage() {
             </p>
           </ManualSection>
 
-          <ManualSection icon={MessageSquare} title="Playground">
+          <ManualSection icon={MessageSquare} title="System Chat">
             <p>
-              Sends one user prompt through <strong className="text-foreground">every</strong> cognitive module sequentially
-              via the browser LLM helper, then shows per-module output cards.{' '}
-              <strong className="text-foreground">Side-by-Side</strong> optionally adds a plain baseline completion.{' '}
-              <strong className="text-foreground">Save as Dataset</strong> is currently a local stub (alert) — module thumbs log
-              to the console until wired to RLHF storage.
+              Runs the <strong className="text-foreground">full server graph pipeline</strong> (SSE) twice in sequence: you compose
+              System A&apos;s line (or use <strong className="text-foreground">Random topic</strong> to preview a suggested starter).
+              A twin preamble tells System A it is addressing a peer pipeline; <strong className="text-foreground">Voice</strong> from
+              A is then fed as System B&apos;s user input (with a short peer prefix). System B persists to a separate mirror mind
+              (beliefs, memory, etc.); open <strong className="text-foreground">Mirror beliefs</strong> /{' '}
+              <strong className="text-foreground">Mirror memory</strong> under System Chat to inspect. Use{' '}
+              <strong className="text-foreground">Graph Pipeline</strong> when you want session tabs and a single primary run.
             </p>
           </ManualSection>
 
@@ -1448,7 +1464,7 @@ export function UserManualPage() {
                 'Use Belief Map filters to focus on contradictions, then resolve tensions in the data model.',
                 'If the API still rejects oversized bodies, enable shared-memory compression in .env or shorten the session; context caps should match your model n_ctx.',
                 'Check Cognitive Health and Emergence Log after bursts of runs to see aggregate signals.',
-                'Use Graph Pipeline for full structured runs; use Playground when you want lighter sequential modules on one prompt.',
+                'Use Graph Pipeline for standard single-primary graph sessions; use System Chat for dual sequential pipelines (primary + mirror peer).',
                 'If Voice still sounds like it is quoting constitution or apologizing for training, tighten shared prompts in shared/pipelineModules.mjs or rephrase constitution text in Settings.',
                 'Set EMBEDDING_MODEL in .env to enable semantic similarity across epistemic fusion, memory retrieval, and personality facet ranking.',
                 'Run POST /api/calibrate after several pipeline sessions to let thresholds self-adjust from your telemetry data.',
@@ -1511,6 +1527,18 @@ const schedulerSelectClass =
 
 function formatSchedulerTime(value) {
   return value ? moment(value).format('lll') : '—';
+}
+
+/** Label for the manual run button (retry vs run due/paused pending now). */
+function schedulerManualRunButtonLabel(task, status) {
+  if (status === 'paused') return 'Resume';
+  const s = normalizeSchedulerTaskStatus(task.status);
+  if (s === 'pending') {
+    const schedulePaused = isScheduledTaskSchedulePaused(task);
+    const due = task.scheduled_at && new Date(task.scheduled_at).getTime() <= Date.now();
+    if (schedulePaused || due) return 'Run now';
+  }
+  return 'Run again';
 }
 
 function isLegacyScheduledTask(t) {
@@ -1780,6 +1808,8 @@ function SchedulerTaskCard({
     );
   }
 
+  const manualRunLabel = schedulerManualRunButtonLabel(task, status);
+
   return (
     <div
       className={cn(
@@ -1799,6 +1829,14 @@ function SchedulerTaskCard({
           >
             {status}
           </span>
+          {task.mind_storage_profile === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR ? (
+            <span
+              className="rounded border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] text-violet-800 dark:text-violet-200"
+              title="Scheduled for System B (mirror) entity stores"
+            >
+              Mirror
+            </span>
+          ) : null}
           {schedulePaused ? (
             <span className="font-mono text-[10px] text-muted-foreground">SCHEDULE PAUSED</span>
           ) : isDue ? (
@@ -1929,7 +1967,9 @@ function SchedulerTaskCard({
             title={
               status === 'paused'
                 ? 'Continue from saved checkpoint (same as Graph scheduled pipeline)'
-                : 'Run again now (does not wait in the scheduler queue)'
+                : manualRunLabel === 'Run now'
+                  ? 'Run this job now (same as when the scheduler tick picks it up)'
+                  : 'Retry after a failure (does not wait in the scheduler queue)'
             }
             className="h-8 shrink-0 gap-1 px-2 text-[11px] font-medium"
             disabled={retrying}
@@ -1944,7 +1984,7 @@ function SchedulerTaskCard({
             ) : (
               <Play className="h-3.5 w-3.5" />
             )}
-            Run again
+            {manualRunLabel}
           </Button>
         ) : null}
         {(status === 'completed' || status === 'failed' || status === 'cancelled') && onDelete ? (
@@ -1963,6 +2003,7 @@ function SchedulerTaskCard({
 }
 
 export function SchedulerPage() {
+  const { isMirror } = useMindScope();
   const [tasks, setTasks] = useState([]);
   const [loading, setLoading] = useState(true);
   const [suggestions, setSuggestions] = useState([]);
@@ -1985,6 +2026,19 @@ export function SchedulerPage() {
   /** Empty = use global Settings for scheduled pipeline tasks */
   const [scheduleMetaMaxReruns, setScheduleMetaMaxReruns] = useState('');
   const [scheduleMetaDelayMin, setScheduleMetaDelayMin] = useState('');
+  const [scheduleMindTarget, setScheduleMindTarget] = useState(
+    /** @type {typeof MIND_STORAGE_PROFILE_PRIMARY | typeof MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR} */ (
+      MIND_STORAGE_PROFILE_PRIMARY
+    )
+  );
+  /** Align “Run for” with Primary | System B scope (`/scheduler` vs `/scheduler/mirror`). */
+  useEffect(() => {
+    setScheduleMindTarget(isMirror ? MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR : MIND_STORAGE_PROFILE_PRIMARY);
+  }, [isMirror]);
+  /** Per-suggestion mind target (`s.id` → profile); omitted keys default to Primary. */
+  const [suggestionMindById, setSuggestionMindById] = useState(
+    /** @type {Record<string, typeof MIND_STORAGE_PROFILE_PRIMARY | typeof MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR>} */ ({})
+  );
   const [creating, setCreating] = useState(false);
   const [retryingTaskId, setRetryingTaskId] = useState(null);
   const [releaseSchedulerHoldBusy, setReleaseSchedulerHoldBusy] = useState(false);
@@ -2051,6 +2105,7 @@ export function SchedulerPage() {
       recurrence_end_date: recurrenceEndDate || undefined,
       recurrence_interval: recurrence === 'custom' ? Number(customInterval) : undefined,
       recurrence_unit: recurrence === 'custom' ? customUnit : undefined,
+      mind_storage_profile: scheduleMindTarget,
       ...(SCHEDULER_PIPELINE_MIND_TASK_TYPES.has(taskType)
         ? {
             mind_phase: scheduleMindPhase,
@@ -2074,9 +2129,11 @@ export function SchedulerPage() {
     setSchedulingSuggestionId(s.id);
     try {
       const rt = getRuntimeSettings();
+      const suggestionProfile = suggestionMindById[s.id] ?? MIND_STORAGE_PROFILE_PRIMARY;
       const opts = {
         reason: `Suggested — ${s.detail}`,
         scheduled_by: 'suggestion',
+        mind_storage_profile: suggestionProfile,
       };
       if (s.input_text != null && String(s.input_text).trim()) {
         opts.input_text = String(s.input_text).trim();
@@ -2138,6 +2195,13 @@ export function SchedulerPage() {
   const runAgainOrResume = async (id) => {
     const taskId = String(id ?? '').trim();
     if (!taskId) return;
+    if (isCooperativePauseAllExternalHoldActive()) {
+      toast({
+        title: 'Scheduler hold active',
+        description: COOPERATIVE_PAUSE_HOLD_SCHEDULER_MESSAGE,
+      });
+      return;
+    }
     setRetryingTaskId(taskId);
     let statusForToast = '';
     try {
@@ -2152,14 +2216,14 @@ export function SchedulerPage() {
       if (statusForToast === 'paused') {
         await resumePausedScheduledPipelineTask(taskId);
         toast({
-          title: 'Resuming scheduled pipeline',
-          description: 'Continuing from the saved checkpoint…',
+          title: 'Scheduled pipeline resumed',
+          description: 'Continuing from the saved checkpoint. Watch Active pipelines or this task’s status for progress.',
         });
       } else {
         await retryFailedScheduledTask(taskId);
         toast({
-          title: 'Scheduled task completed',
-          description: 'The run finished successfully.',
+          title: 'Scheduled task finished',
+          description: 'Run again completed. Check this row’s status and result summary.',
         });
       }
       await refreshAll();
@@ -2204,7 +2268,7 @@ export function SchedulerPage() {
   });
 
   return (
-    <div className="min-h-screen p-4 sm:p-6">
+    <div className="w-full min-h-0 p-4 sm:p-6">
       <div className="mx-auto max-w-4xl">
         {cooperativeSchedulerHoldActive ? (
           <div className="mb-4 flex flex-col gap-3 rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
@@ -2305,10 +2369,31 @@ export function SchedulerPage() {
                     </div>
                     <div className="mt-1 text-xs text-foreground/85">{s.detail}</div>
                   </div>
+                  <div className="flex shrink-0 flex-col gap-2 sm:flex-row sm:items-center">
+                    <div className="min-w-0 sm:w-44">
+                      <label className="mb-0.5 block text-[10px] uppercase tracking-wider text-muted-foreground">
+                        Run for
+                      </label>
+                      <select
+                        className={cn(schedulerSelectClass, 'h-8 w-full')}
+                        value={suggestionMindById[s.id] ?? MIND_STORAGE_PROFILE_PRIMARY}
+                        title="Which mind’s stores this scheduled run uses (when the task type supports mirror)."
+                        onChange={(e) => {
+                          const v =
+                            /** @type {typeof MIND_STORAGE_PROFILE_PRIMARY | typeof MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR} */ (
+                              e.target.value
+                            );
+                          setSuggestionMindById((prev) => ({ ...prev, [s.id]: v }));
+                        }}
+                      >
+                        <option value={MIND_STORAGE_PROFILE_PRIMARY}>Primary mind</option>
+                        <option value={MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR}>System B (mirror)</option>
+                      </select>
+                    </div>
                   <Button
                     type="button"
                     size="sm"
-                    className="shrink-0 gap-1.5"
+                    className="shrink-0 gap-1.5 self-end sm:self-end"
                     disabled={schedulingSuggestionId != null}
                     onClick={() => void scheduleFromSuggestion(s)}
                   >
@@ -2319,6 +2404,7 @@ export function SchedulerPage() {
                     )}
                     Schedule
                   </Button>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -2365,6 +2451,27 @@ export function SchedulerPage() {
                 <option value="custom">Custom interval</option>
               </select>
             </div>
+          </div>
+
+          <div className="mb-3">
+            <label className="mb-1 block text-[10px] uppercase tracking-wider text-muted-foreground">
+              Run for
+            </label>
+            <select
+              className={schedulerSelectClass}
+              value={scheduleMindTarget}
+              title="Where pipeline output and dialogue rows are written when the task type supports System B."
+              onChange={(e) =>
+                setScheduleMindTarget(
+                  /** @type {typeof MIND_STORAGE_PROFILE_PRIMARY | typeof MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR} */ (
+                    e.target.value
+                  )
+                )
+              }
+            >
+              <option value={MIND_STORAGE_PROFILE_PRIMARY}>Primary mind</option>
+              <option value={MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR}>System B (mirror)</option>
+            </select>
           </div>
 
           {recurrence === 'custom' ? (

@@ -86,11 +86,11 @@ export async function probeApiHealth(options = {}) {
 /**
  * Throws an Error if /api/ping cannot be reached (lightweight; full stack is GET /api/health).
  * @param {{ timeoutMs?: number, signal?: AbortSignal, retries?: number, retryDelayMs?: number }} [options]
- * - `retries`: extra attempts after the first failed probe (e.g. 1 = two tries total). Useful when the API is slow to wake.
+ * - `retries`: extra attempts after the first failed probe (e.g. 1 = two tries total). Useful when the API is slow to wake. Capped at 8 extras (9 probes max).
  */
 export async function ensureApiReachable(options = {}) {
   const { retries = 0, retryDelayMs = 400, ...probeOpts } = options;
-  const extra = Math.max(0, Math.min(3, Math.floor(Number(retries) || 0)));
+  const extra = Math.max(0, Math.min(8, Math.floor(Number(retries) || 0)));
   const delay =
     typeof retryDelayMs === 'number' && Number.isFinite(retryDelayMs) && retryDelayMs >= 0
       ? retryDelayMs

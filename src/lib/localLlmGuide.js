@@ -29,5 +29,5 @@ export const LOCAL_LLM_SETUP_TEXT = [
   '4. Restart the backend (e.g. npm run dev).',
   '',
   'Tip: If calls fail with "model not found", LOCAL_LLM_MODELS does not match the loaded model id.',
-  'Tip: Keep the local server running while you use MyBrain.',
+  'Tip: Keep the local server running while you use MetaSelf-CognitiveStack.',
 ].join('\n');

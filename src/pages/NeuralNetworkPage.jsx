@@ -9,7 +9,7 @@ export default function NeuralNetworkPage() {
       title="Neural Network"
       description="Visualization of the cognitive module ring (same component as the Dashboard)."
     >
-      <div className="min-h-[min(70vh,520px)] rounded-2xl border border-border bg-card/30 p-4">
+      <div className="min-h-[min(70svh,520px)] rounded-2xl border border-border bg-card/30 p-4">
         <NeuralNetworkViz className="h-full min-h-[400px] w-full" />
       </div>
     </PageShell>

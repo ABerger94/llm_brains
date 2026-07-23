@@ -1,6 +1,9 @@
 import { graphPipelineStore } from './graphPipelineStore';
 import { consciousnessStreamStore } from './consciousnessStreamStore';
+import { getActiveConsciousnessStreamGraphSessionId } from './consciousnessStreamRunner';
 import { peekConsciousnessStreamDraftForSession, peekGraphPipelineUiPersisted } from './graphPipelineCrossSessionPeek';
+import { getGraphPipelineSessionId } from './graphPipelineSessionScope';
+import { PLAYGROUND_GRAPH_SESSION_A, PLAYGROUND_GRAPH_SESSION_B } from './playgroundDualGraphRunner';
 import {
   getCuriosityPagePursuitSnapshot,
 } from './curiosityPagePursuitStore';
@@ -8,13 +11,13 @@ import { getGoalPagePursuitSnapshot } from './goalPagePursuitStore';
 import { getSchedulerPipelineUiSnapshot } from './schedulerPipelineUiStore';
 import { hasKnownPipelineModuleProcessing, countKnownPipelineModulesProcessing } from './cognitiveModules';
 import {
-  buildDashboardActiveWorkRows,
+  getDashboardActiveWorkSnapshot,
   isGraphPeekPipelineEffectivelyComplete,
   subscribeDashboardActiveWork,
 } from './dashboardActiveWork';
 import { initialCuriosityPipelineUi } from './curiosityPipelineSseUi';
 import { initialGoalPipelineUi } from './goalPipelineSseUi';
-import { computeLiveIdentityStabilityFromSources } from './liveMindSnapshotDerived';
+import { computeLiveIdentityStabilityFromSources, computeLiveMindSnapshot } from './liveMindSnapshotDerived';
 
 /**
  * @param {{
@@ -39,7 +42,9 @@ function fingerprintSource(src) {
     .join('|');
   const logLen = Array.isArray(src.executionLog) ? src.executionLog.length : 0;
   const err = src.runError != null && String(src.runError).trim() ? String(src.runError) : '';
-  return `${moPart}#${msPart}#${String(src.finalOutput ?? '').length}#${logLen}#${err.length}:${err.slice(0, 64)}`;
+  const sm = src.lastSharedMemory && typeof src.lastSharedMemory === 'object' ? src.lastSharedMemory : null;
+  const smKey = sm ? String(sm.sessionId || '') + String(sm.phenomenalNow?.line || '').length : '';
+  return `${moPart}#${msPart}#${String(src.finalOutput ?? '').length}#${logLen}#${err.length}:${err.slice(0, 64)}#${smKey}`;
 }
 
 /** @param {{ key: string, interrupted?: boolean }} row */
@@ -49,6 +54,8 @@ function buildLiveSourceForRow(row) {
 
   if (row.key === 'graph-pipeline' || row.key === 'graph-pipeline-interrupted') {
     const interrupted = row.key === 'graph-pipeline-interrupted';
+    const sm =
+      gp.lastSharedMemory && typeof gp.lastSharedMemory === 'object' ? gp.lastSharedMemory : null;
     return {
       kind: 'graph',
       moduleOutputs: gp.moduleOutputs && typeof gp.moduleOutputs === 'object' ? gp.moduleOutputs : {},
@@ -58,10 +65,13 @@ function buildLiveSourceForRow(row) {
       loopCount: Number(gp.loopCount) || 0,
       isProcessing: Boolean(gp.isRunning || cs.isProcessing) && !interrupted,
       runError: typeof gp.runError === 'string' ? gp.runError : null,
+      lastSharedMemory: sm,
     };
   }
 
   if (row.key === 'graph-pipeline-checkpoint') {
+    const sm =
+      gp.lastSharedMemory && typeof gp.lastSharedMemory === 'object' ? gp.lastSharedMemory : null;
     return {
       kind: 'graph',
       moduleOutputs: gp.moduleOutputs && typeof gp.moduleOutputs === 'object' ? gp.moduleOutputs : {},
@@ -71,6 +81,7 @@ function buildLiveSourceForRow(row) {
       loopCount: Number(gp.loopCount) || 0,
       isProcessing: false,
       runError: typeof gp.runError === 'string' ? gp.runError : null,
+      lastSharedMemory: sm,
     };
   }
 
@@ -78,6 +89,33 @@ function buildLiveSourceForRow(row) {
     const sessionId = row.key.slice('graph-pipeline-session-'.length).trim();
     const peek = sessionId ? peekGraphPipelineUiPersisted(sessionId) : null;
     const draft = peekConsciousnessStreamDraftForSession(sessionId);
+    const streamSid = getActiveConsciousnessStreamGraphSessionId();
+    const bound = getGraphPipelineSessionId();
+    const useInMemory =
+      Boolean(sessionId) &&
+      bound === sessionId &&
+      (streamSid === sessionId || streamSid == null) &&
+      (gp.isRunning || cs.isProcessing);
+
+    if (useInMemory) {
+      const mo = gp.moduleOutputs && typeof gp.moduleOutputs === 'object' ? gp.moduleOutputs : {};
+      const ms = gp.moduleStatuses && typeof gp.moduleStatuses === 'object' ? gp.moduleStatuses : {};
+      const sm =
+        gp.lastSharedMemory && typeof gp.lastSharedMemory === 'object' ? gp.lastSharedMemory : null;
+      return {
+        kind: 'graph',
+        sessionId,
+        moduleOutputs: mo,
+        moduleStatuses: ms,
+        finalOutput: typeof gp.finalOutput === 'string' ? gp.finalOutput : '',
+        executionLog: Array.isArray(gp.executionLog) ? gp.executionLog : [],
+        loopCount: Number(gp.loopCount) || 0,
+        isProcessing: Boolean(gp.isRunning || cs.isProcessing),
+        runError: typeof gp.runError === 'string' ? gp.runError : null,
+        lastSharedMemory: sm,
+      };
+    }
+
     const mo = peek?.moduleOutputs && typeof peek.moduleOutputs === 'object' ? peek.moduleOutputs : {};
     const ms = peek?.moduleStatuses && typeof peek.moduleStatuses === 'object' ? peek.moduleStatuses : {};
     const completeEffective = isGraphPeekPipelineEffectivelyComplete(peek, draft);
@@ -86,6 +124,8 @@ function buildLiveSourceForRow(row) {
       (Boolean(peek?.isRunning) ||
         Boolean(draft.inFlight) ||
         hasKnownPipelineModuleProcessing(ms));
+    const smPeek =
+      peek?.lastSharedMemory && typeof peek.lastSharedMemory === 'object' ? peek.lastSharedMemory : null;
     return {
       kind: 'graph',
       sessionId,
@@ -96,6 +136,7 @@ function buildLiveSourceForRow(row) {
       loopCount: Number(peek?.loopCount) || 0,
       isProcessing: looksRunning,
       runError: typeof peek?.runError === 'string' ? peek.runError : null,
+      lastSharedMemory: smPeek,
     };
   }
 
@@ -168,12 +209,12 @@ function buildLiveSourceForRow(row) {
   };
 }
 
-/** @param {ReturnType<typeof buildDashboardActiveWorkRows>} rows */
+/** @param {ReturnType<typeof getDashboardActiveWorkSnapshot>['rows']} rows */
 function computeSnapshotKey(rows, sources) {
   const rowPart = rows
     .map(
       (r) =>
-        `${r.key}\x00${r.title}\x00${r.detail}\x00${r.pipelineProgress ?? ''}\x00${r.interrupted ? 1 : 0}\x00${r.variant}`
+        `${r.key}\x00${r.title}\x00${r.detail}\x00${r.pipelineProgress ?? ''}\x00${r.interrupted ? 1 : 0}\x00${r.variant}\x00${r.playgroundSystemAccent ?? ''}`
     )
     .join('\x01');
   const srcPart = sources.map((s) => fingerprintSource(s)).join('\x02');
@@ -188,8 +229,49 @@ function computeSnapshotKey(rows, sources) {
   return `${rowPart}\x03${srcPart}\x03${gMeta}\x04${smKey}`;
 }
 
-/** @param {ReturnType<typeof buildDashboardActiveWorkRows>} rows */
-function computeLiveMetrics(rows, sources, stanceAlignmentPercent) {
+/**
+ * @param {unknown[]} sources
+ * @param {string} preferredSessionId
+ */
+export function pickLastSharedMemoryForSystemBucket(sources, preferredSessionId) {
+  const pref = String(preferredSessionId || '').trim();
+  const list = Array.isArray(sources) ? sources : [];
+  for (const s of list) {
+    if (!s || typeof s !== 'object') continue;
+    const sid = s.sessionId != null ? String(s.sessionId).trim() : '';
+    const sm = s.lastSharedMemory;
+    if (sm && typeof sm === 'object' && sid && sid === pref) return sm;
+  }
+  for (const s of list) {
+    if (!s || typeof s !== 'object') continue;
+    if (s.kind === 'graph' && s.lastSharedMemory && typeof s.lastSharedMemory === 'object') {
+      return s.lastSharedMemory;
+    }
+  }
+  return null;
+}
+
+/**
+ * @param {ReturnType<typeof getDashboardActiveWorkSnapshot>['rows']} rows
+ * @param {unknown[]} sources
+ */
+export function partitionSourcesByPlaygroundAccent(rows, sources) {
+  /** @type {unknown[]} */
+  const sourcesA = [];
+  /** @type {unknown[]} */
+  const sourcesB = [];
+  for (let i = 0; i < rows.length; i++) {
+    const acc = rows[i].playgroundSystemAccent === 'b' ? 'b' : 'a';
+    const s = sources[i];
+    if (!s) continue;
+    if (acc === 'b') sourcesB.push(s);
+    else sourcesA.push(s);
+  }
+  return { sourcesA, sourcesB };
+}
+
+/** @param {ReturnType<typeof getDashboardActiveWorkSnapshot>['rows']} rows */
+function computeLiveMetricsSubset(rows, sources) {
   let processingModules = 0;
   let nonEmptyModuleOutputs = 0;
   for (const s of sources) {
@@ -205,17 +287,33 @@ function computeLiveMetrics(rows, sources, stanceAlignmentPercent) {
     activePipelines: rows.length,
     processingModules,
     nonEmptyModuleOutputs,
+  };
+}
+
+/** @param {ReturnType<typeof getDashboardActiveWorkSnapshot>['rows']} rows */
+function computeLiveMetrics(rows, sources, stanceAlignmentPercent) {
+  return {
+    ...computeLiveMetricsSubset(rows, sources),
     stanceAlignmentPercent,
   };
 }
 
-/** @type {{ rows: object[], sources: unknown[], metrics: object, graphLastSharedMemory: object|null } | null} */
+/**
+ * @type {{
+ *   rows: object[],
+ *   sources: unknown[],
+ *   metrics: object,
+ *   metricsBySystem: { systemA: object, systemB: object } | null,
+ *   graphLastSharedMemory: object|null,
+ *   playgroundDualMind: { systemA: object, systemB: object }|null
+ * } | null}
+ */
 let cachedLiveSnapshot = null;
 let cachedLiveKey = '';
 
-/** Live pipelines + module outputs from this tab's stores (see {@link buildDashboardActiveWorkRows}). */
+/** Live pipelines + module outputs from this tab's stores (see {@link getDashboardActiveWorkSnapshot}). */
 export function getLiveActivePipelineAnalyticsSnapshot() {
-  const rows = buildDashboardActiveWorkRows();
+  const { rows } = getDashboardActiveWorkSnapshot();
   const sources = rows.map((r) => buildLiveSourceForRow(r));
   const gp = graphPipelineStore.getState();
   const graphLastSharedMemory =
@@ -225,14 +323,62 @@ export function getLiveActivePipelineAnalyticsSnapshot() {
     typeof stability.overlap === 'number' && Number.isFinite(stability.overlap)
       ? stability.overlap.toFixed(5)
       : `n:${stability.tier}`;
-  const key = `${computeSnapshotKey(rows, sources)}\x05${stabPart}`;
+
+  const hasAnySystemBRow = rows.some((r) => r.playgroundSystemAccent === 'b');
+  let playgroundDualMind = null;
+  if (hasAnySystemBRow) {
+    const { sourcesA, sourcesB } = partitionSourcesByPlaygroundAccent(rows, sources);
+    const smA = pickLastSharedMemoryForSystemBucket(sourcesA, PLAYGROUND_GRAPH_SESSION_A) || graphLastSharedMemory;
+    const smB = pickLastSharedMemoryForSystemBucket(sourcesB, PLAYGROUND_GRAPH_SESSION_B);
+    const dualSnapOpts = { idleGraphFallback: false };
+    playgroundDualMind = {
+      systemA: computeLiveMindSnapshot(sourcesA, smA, dualSnapOpts),
+      systemB: computeLiveMindSnapshot(sourcesB, smB, dualSnapOpts),
+    };
+  }
+
+  const dualPart = playgroundDualMind
+    ? `${playgroundDualMind.systemA.sourcesUsed}|${playgroundDualMind.systemA.stability.headline}|${playgroundDualMind.systemB.stability.headline}|${playgroundDualMind.systemB.sourcesUsed}`
+    : '';
+  const key = `${computeSnapshotKey(rows, sources)}\x05${stabPart}\x07${dualPart}`;
   if (key === cachedLiveKey && cachedLiveSnapshot) return cachedLiveSnapshot;
   cachedLiveKey = key;
   const overlap = stability.overlap;
   const stanceAlignmentPercent =
     typeof overlap === 'number' && Number.isFinite(overlap) ? Math.round(overlap * 100) : null;
   const metrics = computeLiveMetrics(rows, sources, stanceAlignmentPercent);
-  cachedLiveSnapshot = { rows, sources, metrics, graphLastSharedMemory };
+
+  /** When any System B pipeline is active, expose the same four KPIs per system (primary vs mirror). */
+  let metricsBySystem = null;
+  if (hasAnySystemBRow) {
+    const { sourcesA, sourcesB } = partitionSourcesByPlaygroundAccent(rows, sources);
+    const rowsA = rows.filter((r) => r.playgroundSystemAccent !== 'b');
+    const rowsB = rows.filter((r) => r.playgroundSystemAccent === 'b');
+    const smA = pickLastSharedMemoryForSystemBucket(sourcesA, PLAYGROUND_GRAPH_SESSION_A) || graphLastSharedMemory;
+    const smB = pickLastSharedMemoryForSystemBucket(sourcesB, PLAYGROUND_GRAPH_SESSION_B);
+    const stabilityA = computeLiveIdentityStabilityFromSources(sourcesA, smA);
+    const stabilityB = computeLiveIdentityStabilityFromSources(sourcesB, smB);
+    const pctA =
+      typeof stabilityA.overlap === 'number' && Number.isFinite(stabilityA.overlap)
+        ? Math.round(stabilityA.overlap * 100)
+        : null;
+    const pctB =
+      typeof stabilityB.overlap === 'number' && Number.isFinite(stabilityB.overlap)
+        ? Math.round(stabilityB.overlap * 100)
+        : null;
+    metricsBySystem = {
+      systemA: {
+        ...computeLiveMetricsSubset(rowsA, sourcesA),
+        stanceAlignmentPercent: pctA,
+      },
+      systemB: {
+        ...computeLiveMetricsSubset(rowsB, sourcesB),
+        stanceAlignmentPercent: pctB,
+      },
+    };
+  }
+
+  cachedLiveSnapshot = { rows, sources, metrics, metricsBySystem, graphLastSharedMemory, playgroundDualMind };
   return cachedLiveSnapshot;
 }
 

@@ -1,23 +1,22 @@
 {
-  "name": "MyBrain",
-  "short_name": "MyBrain",
-  "description": "Local cognitive pipeline, memory, and belief mapping",
+  "name": "MetaSelf-CognitiveStack",
+  "short_name": "MetaSelf",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
+  "orientation": "any",
   "background_color": "#090b14",
-  "theme_color": "#22d3ee",
+  "theme_color": "#090b14",
   "icons": [
     {
       "src": "/pwa-192.png",
       "sizes": "192x192",
-      "type": "image/png",
-      "purpose": "any"
+      "type": "image/png"
     },
     {
       "src": "/pwa-512.png",
       "sizes": "512x512",
-      "type": "image/png",
-      "purpose": "any"
+      "type": "image/png"
     }
   ]
 }

@@ -1,5 +1,5 @@
 import { graphPipelineStore } from './graphPipelineStore';
-import { buildDashboardActiveWorkRows, subscribeDashboardActiveWork } from './dashboardActiveWork';
+import { getDashboardActiveWorkSnapshot, subscribeDashboardActiveWork } from './dashboardActiveWork';
 import { getSchedulerPipelineUiSnapshot } from './schedulerPipelineUiStore';
 
 /** Cached snapshot so useSyncExternalStore getSnapshot stays referentially stable when data is unchanged. */
@@ -18,7 +18,7 @@ export function getDashboardConnectivitySnapshot() {
   const gp = graphPipelineStore.getState();
   const prov = gp.lastLlmProvider != null && String(gp.lastLlmProvider).trim() ? String(gp.lastLlmProvider).trim() : null;
   const mod = gp.lastLlmModel != null && String(gp.lastLlmModel).trim() ? String(gp.lastLlmModel).trim() : null;
-  const rows = buildDashboardActiveWorkRows();
+  const { rows } = getDashboardActiveWorkSnapshot();
   const schedUi = getSchedulerPipelineUiSnapshot();
   const pipelineActive =
     rows.some((r) => !r.interrupted) || Boolean(schedUi.running);

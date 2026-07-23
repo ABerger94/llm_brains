@@ -1,8 +1,12 @@
-import { useEffect, useLayoutEffect, useState, useSyncExternalStore } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { Activity, Book, Clock, GitBranch, MessageSquare, Plus, X } from 'lucide-react';
+import { useCallback, useEffect, useLayoutEffect, useState, useSyncExternalStore } from 'react';
+import { Link, useLocation } from 'react-router-dom';
+import { Activity, Book, Clock, GitBranch, GitMerge, Loader2, MessageSquare, X } from 'lucide-react';
 import { Button } from '../components/ui';
 import PageShell from '../components/PageShell';
+import MindScopeTabs from '../components/MindScopeTabs';
+import { MirrorPipelineRun } from '../lib/data';
+import { PLAYGROUND_GRAPH_SESSION_B } from '../lib/playgroundDualGraphRunner';
+import { useMindStorageRefresh } from '../lib/mindStorageEvents';
 import { cn } from '../lib/utils';
 import GraphPipelineExecutionPanel from '../components/pipeline/GraphPipelineExecutionPanel';
 import SchedulerTaskPipelineLivePanel from '../components/pipeline/SchedulerTaskPipelineLivePanel';
@@ -10,11 +14,12 @@ import GraphPipelineRunsSessionCard from '../components/graphPipeline/GraphPipel
 import {
   getGraphPipelineSessionRegistry,
   getLastOpenedGraphPipelineSessionId,
-  prepareNewGraphPipelineSession,
   subscribeGraphPipelineLastOpened,
   subscribeGraphPipelineRegistry,
 } from '../lib/graphPipelineSessionRegistry';
+import NewGraphWorkspaceControl from '../components/graphPipeline/NewGraphWorkspaceControl';
 import { DEFAULT_GRAPH_SESSION_ID } from '../lib/graphPipelineSessionScope';
+import { graphPipelineWorkspaceHref } from '../lib/graphSessionMindProfile';
 import {
   getDashboardScheduledRunningFromDbCache,
   subscribeDashboardScheduledRunningSync,
@@ -53,8 +58,41 @@ function formatTime(ts) {
 
 /** @typedef {{ type: 'session', sessionId: string, title: string } | { type: 'scheduler', taskId: string, title: string }} PipelinePeek */
 
+function sessionIdForMirrorRun(run) {
+  const sid = run?.shared_memory?.sessionId;
+  return typeof sid === 'string' && sid.trim() ? sid : null;
+}
+
 export default function GraphPipelineRunsPage() {
-  const navigate = useNavigate();
+  const location = useLocation();
+  const isMirrorHub = location.pathname === '/graph-pipeline/mirror';
+  const [mirrorRuns, setMirrorRuns] = useState([]);
+  const [mirrorLoading, setMirrorLoading] = useState(true);
+
+  const loadMirrorRuns = useCallback(async () => {
+    setMirrorLoading(true);
+    try {
+      const all = await MirrorPipelineRun.listAll('-created_date');
+      const sid = PLAYGROUND_GRAPH_SESSION_B;
+      const filtered = all.filter((r) => sessionIdForMirrorRun(r) === sid || r?.graph_session_id === sid);
+      setMirrorRuns(filtered.length ? filtered : all);
+    } catch (e) {
+      console.error('[GraphPipelineRunsPage] mirror runs load failed:', e);
+      setMirrorRuns([]);
+    } finally {
+      setMirrorLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isMirrorHub) return;
+    void loadMirrorRuns();
+  }, [isMirrorHub, loadMirrorRuns]);
+
+  const refreshMirrorIfHub = useCallback(() => {
+    if (isMirrorHub) void loadMirrorRuns();
+  }, [isMirrorHub, loadMirrorRuns]);
+  useMindStorageRefresh(refreshMirrorIfHub);
   /** @type {[PipelinePeek | null, (v: PipelinePeek | null) => void]} */
   const [pipelinePeek, setPipelinePeek] = useState(null);
   const sessions = useSyncExternalStore(
@@ -97,11 +135,27 @@ export default function GraphPipelineRunsPage() {
 
   useLayoutEffect(() => {
     if (!pipelinePeek || pipelinePeek.type !== 'session') return undefined;
-    rehydrateGraphPipelineSessionStores(pipelinePeek.sessionId);
+    const sid = pipelinePeek.sessionId;
+    try {
+      rehydrateGraphPipelineSessionStores(sid);
+    } catch (e) {
+      console.error('[GraphPipelineRunsPage] rehydrate failed:', e);
+    }
     return () => {
-      resetGraphPipelineSessionStoresAfterLeavingWorkspace(pipelinePeek.sessionId);
+      try {
+        resetGraphPipelineSessionStoresAfterLeavingWorkspace(sid);
+      } catch (e) {
+        console.error('[GraphPipelineRunsPage] reset after peek failed:', e);
+      }
     };
   }, [pipelinePeek]);
+
+  /** Close peek if the session row was removed (e.g. trash on a running row, which did not notify before). */
+  useEffect(() => {
+    if (!pipelinePeek || pipelinePeek.type !== 'session') return;
+    if (sessions.some((s) => s.id === pipelinePeek.sessionId)) return;
+    setPipelinePeek(null);
+  }, [sessions, pipelinePeek]);
 
   useEffect(() => {
     if (!pipelinePeek) return undefined;
@@ -120,11 +174,6 @@ export default function GraphPipelineRunsPage() {
   const runningSessions = sessions.filter((s) => s.isProcessing);
   const idle = sessions.filter((s) => !s.isProcessing);
   const hasRunningSection = runningSessions.length > 0 || scheduledRunning.length > 0;
-
-  const newWorkspace = () => {
-    const id = prepareNewGraphPipelineSession();
-    navigate(`/graph-pipeline/${encodeURIComponent(id)}`);
-  };
 
   const onPeekSession = (payload) => {
     setPipelinePeek({ type: 'session', sessionId: payload.sessionId, title: payload.title });
@@ -197,17 +246,86 @@ export default function GraphPipelineRunsPage() {
 
   const runningCount = runningSessions.length + scheduledRunning.length;
 
+  if (isMirrorHub) {
+    const bSessionHref = `/graph-pipeline/${encodeURIComponent(PLAYGROUND_GRAPH_SESSION_B)}`;
+    return (
+      <PageShell
+        icon={GitBranch}
+        title="Graph Pipeline (System B)"
+        description="Mirror pipeline run history for the System Chat dual-graph mind. Prefer rows tied to the System B session when present."
+        maxWidth="max-w-4xl"
+        fillMain
+        actions={
+          <Link
+            to="/graph-pipeline"
+            className={cn(
+              'inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-input bg-background px-4 text-sm font-medium ring-offset-background transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2'
+            )}
+          >
+            Primary workspaces
+          </Link>
+        }
+      >
+        <div className="space-y-4">
+          <MindScopeTabs />
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            Rows load from <span className="font-mono text-xs">MirrorPipelineRun</span>. When the filter matches{' '}
+            <span className="font-mono text-xs">{PLAYGROUND_GRAPH_SESSION_B}</span>, those runs are listed first; otherwise all
+            mirror runs are shown.
+          </p>
+          <div className="flex flex-wrap gap-4 text-sm">
+            <Link to={bSessionHref} className="font-medium text-primary underline-offset-2 hover:underline">
+              Open System B graph workspace
+            </Link>
+            <Link to="/voice/mirror" className="font-medium text-primary underline-offset-2 hover:underline">
+              Voice (System B)
+            </Link>
+            <Link to="/playground" className="font-medium text-primary underline-offset-2 hover:underline">
+              System Chat
+            </Link>
+          </div>
+          {mirrorLoading ? (
+            <div className="flex justify-center py-12">
+              <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" aria-hidden />
+            </div>
+          ) : mirrorRuns.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-border bg-muted/10 px-6 py-12 text-center text-sm text-muted-foreground">
+              No mirror pipeline runs yet. Run System Chat (System B), then refresh.
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {mirrorRuns.map((r) => {
+                const sid = sessionIdForMirrorRun(r);
+                return (
+                  <div key={r.id} className="rounded-lg border border-border bg-card px-4 py-3 text-sm shadow-sm">
+                    <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
+                      <span>{formatTime(r.created_date)}</span>
+                      {sid ? <span className="font-mono">session {sid.slice(0, 10)}…</span> : null}
+                      <span className="font-mono opacity-80">…{String(r.id).slice(-8)}</span>
+                    </div>
+                    <p className="mt-1 line-clamp-3 text-foreground/90">{String(r.input || '—')}</p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </PageShell>
+    );
+  }
+
   return (
     <PageShell
       icon={GitBranch}
       title="Graph Pipeline"
       description="Each session is an isolated workspace with live stage tracking, module execution, and an interaction composer."
       maxWidth="max-w-4xl"
+      fillMain
       actions={
         <>
           {lastOpened ? (
             <Link
-              to={`/graph-pipeline/${encodeURIComponent(lastOpened)}`}
+              to={graphPipelineWorkspaceHref(lastOpened)}
               className={cn(
                 'inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-input bg-background px-4 text-sm font-medium ring-offset-background transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2'
               )}
@@ -215,10 +333,7 @@ export default function GraphPipelineRunsPage() {
               Resume last session
             </Link>
           ) : null}
-          <Button type="button" className="h-9 gap-2" onClick={newWorkspace}>
-            <Plus className="h-4 w-4" aria-hidden />
-            New workspace
-          </Button>
+          <NewGraphWorkspaceControl />
         </>
       }
     >
@@ -240,6 +355,7 @@ export default function GraphPipelineRunsPage() {
                   mode="running"
                   updatedLabel={formatTime(s.updatedAt)}
                   onPeekSession={onPeekSession}
+                  onSessionRemoved={onSessionRemovedFromList}
                 />
               ))}
               {scheduledRunning.map((t) => (
@@ -289,10 +405,15 @@ export default function GraphPipelineRunsPage() {
           )}
         </section>
 
-        <div className="flex items-center justify-center gap-4 border-t border-border/60 pt-4 text-xs text-muted-foreground">
-          <Link to="/dialogue" className="inline-flex items-center gap-1.5 text-primary underline-offset-2 hover:underline">
+        <div className="flex flex-wrap items-center justify-center gap-4 border-t border-border/60 pt-4 text-xs text-muted-foreground">
+          <Link to="/voice" className="inline-flex items-center gap-1.5 text-primary underline-offset-2 hover:underline">
             <MessageSquare className="h-3.5 w-3.5" aria-hidden />
-            Dialogue
+            Voice
+          </Link>
+          <span className="text-border">|</span>
+          <Link to="/playground" className="inline-flex items-center gap-1.5 text-primary underline-offset-2 hover:underline">
+            <GitMerge className="h-3.5 w-3.5" aria-hidden />
+            System Chat
           </Link>
           <span className="text-border">|</span>
           <Link to="/user-manual" className="inline-flex items-center gap-1.5 text-primary underline-offset-2 hover:underline">
@@ -303,7 +424,12 @@ export default function GraphPipelineRunsPage() {
       </div>
 
       {pipelinePeek ? (
-        <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center sm:p-4" role="dialog" aria-modal="true" aria-labelledby="graph-runs-pipeline-peek-title">
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center pt-[env(safe-area-inset-top,0px)] pb-[env(safe-area-inset-bottom,0px)] pl-[env(safe-area-inset-left,0px)] pr-[env(safe-area-inset-right,0px)] sm:items-center sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="graph-runs-pipeline-peek-title"
+        >
           <button
             type="button"
             className="absolute inset-0 bg-background/80 backdrop-blur-[2px]"
@@ -312,11 +438,11 @@ export default function GraphPipelineRunsPage() {
           />
           <div
             className={cn(
-              'relative z-10 flex max-h-[min(92dvh,880px)] w-full max-w-4xl flex-col overflow-hidden rounded-t-2xl border border-border bg-background shadow-2xl',
-              'sm:max-h-[min(88vh,900px)] sm:rounded-xl'
+              'relative z-10 flex max-h-[min(92svh,880px)] w-full max-w-4xl flex-col overflow-hidden rounded-t-2xl border border-border bg-background shadow-2xl',
+              'sm:max-h-[min(88svh,900px)] sm:rounded-xl'
             )}
           >
-            <div className="flex shrink-0 items-start justify-between gap-2 border-b border-border bg-card/50 px-4 py-3">
+            <div className="flex shrink-0 items-start justify-between gap-2 border-b border-border bg-card lg:bg-card/50 px-4 py-3">
               <div className="min-w-0">
                 <h2 id="graph-runs-pipeline-peek-title" className="truncate text-sm font-semibold text-foreground">
                   Live pipeline
@@ -326,7 +452,7 @@ export default function GraphPipelineRunsPage() {
               <div className="flex shrink-0 items-center gap-2">
                 {pipelinePeek.type === 'session' ? (
                   <Link
-                    to={`/graph-pipeline/${encodeURIComponent(pipelinePeek.sessionId)}`}
+                    to={graphPipelineWorkspaceHref(pipelinePeek.sessionId)}
                     className="hidden text-xs font-medium text-primary underline-offset-2 hover:underline sm:inline"
                     onClick={() => setPipelinePeek(null)}
                   >
@@ -356,7 +482,7 @@ export default function GraphPipelineRunsPage() {
             <div className="shrink-0 border-t border-border bg-muted/20 px-4 py-2 sm:hidden">
               {pipelinePeek.type === 'session' ? (
                 <Link
-                  to={`/graph-pipeline/${encodeURIComponent(pipelinePeek.sessionId)}`}
+                  to={graphPipelineWorkspaceHref(pipelinePeek.sessionId)}
                   className="text-xs font-medium text-primary underline-offset-2 hover:underline"
                   onClick={() => setPipelinePeek(null)}
                 >

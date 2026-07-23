@@ -1,7 +1,6 @@
 import { consciousnessStreamStore } from './consciousnessStreamStore';
-import { getCuriosityPagePursuitSnapshot, updateCuriosityPursuitPipelineUiForId } from './curiosityPagePursuitStore';
-import { getGoalPagePursuitSnapshot, updateGoalPagePursuitPipelineUiForId } from './goalPagePursuitStore';
-import { setDashboardPauseAllSucceededAck } from './dashboardPauseAllAckStore';
+import { appendCuriosityPursuitExecutionLogLineAllRunning } from './curiosityPagePursuitStore';
+import { appendGoalPursuitExecutionLogLineAllRunning } from './goalPagePursuitStore';
 import { graphPipelineStore } from './graphPipelineStore';
 import { appendSchedulerPipelineExecutionLogLineAllTasks } from './schedulerPipelineUiStore';
 import { hasKnownPipelineModuleProcessing } from './cognitiveModules';
@@ -45,24 +44,8 @@ export function appendCooperativePauseAllRequestedToExecutionLogs() {
     graphPipelineStore.patch({ executionLog: [...prev, line].slice(-40) });
   }
 
-  const snapC = getCuriosityPagePursuitSnapshot().pursuits || {};
-  for (const id of Object.keys(snapC)) {
-    if (!snapC[id]?.running) continue;
-    updateCuriosityPursuitPipelineUiForId(id, (prev) => ({
-      ...prev,
-      executionLog: [...(prev.executionLog || []), line].slice(-40),
-    }));
-  }
-
-  const snapG = getGoalPagePursuitSnapshot().pursuits || {};
-  for (const id of Object.keys(snapG)) {
-    if (!snapG[id]?.running) continue;
-    updateGoalPagePursuitPipelineUiForId(id, (prev) => ({
-      ...prev,
-      executionLog: [...(prev.executionLog || []), line].slice(-40),
-    }));
-  }
+  appendCuriosityPursuitExecutionLogLineAllRunning(line);
+  appendGoalPursuitExecutionLogLineAllRunning(line);
 
   appendSchedulerPipelineExecutionLogLineAllTasks(line);
-  setDashboardPauseAllSucceededAck(true);
 }

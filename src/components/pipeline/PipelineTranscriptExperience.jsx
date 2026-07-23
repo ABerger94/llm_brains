@@ -11,6 +11,7 @@ import {
 import { AlertTriangle, ChevronDown, Loader2, Play, RotateCcw, Send } from 'lucide-react';
 import { Button, Input, toast } from '../ui';
 import { ConversationMessage } from '../../lib/data';
+import { conversationEntityForPlaygroundSession } from '../../lib/playgroundDualMind';
 import FileAttachButton from './FileAttachButton';
 import { cn } from '../../lib/utils';
 import {
@@ -31,6 +32,9 @@ import {
   subscribeGraphPipeline,
   validCooperativePipelineCheckpoint,
 } from '../../lib/graphPipelineStore';
+import { isTransientReconnectFailure } from '../../lib/transientPipelineFailure.js';
+import { graphResumeStreamOptsForSession } from '../../lib/playgroundDualGraphRunner';
+import { resolveGraphSessionMindStorageProfile } from '../../lib/graphSessionMindProfile';
 
 function consciousnessStreamEntryTextClass(entry) {
   switch (entry.type) {
@@ -165,6 +169,12 @@ export default function PipelineTranscriptExperience({
     () => graphPipelineStore.getState()
   );
   const pipelineCheckpoint = validCooperativePipelineCheckpoint(gpSnap.pipelineCheckpoint);
+  const ckNextModule = pipelineCheckpoint?.executionCursor?.nextModuleName;
+  const ckSavedAt = pipelineCheckpoint?.savedAt;
+  const recoverableResumeError =
+    Boolean(runInterrupted && gpSnap.runError && isTransientReconnectFailure(String(gpSnap.runError)));
+
+  const sid = graphSessionId != null && String(graphSessionId).trim() ? String(graphSessionId).trim() : '';
 
   const streamRenderPlan = useMemo(
     () => buildConsciousnessStreamRenderPlan(streamEntries, isProcessing),
@@ -181,7 +191,8 @@ export default function PipelineTranscriptExperience({
     const sid = String(graphSessionId).trim();
     let cancelled = false;
     (async () => {
-      const rows = await ConversationMessage.list('-created_date', 320);
+      const Conv = sid ? conversationEntityForPlaygroundSession(sid) : ConversationMessage;
+      const rows = await Conv.list('-created_date', 320);
       if (cancelled) return;
       const filtered = filterConversationRowsForGraphSession(rows, sid);
       const s = consciousnessStreamStore.getState();
@@ -237,7 +248,15 @@ export default function PipelineTranscriptExperience({
     if (isProcessing) return;
     const files = [...pendingFiles];
     setPendingFiles([]);
-    await startConsciousnessStreamRun({ pendingFiles: files });
+    await startConsciousnessStreamRun({
+      pendingFiles: files,
+      ...(sid
+        ? {
+            graphSessionIdForPersistence: sid,
+            mindStorageProfile: resolveGraphSessionMindStorageProfile(sid),
+          }
+        : {}),
+    });
   };
 
   const resumeInterruptedPipeline = async () => {
@@ -299,8 +318,17 @@ export default function PipelineTranscriptExperience({
             <div className="flex min-w-0 flex-1 gap-2">
               <Play className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sky-400" aria-hidden />
               <p className="min-w-0 flex-1">
-                A cooperative checkpoint is saved. Use <span className="font-medium text-foreground/90">Continue</span> to
-                resume the graph, or Discard to remove this save (Dashboard Resume all also resumes checkpoints).
+                Cooperative checkpoint — mid-pipeline resume. Use{' '}
+                <span className="font-medium text-foreground/90">Continue</span> for the next module, or Discard. Dashboard
+                &quot;Resume all&quot; can also pick up saved checkpoints.
+                {ckNextModule ? (
+                  <span className="mt-0.5 block text-muted-foreground/95">
+                    Next: <span className="font-medium text-foreground/90">{ckNextModule}</span>
+                    {typeof ckSavedAt === 'number'
+                      ? ` · ${new Date(ckSavedAt).toLocaleString()}`
+                      : ''}
+                  </span>
+                ) : null}
               </p>
             </div>
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 sm:pt-0">
@@ -314,7 +342,11 @@ export default function PipelineTranscriptExperience({
                   setCheckpointResumeBusy(true);
                   void (async () => {
                     try {
-                      await startConsciousnessStreamRun({ resumeFromCheckpoint: true });
+                      await startConsciousnessStreamRun({
+                        resumeFromCheckpoint: true,
+                        ...graphResumeStreamOptsForSession(sid),
+                        ...(sid ? { graphSessionIdForPersistence: sid } : {}),
+                      });
                     } catch (e) {
                       toast({
                         title: 'Resume failed',
@@ -348,9 +380,18 @@ export default function PipelineTranscriptExperience({
             <div className="flex min-w-0 flex-1 gap-2">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
               <p className="min-w-0 flex-1">
-                A pipeline run was interrupted by reload (no cooperative checkpoint in this session yet). Entries from disk
-                were merged where possible. Use <span className="font-medium text-foreground/90">Resume</span> or hide
-                this notice.
+                {recoverableResumeError ? (
+                  <>
+                    Recoverable network/API error — <span className="font-medium text-foreground/90">Resume</span> retries
+                    from your continuation seed. Mid-module position requires Pause &amp; save (checkpoint) first.
+                  </>
+                ) : (
+                  <>
+                    Reload or session restore — entries merged from disk where possible.{' '}
+                    <span className="font-medium text-foreground/90">Resume</span> uses the server continuation seed (not a
+                    module checkpoint unless you cooperatively paused).
+                  </>
+                )}
               </p>
             </div>
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 sm:pt-0">

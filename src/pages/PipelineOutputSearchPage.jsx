@@ -3,8 +3,9 @@ import { Link } from 'react-router-dom';
 import moment from 'moment';
 import { FileSearch, Loader2, MessageSquare, RefreshCw } from 'lucide-react';
 import { Button, Input, Label } from '../components/ui';
-import { PipelineRun, ConversationMessage } from '../lib/data';
 import { useMindStorageRefresh } from '../lib/mindStorageEvents';
+import { useScopedEntities } from '../context/MindScopeContext';
+import MindScopeTabs from '../components/MindScopeTabs';
 import { cn } from '../lib/utils';
 import {
   buildConversationMessageDisplayDocument,
@@ -13,28 +14,7 @@ import {
   parseSearchTerms,
   segmentFullTextWithHighlights,
 } from '../lib/pipelineOutputSearch';
-
-function PageShell({ icon: Icon, title, description, actions, children }) {
-  return (
-    <div className="min-h-screen p-4 sm:p-6">
-      <div className="mx-auto max-w-7xl">
-        <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-          <div className="min-w-0">
-            <div className="mb-2 flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/15">
-                <Icon className="h-5 w-5 text-primary" />
-              </div>
-              <h1 className="text-2xl font-bold">{title}</h1>
-            </div>
-            <p className="max-w-2xl text-sm text-muted-foreground">{description}</p>
-          </div>
-          {actions ? <div className="flex flex-wrap gap-2">{actions}</div> : null}
-        </div>
-        {children}
-      </div>
-    </div>
-  );
-}
+import PageShell from '../components/PageShell';
 
 function Panel({ className, children }) {
   return <div className={cn('rounded-2xl border border-border bg-card p-4', className)}>{children}</div>;
@@ -56,7 +36,7 @@ function formatRelative(value) {
 const FullContextPanel = memo(function FullContextPanel({ text, termsLower }) {
   const segments = useMemo(() => segmentFullTextWithHighlights(text, termsLower), [text, termsLower]);
   return (
-    <div className="mt-3 max-h-[min(75vh,960px)] overflow-auto rounded-lg border border-border bg-muted/30 p-3">
+    <div className="mt-3 max-h-[min(75svh,960px)] overflow-auto rounded-lg border border-border bg-muted/30 p-3">
       <pre className="m-0 whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-foreground/90">
         {segments.map((s, i) =>
           s.type === 'hit' ? (
@@ -75,6 +55,7 @@ const FullContextPanel = memo(function FullContextPanel({ text, termsLower }) {
 const DEBOUNCE_MS = 220;
 
 export default function PipelineOutputSearchPage() {
+  const { PipelineRun, ConversationMessage } = useScopedEntities();
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [includeChat, setIncludeChat] = useState(true);
@@ -170,6 +151,9 @@ export default function PipelineOutputSearchPage() {
         </Button>
       }
     >
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <MindScopeTabs />
+      </div>
       <Panel className="mb-6 space-y-4">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
           <div className="min-w-0 flex-1 space-y-2">

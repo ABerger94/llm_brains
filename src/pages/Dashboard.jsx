@@ -7,6 +7,7 @@ import {
   BookOpen,
   Brain,
   CheckCircle,
+  ChevronDown,
   Clock,
   Cpu,
   Database,
@@ -16,7 +17,10 @@ import {
   Play,
   FlaskConical,
   Loader2,
+  Network,
   Download,
+  Eye,
+  EyeOff,
   Radio,
   RefreshCw,
   ScanSearch,
@@ -26,14 +30,17 @@ import {
   Upload,
   Trash2,
   Pause,
+  FolderOpen,
 } from 'lucide-react';
 import NeuralNetworkViz from '../components/NeuralNetworkViz';
 import { PipelineProgressTrack } from '../components/consciousness/PipelineProgressTrack';
 import { COGNITIVE_MODULES } from '../lib/cognitiveModules';
 import { PipelineRun, Dataset, TrainingRun } from '../lib/data';
-import { Button, toast } from '../components/ui';
+import { Button, Input, toast } from '../components/ui';
 import { buildMindArchiveBlob, importMindArchive, wipeAllLocalMindData } from '../lib/mindBackup';
+import { shareOrDownloadBlob } from '../lib/triggerBlobDownload';
 import { cn } from '../lib/utils';
+import { DASHBOARD_HEADING, DASHBOARD_HEADING_PARTS, PRODUCT_NAME } from '../lib/productBranding';
 import { getDashboardActiveWorkSnapshot, subscribeDashboardActiveWork } from '../lib/dashboardActiveWork';
 import {
   getDashboardConnectivitySnapshot,
@@ -42,12 +49,30 @@ import {
 import { abortDashboardActivePipelineRow } from '../lib/dashboardAbortActivePipeline';
 import { useDashboardPauseAllSettlement } from '../lib/useDashboardPauseAllSettlement';
 import { resetDashboardPauseAllUi } from '../lib/dashboardPauseAllAckStore';
-import { reloadInterruptedPipelineWorkFromDashboard } from '../lib/reloadInterruptedPipelineWork';
+import {
+  loadSavedPausedPipelineStateFromDashboard,
+  reloadInterruptedPipelineWorkFromDashboard,
+} from '../lib/reloadInterruptedPipelineWork';
+import { resumeDashboardActivePipelineRow } from '../lib/dashboardResumeActivePipeline';
+import { healGraphRegistryWhenPersistSaysIdle } from '../lib/graphSessionStaleRunningHeal';
 import {
   getVoiceModuleOutputTextFromPipelineRun,
   pickLatestPipelineRunWithVoiceModuleOutput,
 } from '../lib/pipelineRunCheckpoint';
 import { splitVoiceOutputBeliefRevisionsAppendix } from '../../shared/beliefRevisionsVoice.mjs';
+import BeliefMapCanvas from '../components/beliefMap/BeliefMapCanvas';
+import { BeliefStore, MirrorBeliefStore } from '../lib/data';
+import { splitAggregateBeliefRowsInStore } from '../lib/mindPersistence';
+import { useMindStorageRefresh } from '../lib/mindStorageEvents';
+import {
+  fetchMindSnapshotMeta,
+  getMindSnapshotLocalHints,
+  getMindSnapshotSyncToken,
+  pullMindSnapshotFromServer,
+  pushMindSnapshotToServer,
+  serverSnapshotLooksNewerThanRecorded,
+  setMindSnapshotSyncToken,
+} from '../lib/mindSnapshotSync';
 
 /** Fallback label when health has not reported a model yet. */
 const PRIMARY_MODEL_LABEL = 'HF + OpenRouter + local (see .env.example for model limits)';
@@ -129,7 +154,7 @@ function activeWorkRowIcon(variant) {
   }
 }
 
-function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBusy }) {
+function DashboardActiveWorkSection({ onLoadSavedPipelines, loadSavedPipelinesBusy }) {
   const { rows } = useSyncExternalStore(
     subscribeDashboardActiveWork,
     getDashboardActiveWorkSnapshot,
@@ -145,8 +170,10 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
     pauseAllSucceededAck,
   } = useDashboardPauseAllSettlement({
     activeRowCount: rows.length,
-    resumeAllPipelinesBusy,
+    loadSavedPipelinesBusy,
   });
+
+  const [resumeRowBusy, setResumeRowBusy] = useState(false);
 
   const allPaused = rows.length > 0 && rows.every((r) => r.paused);
 
@@ -159,7 +186,7 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
         isCompleteFlash &&
           'border-emerald-500/35 bg-emerald-500/[0.05] dark:border-emerald-500/30 dark:bg-emerald-950/20',
         !isWaitingSettle && !isCompleteFlash && allPaused &&
-          'border-muted-foreground/20 bg-muted/10 dark:border-muted-foreground/15 dark:bg-muted/5',
+          'border-muted-foreground/35 bg-muted/45 saturate-[0.85] dark:border-muted-foreground/30 dark:bg-muted/30 dark:saturate-[0.9]',
         !isWaitingSettle && !isCompleteFlash && !allPaused && 'border-border bg-card'
       )}
     >
@@ -178,7 +205,7 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
           ) : allPaused ? (
             <Pause className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
           ) : rows.length > 0 ? (
-            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" aria-hidden />
+            <Radio className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden />
           ) : (
             <Activity className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" aria-hidden />
           )}
@@ -194,7 +221,7 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
               isWaitingSettle &&
                 'border-amber-500/55 bg-amber-500/10 text-amber-950 hover:bg-amber-500/[0.16] dark:border-amber-400/45 dark:bg-amber-950/35 dark:text-amber-100 dark:hover:bg-amber-950/45'
             )}
-            disabled={pauseAllBusy || resumeAllPipelinesBusy}
+            disabled={pauseAllBusy || loadSavedPipelinesBusy || resumeRowBusy}
             title={pauseButtonTitle}
             onClick={() => {
               void runPauseAll();
@@ -210,20 +237,26 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
             className={cn(
               'h-7 gap-1 text-[10px]',
               isCompleteFlash &&
-                'border-emerald-600/80 bg-emerald-500/10 text-emerald-900 hover:bg-emerald-500/[0.18] dark:border-emerald-500/55 dark:bg-emerald-950/40 dark:text-emerald-100 dark:hover:bg-emerald-950/55'
+                'border-emerald-600/80 bg-emerald-500/10 text-emerald-900 hover:bg-emerald-500/[0.18] dark:border-emerald-500/55 dark:bg-emerald-950/40 dark:text-emerald-100 dark:hover:bg-emerald-950/55',
+              !isWaitingSettle &&
+                !isCompleteFlash &&
+                allPaused &&
+                'border-emerald-600/80 bg-emerald-500/[0.2] font-semibold text-emerald-950 shadow-[0_0_18px_-2px_rgba(16,185,129,0.55)] ring-2 ring-emerald-500/35 hover:bg-emerald-500/[0.28] dark:border-emerald-400/75 dark:bg-emerald-950/45 dark:text-emerald-50 dark:shadow-[0_0_22px_-2px_rgba(52,211,153,0.5)] dark:ring-emerald-400/30 dark:hover:bg-emerald-950/55'
             )}
-            disabled={pauseAllBusy || resumeAllPipelinesBusy}
+            disabled={pauseAllBusy || loadSavedPipelinesBusy || resumeRowBusy}
             title={resumeButtonTitle}
             onClick={() => {
-              if (typeof onResumeAllPipelines === 'function') onResumeAllPipelines();
+              if (typeof onLoadSavedPipelines === 'function') onLoadSavedPipelines();
             }}
           >
-            <Play className="h-3 w-3 shrink-0" aria-hidden />
-            Resume all
+            <FolderOpen className="h-3 w-3 shrink-0" aria-hidden />
+            Load saved
           </Button>
           <span className="text-[10px] text-muted-foreground">
-            Pause: this tab + other windows, and holds due scheduled tasks until you Resume all. Resume: checkpoints,
-            paused pursuits, and releases the scheduler hold.
+            Pause: cooperative (finishes the current module), notifies all open tabs, and holds new scheduled work until you
+            resume. Load saved: merges pursuit state from storage and refreshes this list so paused pipelines appear. Use
+            Resume on each card to continue from the last saved checkpoint. Rerun interrupted (overview below): pursuits only
+            — no interactive graph or scheduler flush.
           </span>
         </div>
         {isWaitingSettle ? (
@@ -243,7 +276,7 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
               All active pipelines in this tab have finished; checkpoints are saved.
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
-              Use Resume all when you want to continue from saved checkpoints or paused pursuits.
+              Use Load saved to surface paused work from storage, then Resume on each card to continue from checkpoints.
             </p>
           </div>
         ) : (
@@ -256,6 +289,7 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
           {rows.map((row) => {
             const isAttentionRow = row.interrupted;
             const isPausedRow = Boolean(row.paused);
+            const systemAccent = row.playgroundSystemAccent;
             const RowIcon = activeWorkRowIcon(row.variant);
             const progressAmber = isAttentionRow;
             const showStop = row.variant !== 'global';
@@ -265,9 +299,11 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
                 : row.key === 'graph-pipeline-checkpoint'
                   ? 'Discard'
                   : 'Stop';
-            const showPausedInstead =
-              isPausedRow || (pauseAllSucceededAck && baseStopLabel === 'Stop' && !isAttentionRow);
+            const isSettlementPausedLabel =
+              !isAttentionRow && !isPausedRow && pauseAllSucceededAck && baseStopLabel === 'Stop';
+            const showPausedInstead = isPausedRow || isSettlementPausedLabel;
             const stopLabel = showPausedInstead ? 'Paused' : baseStopLabel;
+            const showResumeForPausedCheckpoint = isPausedRow && showStop && !isAttentionRow;
 
             return (
               <li
@@ -277,8 +313,16 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
                   isAttentionRow
                     ? 'border-amber-500/45 dark:border-amber-400/35'
                     : isPausedRow
-                      ? 'border-muted-foreground/25 dark:border-muted-foreground/20'
-                      : 'border-border/80'
+                      ? systemAccent === 'b'
+                        ? 'border-muted-foreground/25 shadow-[inset_4px_0_0_0_rgba(239,68,68,0.45)] dark:border-muted-foreground/20'
+                        : systemAccent === 'a'
+                          ? 'border-muted-foreground/25 shadow-[inset_4px_0_0_0_rgba(59,130,246,0.45)] dark:border-muted-foreground/20'
+                          : 'border-muted-foreground/25 dark:border-muted-foreground/20'
+                      : systemAccent === 'a'
+                        ? 'border-blue-500/40 shadow-[inset_4px_0_0_0_rgba(59,130,246,0.55)]'
+                        : systemAccent === 'b'
+                          ? 'border-red-500/40 shadow-[inset_4px_0_0_0_rgba(239,68,68,0.5)]'
+                          : 'border-border/80'
                 )}
               >
                 <div
@@ -422,16 +466,43 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
                     ) : null}
                     <span className="text-[10px] font-medium text-muted-foreground">Open →</span>
                   </Link>
-                  {showStop ? (
+                  {showStop && showResumeForPausedCheckpoint ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={pauseAllBusy || loadSavedPipelinesBusy || resumeRowBusy}
+                      title="Resume this pipeline from the last saved checkpoint (clears the scheduled-work hold)."
+                      className="h-auto min-h-0 w-full flex-col gap-0.5 rounded-none border-0 border-t border-border px-2 py-1 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-500/10 hover:text-emerald-800 dark:text-emerald-400 dark:hover:bg-emerald-950/35 dark:hover:text-emerald-300"
+                      aria-label={`Resume saved checkpoint: ${row.pageName}`}
+                      onClick={async () => {
+                        if (resumeRowBusy) return;
+                        setResumeRowBusy(true);
+                        try {
+                          const r = await resumeDashboardActivePipelineRow(row);
+                          toast({
+                            title: r.ok ? 'Resuming' : 'Cannot resume',
+                            description: r.message || '',
+                            variant: r.ok ? undefined : 'destructive',
+                          });
+                        } finally {
+                          setResumeRowBusy(false);
+                        }
+                      }}
+                    >
+                      <Play className="h-3 w-3 shrink-0" aria-hidden />
+                      Resume
+                    </Button>
+                  ) : showStop ? (
                     <Button
                       type="button"
                       variant="ghost"
                       size="sm"
                       title={
                         showPausedInstead
-                          ? isPausedRow
-                            ? 'Pipeline paused — click Discard to remove, or use Resume all.'
-                            : 'Cooperative pause requested — click to force-stop and clear this entry.'
+                          ? isSettlementPausedLabel
+                            ? 'Cooperative pause requested — click to force-stop and clear this entry.'
+                            : 'Pipeline paused — open the destination to discard the checkpoint if needed.'
                           : undefined
                       }
                       className={cn(
@@ -443,12 +514,12 @@ function DashboardActiveWorkSection({ onResumeAllPipelines, resumeAllPipelinesBu
                       )}
                       aria-label={
                         showPausedInstead
-                          ? `Paused — click to ${isPausedRow ? 'discard' : 'force-stop'} ${row.pageName}`
+                          ? `Paused — click to ${isSettlementPausedLabel ? 'force-stop' : 'discard or stop'} ${row.pageName}`
                           : `${stopLabel}: ${row.pageName}`
                       }
                       onClick={async () => {
                         const r = await abortDashboardActivePipelineRow(row);
-                        if (showPausedInstead && !isPausedRow && r.ok) {
+                        if (showPausedInstead && isSettlementPausedLabel && r.ok) {
                           resetDashboardPauseAllUi();
                         }
                         toast({
@@ -489,23 +560,127 @@ export default function Dashboard() {
   const [stats, setStats] = useState({ runs: 0, datasets: 0, trainings: 0 });
   const [includeAppPrefsInExport, setIncludeAppPrefsInExport] = useState(false);
   const [recoveryPipelinesBusy, setRecoveryPipelinesBusy] = useState(false);
+  const [loadSavedPipelinesBusy, setLoadSavedPipelinesBusy] = useState(false);
+  const [dashboardOverviewOpen, setDashboardOverviewOpen] = useState(false);
+  const [dashboardMindViz, setDashboardMindViz] = useState(() => {
+    if (typeof window === 'undefined') return 'modules';
+    try {
+      return window.localStorage.getItem('dashboardMindViz') === 'beliefs' ? 'beliefs' : 'modules';
+    } catch {
+      return 'modules';
+    }
+  });
+  const [dashboardBeliefs, setDashboardBeliefs] = useState([]);
+  /** Which mind’s beliefs feed the dashboard map (Belief Map page uses /beliefs vs /beliefs/mirror). */
+  const [dashboardBeliefScope, setDashboardBeliefScope] = useState(() => {
+    if (typeof window === 'undefined') return 'primary';
+    try {
+      return window.localStorage.getItem('dashboardBeliefScope') === 'mirror' ? 'mirror' : 'primary';
+    } catch {
+      return 'primary';
+    }
+  });
   const mindBackupFileRef = useRef(null);
   const recoveryPipelinesInFlightRef = useRef(false);
+  const loadSavedPipelinesInFlightRef = useRef(false);
+  const [snapshotTokenInput, setSnapshotTokenInput] = useState(() =>
+    typeof window !== 'undefined' ? getMindSnapshotSyncToken() : ''
+  );
+  const [snapshotMeta, setSnapshotMeta] = useState(null);
+  const [snapshotMetaErr, setSnapshotMetaErr] = useState(null);
+  const [snapshotBusy, setSnapshotBusy] = useState(false);
+  /** Pull/Push in progress: human-readable line (Pull phases: download → decode → parse → save). */
+  const [snapshotPullProgress, setSnapshotPullProgress] = useState(null);
+  const [snapshotMetaLoading, setSnapshotMetaLoading] = useState(false);
+  const [snapshotTokenVisible, setSnapshotTokenVisible] = useState(false);
 
-  const runDashboardPipelineRecovery = useCallback(async (kind) => {
+  const refreshSnapshotMeta = useCallback(async () => {
+    const t = getMindSnapshotSyncToken().trim();
+    if (!t) {
+      setSnapshotMeta(null);
+      setSnapshotMetaErr(null);
+      return;
+    }
+    setSnapshotMetaLoading(true);
+    try {
+      setSnapshotMetaErr(null);
+      const m = await fetchMindSnapshotMeta();
+      setSnapshotMeta(m);
+    } catch (e) {
+      setSnapshotMeta(null);
+      setSnapshotMetaErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSnapshotMetaLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshSnapshotMeta();
+  }, [refreshSnapshotMeta]);
+
+  const loadDashboardBeliefs = useCallback(async () => {
+    try {
+      const store = dashboardBeliefScope === 'mirror' ? MirrorBeliefStore : BeliefStore;
+      await splitAggregateBeliefRowsInStore(400, store, { deleteUnparsedModuleBlobs: false });
+      setDashboardBeliefs(await store.listAll('-created_date'));
+    } catch {
+      /* IndexedDB unavailable or migration */
+    }
+  }, [dashboardBeliefScope]);
+
+  useEffect(() => {
+    void loadDashboardBeliefs();
+  }, [loadDashboardBeliefs]);
+
+  useMindStorageRefresh(loadDashboardBeliefs);
+
+  const runLoadSavedPausedPipelines = useCallback(async () => {
+    if (loadSavedPipelinesInFlightRef.current) return;
+    loadSavedPipelinesInFlightRef.current = true;
+    setLoadSavedPipelinesBusy(true);
+    toast({
+      title: 'Load saved',
+      description: 'Merging saved pursuit state from storage and refreshing the active pipeline list.',
+    });
+    try {
+      const r = await loadSavedPausedPipelineStateFromDashboard();
+      const bits = [];
+      if (r.curiosityMerged > 0) {
+        bits.push(`${r.curiosityMerged} curiosity slot(s) merged from storage`);
+      }
+      if (r.goalMerged > 0) {
+        bits.push(`${r.goalMerged} goal slot(s) merged from storage`);
+      }
+      toast({
+        title: 'Load saved',
+        description:
+          bits.join(' · ') ||
+          'No new pursuit slots were merged from storage. Paused pipelines already in memory, or nothing saved yet.',
+      });
+    } catch (e) {
+      toast({
+        title: 'Load saved failed',
+        description: e instanceof Error ? e.message : String(e),
+        variant: 'destructive',
+      });
+    } finally {
+      loadSavedPipelinesInFlightRef.current = false;
+      setLoadSavedPipelinesBusy(false);
+    }
+  }, []);
+
+  const runDashboardPipelineRecovery = useCallback(async () => {
     if (recoveryPipelinesInFlightRef.current) return;
     recoveryPipelinesInFlightRef.current = true;
     setRecoveryPipelinesBusy(true);
-      const isResumeAll = kind === 'resume_all';
     toast({
-      title: isResumeAll ? 'Resume all' : 'Rerun interrupted',
-      description: isResumeAll
-        ? 'Resuming saved graph checkpoints, paused scheduler graph tasks, and paused or interrupted curiosity/goal graph pursuits where possible.'
-        : 'Resuming paused scheduler pipelines, waking due queued tasks, and rerunning interrupted curiosity/goal pursuits. Use Resume all for the interactive graph checkpoint.',
+      title: 'Rerun interrupted',
+      description:
+        'Curiosity/goal pursuits only: continues from saved module checkpoints when possible (not from Perception). No interactive graph, no scheduler paused jobs, no due-queue flush — use Load saved and Resume on each card for those.',
     });
     try {
       const r = await reloadInterruptedPipelineWorkFromDashboard({
-        mode: isResumeAll ? 'resume_all' : 'rerun_interrupted',
+        mode: 'rerun_interrupted',
       });
       const bits = [];
       if (r.curiosityMerged > 0) {
@@ -515,7 +690,14 @@ export default function Dashboard() {
         bits.push(`${r.goalMerged} goal slot(s) merged from storage`);
       }
       const { graphStarted, graphReason } = r.graph;
-      if (graphStarted && graphReason === 'started_from_checkpoint') {
+      if (graphStarted && graphReason === 'started_from_checkpoint_multi') {
+        const n = Number(r.graph?.cooperativeCheckpointLegs ?? 0);
+        bits.push(
+          n > 1
+            ? `Graph: resumed ${n} saved cooperative checkpoints (interactive sessions, one after another)`
+            : 'Graph: resumed from cooperative checkpoint'
+        );
+      } else if (graphStarted && graphReason === 'started_from_checkpoint') {
         bits.push('Graph: resumed from cooperative checkpoint');
       } else if (graphStarted) {
         bits.push('Graph pipeline ran');
@@ -530,14 +712,14 @@ export default function Dashboard() {
       } else if (graphReason === 'not_started') {
         bits.push('Graph: did not start');
       } else if (graphReason === 'skipped_rerun_interrupted_mode') {
-        bits.push('Graph: skipped — use Resume all for interactive checkpoint');
+        bits.push('Graph: skipped — use Load saved + Resume on the graph row for interactive checkpoint');
       } else if (String(graphReason || '').startsWith('error:')) {
         bits.push(`Graph error: ${String(graphReason).replace(/^error:/, '').trim()}`);
       }
       const otherCk = Number(r.graph?.otherGraphCheckpointSessions ?? 0);
       if (otherCk > 0) {
         bits.push(
-          `Graph: ${otherCk} other saved session(s) — run Resume all again to resume the next checkpoint`
+          `Graph: ${otherCk} other saved session(s) — use Resume on each saved graph row when ready`
         );
       }
       const sOk = r.scheduledPausedResumes?.filter((x) => x.ok).length ?? 0;
@@ -556,16 +738,14 @@ export default function Dashboard() {
         bits.push(`Goals pursue ${gOk} ok${gFail ? `, ${gFail} failed` : ''}`);
       }
       toast({
-        title: isResumeAll ? 'Resume all' : 'Rerun interrupted pipelines',
+        title: 'Rerun interrupted pipelines',
         description:
           bits.join(' · ') ||
-          (isResumeAll
-            ? 'Nothing to resume was found (graph checkpoint, paused pursuits, or reload-interrupted slots).'
-            : 'Nothing to rerun was found (scheduler paused/queued wake, or interrupted pursuits). Use Resume all for the graph.'),
+          'Nothing to rerun was found (interrupted curiosity/goal pursuits). Use Load saved + Resume for graph and scheduler.',
       });
     } catch (e) {
       toast({
-        title: isResumeAll ? 'Resume all failed' : 'Rerun interrupted pipelines failed',
+        title: 'Rerun interrupted pipelines failed',
         description: e instanceof Error ? e.message : String(e),
         variant: 'destructive',
       });
@@ -577,17 +757,22 @@ export default function Dashboard() {
 
   const handleMindExport = useCallback(async () => {
     try {
-      const { blob, filename } = await buildMindArchiveBlob({ includeAppPrefs: includeAppPrefsInExport });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      toast({ title: 'Backup downloaded', description: filename });
+      const result = await buildMindArchiveBlob({ includeAppPrefs: includeAppPrefsInExport });
+      if (result.kind === 'file') {
+        toast({ title: 'Backup saved', description: result.filename });
+        return;
+      }
+      const mode = await shareOrDownloadBlob(result.blob, result.filename);
+      if (mode === 'cancelled') return;
+      toast({
+        title: mode === 'shared' ? 'Backup shared' : 'Backup downloaded',
+        description:
+          mode === 'shared' ? 'Choose Save to Files or another app in the share sheet.' : result.filename,
+      });
     } catch (e) {
+      if (e && typeof e === 'object' && e.name === 'AbortError') {
+        return;
+      }
       toast({
         title: 'Export failed',
         description: e instanceof Error ? e.message : String(e),
@@ -611,8 +796,12 @@ export default function Dashboard() {
     const reader = new FileReader();
     reader.onload = () => {
       void (async () => {
-        const text = String(reader.result ?? '');
-        const result = await importMindArchive(text);
+        const buf = reader.result;
+        if (!buf || !(buf instanceof ArrayBuffer)) {
+          toast({ title: 'Import failed', description: 'Could not read file.', variant: 'destructive' });
+          return;
+        }
+        const result = await importMindArchive(buf);
         if (!result.ok) {
           toast({ title: 'Import failed', description: result.error, variant: 'destructive' });
           return;
@@ -627,12 +816,12 @@ export default function Dashboard() {
     reader.onerror = () => {
       toast({ title: 'Import failed', description: 'Could not read file.', variant: 'destructive' });
     };
-    reader.readAsText(file);
+    reader.readAsArrayBuffer(file);
   }, []);
 
   const handleWipeAllLocalData = useCallback(() => {
     const ok = window.confirm(
-      'Erase ALL locally stored MyBrain data in this browser? This removes IndexedDB (KV + entities), Origin Private File System staging under mybrain/opfs, and any legacy localStorage keys (mybrain_*, yourbrain_*, my_brain_*, your_brain_*). This cannot be undone. Continue?'
+      `Erase ALL locally stored ${PRODUCT_NAME} data in this browser? This removes IndexedDB (KV + entities), Origin Private File System staging under mybrain/opfs, and any legacy localStorage keys (mybrain_*, yourbrain_*, my_brain_*, your_brain_*). This cannot be undone. Continue?`
     );
     if (!ok) return;
     void (async () => {
@@ -644,6 +833,105 @@ export default function Dashboard() {
       window.setTimeout(() => window.location.reload(), 400);
     })();
   }, []);
+
+  const handleSnapshotSaveToken = useCallback(() => {
+    setMindSnapshotSyncToken(snapshotTokenInput);
+    toast({ title: 'Token saved', description: 'Stored in this browser for snapshot API calls.' });
+    void refreshSnapshotMeta();
+  }, [snapshotTokenInput, refreshSnapshotMeta]);
+
+  const handleSnapshotPush = useCallback(async () => {
+    const t = getMindSnapshotSyncToken().trim();
+    if (!t) {
+      toast({ title: 'Token required', description: 'Enter the same token as MIND_SNAPSHOT_SYNC_TOKEN on the PC.', variant: 'destructive' });
+      return;
+    }
+    const ok = window.confirm(
+      'Overwrite the server snapshot with this browser’s current mind data? (Other devices can pull it.)'
+    );
+    if (!ok) return;
+    setSnapshotBusy(true);
+    try {
+      const r = await pushMindSnapshotToServer();
+      if (!r.ok) {
+        toast({ title: 'Push failed', description: r.error, variant: 'destructive' });
+        return;
+      }
+      toast({
+        title: 'Snapshot pushed',
+        description: r.updatedAt ? `Server updated ${r.updatedAt}` : 'Server updated.',
+      });
+      await refreshSnapshotMeta();
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }, [refreshSnapshotMeta]);
+
+  const handleSnapshotPull = useCallback(async () => {
+    const t = getMindSnapshotSyncToken().trim();
+    if (!t) {
+      toast({ title: 'Token required', description: 'Enter the same token as MIND_SNAPSHOT_SYNC_TOKEN on the PC.', variant: 'destructive' });
+      return;
+    }
+    const confirmPull = window.confirm(
+      'Replace IndexedDB mind data in this browser with the server snapshot? This is the same as importing a backup file.'
+    );
+    if (!confirmPull) return;
+    setSnapshotBusy(true);
+    setSnapshotPullProgress('Connecting…');
+    const sizeHint = snapshotMeta?.sizeBytes != null ? Number(snapshotMeta.sizeBytes) : null;
+    try {
+      const r = await pullMindSnapshotFromServer({
+        onProgress: (phase, detail) => {
+          if (phase === 'downloading') {
+            const total = detail?.totalBytes;
+            const bytes = detail?.bytes ?? 0;
+            if (typeof total === 'number' && total > 0) {
+              const pct = Math.min(100, Math.round((bytes / total) * 100));
+              const mbTotal = (total / (1024 * 1024)).toFixed(1);
+              const mbGot = (bytes / (1024 * 1024)).toFixed(1);
+              setSnapshotPullProgress(`Downloading ${pct}% (${mbGot} / ${mbTotal} MB)…`);
+            } else {
+              const hint =
+                typeof sizeHint === 'number' && sizeHint > 0
+                  ? ` (~${Math.max(1, Math.round(sizeHint / (1024 * 1024)))} MB)`
+                  : '';
+              setSnapshotPullProgress(`Downloading snapshot${hint}…`);
+            }
+            return;
+          }
+          if (phase === 'decoding') {
+            setSnapshotPullProgress('Decompressing / reading backup…');
+            return;
+          }
+          if (phase === 'parsing') {
+            const n = detail?.lines;
+            setSnapshotPullProgress(
+              typeof n === 'number' && n > 0
+                ? `Parsing backup (${n.toLocaleString()} lines processed)…`
+                : 'Parsing backup…'
+            );
+            return;
+          }
+          if (phase === 'saving') {
+            setSnapshotPullProgress('Saving to this device…');
+          }
+        },
+      });
+      if (!r.ok) {
+        toast({ title: 'Pull failed', description: r.error, variant: 'destructive' });
+        return;
+      }
+      toast({
+        title: 'Mind restored from server',
+        description: `${r.keyCount} item(s) imported. Reloading…`,
+      });
+      window.setTimeout(() => window.location.reload(), 400);
+    } finally {
+      setSnapshotBusy(false);
+      setSnapshotPullProgress(null);
+    }
+  }, [snapshotMeta]);
 
   const loadHealth = useCallback(async () => {
     const ac = new AbortController();
@@ -668,16 +956,18 @@ export default function Dashboard() {
 
   const loadLocalStats = useCallback(async () => {
     try {
-      const [runs, datasets, trainings] = await Promise.all([
-        PipelineRun.list('-created_date', 500),
-        Dataset.list('-created_date', 200),
-        TrainingRun.list('-created_date', 200),
+      const LATEST_RUN_SCAN = 200;
+      const [runCount, datasetCount, trainingCount, runsForLatest] = await Promise.all([
+        PipelineRun.count(),
+        Dataset.count(),
+        TrainingRun.count(),
+        PipelineRun.list('-created_date', LATEST_RUN_SCAN),
       ]);
-      setLatestRun(pickLatestPipelineRunWithVoiceModuleOutput(runs) || null);
+      setLatestRun(pickLatestPipelineRunWithVoiceModuleOutput(runsForLatest) || null);
       setStats({
-        runs: runs.length,
-        datasets: datasets.length,
-        trainings: trainings.length,
+        runs: runCount,
+        datasets: datasetCount,
+        trainings: trainingCount,
       });
     } catch {
       /* local entity read failed — leave prior state */
@@ -695,17 +985,20 @@ export default function Dashboard() {
   );
 
   useEffect(() => {
+    healGraphRegistryWhenPersistSaysIdle();
     refreshAll();
     const id = setInterval(refreshAll, 10_000);
     const onVis = () => {
-      if (document.visibilityState === 'visible') refreshAll();
+      // Avoid heavy IndexedDB reads (PipelineRun.list, counts) on every tab return — background
+      // tabs already run refreshAll on the 10s timer; visibility here only re-pings the API.
+      if (document.visibilityState === 'visible') void loadHealth();
     };
     document.addEventListener('visibilitychange', onVis);
     return () => {
       clearInterval(id);
       document.removeEventListener('visibilitychange', onVis);
     };
-  }, [refreshAll]);
+  }, [loadHealth, refreshAll]);
 
   const llm = health?.llm;
   const inFlight = (llm?.inFlight ?? 0) > 0;
@@ -782,8 +1075,12 @@ export default function Dashboard() {
     : '';
 
   return (
-    <div className="min-h-screen bg-background">
-      <div className="relative overflow-hidden">
+    <div className="flex w-full min-h-0 flex-1 flex-col bg-background">
+      {/*
+        shrink-0: in a height-constrained flex column (AppLayout main), overflow-hidden lets this flex item’s
+        automatic min-height go to 0 — keep the hero + latest output + mind viz in this wrapper; backup/sync sit below.
+      */}
+      <div className="relative shrink-0 overflow-hidden">
         <div
           className="pointer-events-none absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent"
           aria-hidden
@@ -801,18 +1098,57 @@ export default function Dashboard() {
               />
               <span className="font-mono text-xs uppercase tracking-widest text-primary">{headerStatusLabel}</span>
             </div>
-            <h1 className="text-3xl font-bold tracking-tight text-foreground">MyBrain</h1>
-            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-              <span className="text-foreground/80">Six-layer</span> graph pipeline ({' '}
-              <span className="text-foreground/80">{COGNITIVE_MODULES.length} modules</span>
-              ), beliefs, memory, and world model with probabilistic integrations (adaptive temperature, embedding similarity,
-              soft metacognition thresholds, stochastic cognitive policy, calibrated decision thresholds). Supervisors can rerun
-              early layers; Integration emits{' '}
-              <span className="font-mono text-[11px] text-foreground/75">INTEGRATION_JSON</span> before Language → Narrative →
-              Voice. LLMs hit your local Express API: <span className="text-foreground/80">LM Studio</span> first, then
-              OpenRouter, then <span className="text-foreground/80">Hugging Face</span> (keys in Settings or{' '}
-              <code className="rounded bg-muted/80 px-1 text-[11px]">.env</code>). Mind data stays in the browser.
-            </p>
+            <h1 className="text-3xl font-bold tracking-tight" aria-label={DASHBOARD_HEADING}>
+              {DASHBOARD_HEADING_PARTS.map((part) => (
+                <span key={part.text} className={part.className}>
+                  {part.text}
+                </span>
+              ))}
+            </h1>
+            <div className="mt-1 max-w-2xl">
+              <button
+                type="button"
+                id="dashboard-overview-toggle"
+                aria-expanded={dashboardOverviewOpen}
+                aria-controls="dashboard-overview-panel"
+                onClick={() => setDashboardOverviewOpen((o) => !o)}
+                className="flex w-full max-w-full items-start gap-2 rounded-md py-1.5 text-left text-sm text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground sm:items-center"
+              >
+                <ChevronDown
+                  className={cn(
+                    'mt-0.5 h-4 w-4 shrink-0 transition-transform duration-200 sm:mt-0',
+                    dashboardOverviewOpen && 'rotate-180'
+                  )}
+                  aria-hidden
+                />
+                <span>
+                  {dashboardOverviewOpen
+                    ? 'Hide overview'
+                    : 'Overview — six-layer pipeline, beliefs & memory, local LLMs, data in the browser'}
+                </span>
+              </button>
+              {dashboardOverviewOpen ? (
+                <div
+                  id="dashboard-overview-panel"
+                  role="region"
+                  aria-labelledby="dashboard-overview-toggle"
+                  className="mt-2 text-sm text-muted-foreground"
+                >
+                  <p>
+                    <span className="text-foreground/80">Six-layer</span> graph pipeline ({' '}
+                    <span className="text-foreground/80">{COGNITIVE_MODULES.length} modules</span>
+                    ), beliefs, memory, and world model with probabilistic integrations (adaptive temperature, embedding
+                    similarity, soft metacognition thresholds, stochastic cognitive policy, calibrated decision thresholds).
+                    Supervisors can rerun early layers; Integration emits{' '}
+                    <span className="font-mono text-[11px] text-foreground/75">INTEGRATION_JSON</span> before Language →
+                    Narrative → Voice. LLMs hit your local Express API:{' '}
+                    <span className="text-foreground/80">LM Studio</span> first, then OpenRouter, then{' '}
+                    <span className="text-foreground/80">Hugging Face</span> (keys in Settings or{' '}
+                    <code className="rounded bg-muted/80 px-1 text-[11px]">.env</code>). Mind data stays in the browser.
+                  </p>
+                </div>
+              ) : null}
+            </div>
 
             <div className="mt-8">
               <h2 className="mb-3 text-xs uppercase tracking-widest text-muted-foreground">Quick actions</h2>
@@ -883,6 +1219,43 @@ export default function Dashboard() {
                     <span className="text-xs font-medium">Live Analytics</span>
                   </Button>
                 </Link>
+                <Link to="/scheduler" className="block">
+                  <Button
+                    variant="outline"
+                    className="flex h-auto w-full flex-col items-center gap-2 border-border py-4 transition-all hover:border-primary/40 hover:bg-primary/5"
+                  >
+                    <Clock className="h-5 w-5 text-violet-500 dark:text-violet-400" />
+                    <span className="text-xs font-medium">Scheduler</span>
+                  </Button>
+                </Link>
+                <Link to="/beliefs" className="block">
+                  <Button
+                    variant="outline"
+                    className="flex h-auto w-full flex-col items-center gap-2 border-border py-4 transition-all hover:border-primary/30 hover:bg-muted/40"
+                  >
+                    <Network className="h-5 w-5 text-fuchsia-500 dark:text-fuchsia-400" />
+                    <span className="text-xs font-medium">Belief map</span>
+                  </Button>
+                </Link>
+                <div className="block">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={snapshotBusy}
+                    aria-busy={snapshotBusy}
+                    aria-label="Push mind snapshot to server"
+                    title="Upload this browser's mind data to the Express host (requires sync token in Snapshot sync below)."
+                    onClick={() => void handleSnapshotPush()}
+                    className="flex h-auto w-full flex-col items-center gap-2 border-border py-4 transition-all hover:border-primary/40 hover:bg-primary/5"
+                  >
+                    {snapshotBusy ? (
+                      <Loader2 className="h-5 w-5 animate-spin text-primary" aria-hidden />
+                    ) : (
+                      <Upload className="h-5 w-5 text-emerald-500 dark:text-emerald-400" aria-hidden />
+                    )}
+                    <span className="text-xs font-medium">Push to server</span>
+                  </Button>
+                </div>
                 <div className="block">
                   <Button
                     type="button"
@@ -892,9 +1265,9 @@ export default function Dashboard() {
                     aria-label="Rerun interrupted pipelines"
                     onClick={(e) => {
                       e.preventDefault();
-                      void runDashboardPipelineRecovery('rerun_interrupted');
+                      void runDashboardPipelineRecovery();
                     }}
-                    title="Does not start the interactive graph — use Resume all for that. Resumes paused scheduler graph tasks, wakes due queued scheduler work, and reruns interrupted curiosity/goal pursuits."
+                    title="Pursuits only: continues from the last saved pipeline checkpoint when available. Does not start the interactive graph, resume paused scheduler tasks, or flush the due queue — use Load saved and Resume on each card for those."
                     className="flex h-auto w-full flex-col items-center gap-2 border-border py-4 transition-all hover:border-primary/30 hover:bg-muted/40"
                   >
                     <RefreshCw
@@ -911,34 +1284,27 @@ export default function Dashboard() {
                   <Button
                     type="button"
                     variant="outline"
-                    aria-label="Export mind backup"
-                    title="Download a JSON backup of local mind data. Uses the “Include app URL prefs” option in Mind backup below."
-                    onClick={() => void handleMindExport()}
-                    className="flex h-auto w-full flex-col items-center gap-2 border-border py-4 transition-all hover:border-primary/40 hover:bg-primary/5"
-                  >
-                    <Download className="h-5 w-5 text-red-500 dark:text-red-400" aria-hidden />
-                    <span className="text-xs font-medium">Export backup</span>
-                  </Button>
-                </div>
-                <div className="block">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    aria-label="Import mind backup"
-                    title="Restore from a JSON backup file (replaces local IndexedDB data after you confirm)"
-                    onClick={handleMindImportPick}
+                    disabled={snapshotBusy}
+                    aria-busy={snapshotBusy}
+                    aria-label="Pull mind snapshot from server"
+                    title="Replace this browser's mind data with the server copy (requires sync token; confirms before import)."
+                    onClick={() => void handleSnapshotPull()}
                     className="flex h-auto w-full flex-col items-center gap-2 border-border py-4 transition-all hover:border-primary/30 hover:bg-muted/40"
                   >
-                    <Upload className="h-5 w-5 text-teal-500 dark:text-teal-400" aria-hidden />
-                    <span className="text-xs font-medium">Import backup</span>
+                    {snapshotBusy ? (
+                      <Loader2 className="h-5 w-5 animate-spin text-primary" aria-hidden />
+                    ) : (
+                      <Download className="h-5 w-5 text-violet-500 dark:text-violet-400" aria-hidden />
+                    )}
+                    <span className="text-xs font-medium">Pull from server</span>
                   </Button>
                 </div>
               </div>
             </div>
 
             <DashboardActiveWorkSection
-              onResumeAllPipelines={() => void runDashboardPipelineRecovery('resume_all')}
-              resumeAllPipelinesBusy={recoveryPipelinesBusy}
+              onLoadSavedPipelines={() => void runLoadSavedPausedPipelines()}
+              loadSavedPipelinesBusy={loadSavedPipelinesBusy}
             />
           </div>
         </div>
@@ -976,26 +1342,298 @@ export default function Dashboard() {
           </div>
         </div>
 
-        <div className="relative mx-auto mb-2 h-[min(520px,56vh)] min-h-[320px] max-w-7xl overflow-hidden rounded-2xl border border-border bg-card/50 px-4 sm:px-6">
-          <NeuralNetworkViz className="min-h-0" />
-          <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-[3] flex items-center justify-between">
-            <div className="pointer-events-auto flex items-center gap-2 rounded-lg border border-border bg-background/85 px-3 py-1.5 backdrop-blur-sm">
-              <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
-              <span className="font-mono text-[11px] text-muted-foreground">
-                {COGNITIVE_MODULES.length} modules · six layers · dual supervisors + GWT
-              </span>
-            </div>
-            {inFlight ? (
-              <div className="pointer-events-auto flex items-center gap-2 rounded-lg border border-primary/30 bg-primary/10 px-3 py-1.5 backdrop-blur-sm">
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-                <span className="text-[11px] text-primary">LLM call in flight…</span>
+        <div className="mx-auto w-full max-w-7xl shrink-0 px-4 pb-4 sm:px-6">
+          <h2 className="mb-3 text-xs uppercase tracking-widest text-muted-foreground">Latest pipeline output</h2>
+          <div className="rounded-xl border border-border bg-card p-5">
+            {finalVoiceDisplay ? (
+              <div>
+                <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Final voice
+                </p>
+                <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground">{finalVoiceDisplay}</p>
+                {narrative ? (
+                  <div className="mt-5 border-t border-border pt-4">
+                    <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      Internal narrative
+                    </p>
+                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/85">{narrative}</p>
+                  </div>
+                ) : null}
+                <div className="mt-4 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                  <span>Run id: {String(latestRun.id || '').slice(0, 12)}…</span>
+                  <span>·</span>
+                  <span>{moment(latestRun.created_date).fromNow()}</span>
+                  {latestRun.model_used ? (
+                    <>
+                      <span>·</span>
+                      <span>Model: {latestRun.model_used}</span>
+                    </>
+                  ) : null}
+                </div>
               </div>
-            ) : null}
+            ) : stats.runs > 0 ? (
+              <div className="py-8 text-center">
+                <Brain className="mx-auto mb-2 h-8 w-8 text-muted-foreground/30" />
+                <p className="text-sm text-muted-foreground">
+                  No completed Voice line to show yet — the newest saved runs are paused checkpoints. Resume or finish a run in{' '}
+                  <Link to="/graph-pipeline" className="font-medium text-primary underline-offset-2 hover:underline">
+                    Graph Pipeline
+                  </Link>{' '}
+                  to update this card.
+                </p>
+              </div>
+            ) : (
+              <div className="py-8 text-center">
+                <Brain className="mx-auto mb-2 h-8 w-8 text-muted-foreground/30" />
+                <p className="text-sm text-muted-foreground">
+                  No pipeline runs yet. Start the backend (<code className="rounded bg-muted px-1 text-xs">npm run dev</code>)
+                  and run the graph pipeline once.
+                </p>
+                <Link to="/graph-pipeline" className="mt-4 inline-block">
+                  <Button variant="outline" size="sm" className="gap-2">
+                    <Play className="h-3.5 w-3.5" />
+                    Run first pipeline
+                  </Button>
+                </Link>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="relative mx-auto mb-2 flex h-[min(520px,56svh)] min-h-[min(280px,50svh)] max-w-7xl flex-col overflow-hidden rounded-2xl border border-border bg-card lg:bg-card/50 px-4 sm:px-6">
+          <div className="relative min-h-0 flex-1 py-2">
+            {dashboardMindViz === 'modules' ? (
+              <NeuralNetworkViz className="h-full min-h-0" />
+            ) : (
+              <BeliefMapCanvas
+                variant="dashboard"
+                beliefs={dashboardBeliefs}
+                filterStatus="all"
+                expandedId={null}
+                onExpandedIdChange={() => {}}
+                className="h-full min-h-0 rounded-xl border border-border bg-card"
+                mapWrapClassName="min-h-0 flex-1 !max-lg:max-h-none"
+              />
+            )}
+          </div>
+          <div className="pointer-events-none relative z-[3] flex flex-wrap items-center justify-between gap-2 pb-3 pt-1">
+            <div className="pointer-events-auto flex min-w-0 flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1 rounded-lg border border-border bg-background/85 p-0.5 backdrop-blur-sm">
+                <Button
+                  type="button"
+                  variant={dashboardMindViz === 'modules' ? 'secondary' : 'ghost'}
+                  size="sm"
+                  className="h-7 gap-1 px-2 text-[10px]"
+                  onClick={() => {
+                    setDashboardMindViz('modules');
+                    try {
+                      window.localStorage.setItem('dashboardMindViz', 'modules');
+                    } catch {
+                      /* ignore */
+                    }
+                  }}
+                >
+                  <Cpu className="h-3 w-3 shrink-0" aria-hidden />
+                  Modules
+                </Button>
+                <Button
+                  type="button"
+                  variant={dashboardMindViz === 'beliefs' ? 'secondary' : 'ghost'}
+                  size="sm"
+                  className="h-7 gap-1 px-2 text-[10px]"
+                  onClick={() => {
+                    setDashboardMindViz('beliefs');
+                    try {
+                      window.localStorage.setItem('dashboardMindViz', 'beliefs');
+                    } catch {
+                      /* ignore */
+                    }
+                    void loadDashboardBeliefs();
+                  }}
+                >
+                  <Network className="h-3 w-3 shrink-0" aria-hidden />
+                  Beliefs map
+                </Button>
+              </div>
+              {dashboardMindViz === 'beliefs' ? (
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  <div className="flex items-center gap-0.5 rounded-lg border border-border bg-background/85 p-0.5 backdrop-blur-sm">
+                    <Button
+                      type="button"
+                      variant={dashboardBeliefScope === 'primary' ? 'secondary' : 'ghost'}
+                      size="sm"
+                      className="h-7 gap-1 px-2 text-[10px]"
+                      title="Primary mind belief store"
+                      onClick={() => {
+                        setDashboardBeliefScope('primary');
+                        try {
+                          window.localStorage.setItem('dashboardBeliefScope', 'primary');
+                        } catch {
+                          /* ignore */
+                        }
+                      }}
+                    >
+                      System A
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={dashboardBeliefScope === 'mirror' ? 'secondary' : 'ghost'}
+                      size="sm"
+                      className="h-7 gap-1 px-2 text-[10px]"
+                      title="Playground mirror (System B) belief store"
+                      onClick={() => {
+                        setDashboardBeliefScope('mirror');
+                        try {
+                          window.localStorage.setItem('dashboardBeliefScope', 'mirror');
+                        } catch {
+                          /* ignore */
+                        }
+                      }}
+                    >
+                      System B
+                    </Button>
+                  </div>
+                  <Link
+                    to={dashboardBeliefScope === 'mirror' ? '/beliefs/mirror' : '/beliefs'}
+                    className="text-[10px] font-medium text-primary underline-offset-2 hover:underline"
+                  >
+                    Open full Belief Map
+                  </Link>
+                </div>
+              ) : null}
+            </div>
+            <div className="pointer-events-auto flex flex-wrap items-center justify-end gap-2">
+              <div className="flex items-center gap-2 rounded-lg border border-border bg-background/85 px-3 py-1.5 backdrop-blur-sm">
+                <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  {dashboardMindViz === 'modules' ? (
+                    <>
+                      {COGNITIVE_MODULES.length} modules · six layers · dual supervisors + GWT
+                    </>
+                  ) : (
+                    <>
+                      {dashboardBeliefs.length} beliefs ·{' '}
+                      {dashboardBeliefScope === 'mirror' ? 'System B mirror · ' : 'Primary · '}
+                      grid / radial (toolbar)
+                    </>
+                  )}
+                </span>
+              </div>
+              {inFlight ? (
+                <div className="flex items-center gap-2 rounded-lg border border-primary/30 bg-primary/10 px-3 py-1.5 backdrop-blur-sm">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+                  <span className="text-[11px] text-primary">LLM call in flight…</span>
+                </div>
+              ) : null}
+            </div>
           </div>
         </div>
       </div>
 
-      <div className="mx-auto max-w-7xl px-4 pb-6 sm:px-6">
+      <div className="mx-auto w-full max-w-7xl shrink-0 px-4 pb-6 sm:px-6">
+        <h2 className="mb-3 text-xs uppercase tracking-widest text-muted-foreground">Snapshot sync (server)</h2>
+        <div className="rounded-xl border border-border bg-card p-5">
+          <p className="mb-4 text-sm text-muted-foreground">
+            Share one mind backup between this browser and another device (e.g. phone) via the Express host. Set{' '}
+            <code className="rounded bg-muted px-1 text-xs">MIND_SNAPSHOT_SYNC_TOKEN</code> in the PC&apos;s{' '}
+            <code className="rounded bg-muted px-1 text-xs">.env</code> and restart the backend. Same token here;
+            then Push overwrites the server copy, Pull replaces this browser&apos;s data with the server copy. With a
+            saved token, this browser also <span className="font-medium text-foreground/90">auto-pushes every 10 minutes</span>{' '}
+            while the tab stays open.
+          </p>
+          <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end">
+            <div className="min-w-0 flex-1">
+              <label className="mb-1 block text-[11px] font-medium text-muted-foreground">Sync token (Bearer)</label>
+              <div className="flex gap-2">
+                <Input
+                  type={snapshotTokenVisible ? 'text' : 'password'}
+                  autoComplete="new-password"
+                  value={snapshotTokenInput}
+                  onChange={(e) => setSnapshotTokenInput(e.target.value)}
+                  placeholder="Paste token from .env"
+                  className="min-w-0 flex-1 font-mono text-xs"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0 gap-1.5"
+                  aria-pressed={snapshotTokenVisible}
+                  aria-label={snapshotTokenVisible ? 'Hide token' : 'Show token'}
+                  onClick={() => setSnapshotTokenVisible((v) => !v)}
+                >
+                  {snapshotTokenVisible ? (
+                    <EyeOff className="h-3.5 w-3.5" aria-hidden />
+                  ) : (
+                    <Eye className="h-3.5 w-3.5" aria-hidden />
+                  )}
+                  {snapshotTokenVisible ? 'Hide' : 'Show'}
+                </Button>
+              </div>
+            </div>
+            <Button type="button" variant="secondary" className="shrink-0" onClick={handleSnapshotSaveToken}>
+              Save token
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              className="shrink-0 gap-1"
+              disabled={snapshotBusy || snapshotMetaLoading}
+              onClick={() => void refreshSnapshotMeta()}
+            >
+              {snapshotMetaLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              Refresh status
+            </Button>
+          </div>
+          <div className="mb-4 rounded-md border border-border/60 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+            {snapshotMetaErr ? (
+              <span className="text-destructive">{snapshotMetaErr}</span>
+            ) : snapshotMeta && snapshotMeta.exists ? (
+              <span>
+                Server snapshot: {snapshotMeta.sizeBytes != null ? `${Number(snapshotMeta.sizeBytes).toLocaleString()} bytes` : '—'}
+                {snapshotMeta.updatedAt ? ` · updated ${snapshotMeta.updatedAt}` : ''}
+                {serverSnapshotLooksNewerThanRecorded(snapshotMeta) ? (
+                  <span className="ml-1 font-medium text-amber-600 dark:text-amber-400">
+                    — newer than last pull/push on this device; consider Pull.
+                  </span>
+                ) : null}
+              </span>
+            ) : getMindSnapshotSyncToken().trim() ? (
+              <span>No snapshot on server yet — Push from a device with data.</span>
+            ) : (
+              <span>Enter and save a token to see server status.</span>
+            )}
+            {(() => {
+              const h = getMindSnapshotLocalHints();
+              if (!h.lastRemoteUpdatedAt && !h.lastPushedAt) return null;
+              return (
+                <div className="mt-1 text-[11px] opacity-90">
+                  {h.lastPushedAt ? `Last push recorded (this browser): ${h.lastPushedAt}` : null}
+                  {h.lastPushedAt && h.lastRemoteUpdatedAt ? ' · ' : null}
+                  {h.lastRemoteUpdatedAt ? `Last recorded remote: ${h.lastRemoteUpdatedAt}` : null}
+                </div>
+              );
+            })()}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button type="button" variant="outline" className="gap-2" disabled={snapshotBusy} onClick={() => void handleSnapshotPush()}>
+              {snapshotBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+              Push to server
+            </Button>
+            <Button type="button" variant="outline" className="gap-2" disabled={snapshotBusy} onClick={() => void handleSnapshotPull()}>
+              {snapshotBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              Pull from server
+            </Button>
+          </div>
+          {snapshotBusy && snapshotPullProgress ? (
+            <p className="mt-3 text-xs leading-relaxed text-muted-foreground" role="status" aria-live="polite">
+              {snapshotPullProgress}
+            </p>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="mx-auto w-full max-w-7xl shrink-0 px-4 pb-6 sm:px-6">
         <h2 className="mb-3 text-xs uppercase tracking-widest text-muted-foreground">Mind backup</h2>
         <div className="rounded-xl border border-border bg-card p-5">
           <p className="mb-4 text-sm text-muted-foreground">
@@ -1038,7 +1676,7 @@ export default function Dashboard() {
             <input
               ref={mindBackupFileRef}
               type="file"
-              accept="application/json,.json"
+              accept="application/json,.json,.json.gz,application/gzip"
               className="hidden"
               onChange={handleMindImportFile}
             />
@@ -1046,65 +1684,7 @@ export default function Dashboard() {
         </div>
       </div>
 
-      <div className="mx-auto max-w-7xl px-4 pb-8 sm:px-6">
-        <h2 className="mb-3 text-xs uppercase tracking-widest text-muted-foreground">Latest pipeline output</h2>
-        <div className="rounded-xl border border-border bg-card p-5">
-          {finalVoiceDisplay ? (
-            <div>
-              <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                Final voice
-              </p>
-              <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground">{finalVoiceDisplay}</p>
-              {narrative ? (
-                <div className="mt-5 border-t border-border pt-4">
-                  <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                    Internal narrative
-                  </p>
-                  <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/85">{narrative}</p>
-                </div>
-              ) : null}
-              <div className="mt-4 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-                <span>Run id: {String(latestRun.id || '').slice(0, 12)}…</span>
-                <span>·</span>
-                <span>{moment(latestRun.created_date).fromNow()}</span>
-                {latestRun.model_used ? (
-                  <>
-                    <span>·</span>
-                    <span>Model: {latestRun.model_used}</span>
-                  </>
-                ) : null}
-              </div>
-            </div>
-          ) : stats.runs > 0 ? (
-            <div className="py-8 text-center">
-              <Brain className="mx-auto mb-2 h-8 w-8 text-muted-foreground/30" />
-              <p className="text-sm text-muted-foreground">
-                No completed Voice line to show yet — the newest saved runs are paused checkpoints. Resume or finish a run in{' '}
-                <Link to="/graph-pipeline" className="font-medium text-primary underline-offset-2 hover:underline">
-                  Graph Pipeline
-                </Link>{' '}
-                to update this card.
-              </p>
-            </div>
-          ) : (
-            <div className="py-8 text-center">
-              <Brain className="mx-auto mb-2 h-8 w-8 text-muted-foreground/30" />
-              <p className="text-sm text-muted-foreground">
-                No pipeline runs yet. Start the backend (<code className="rounded bg-muted px-1 text-xs">npm run dev</code>)
-                and run the graph pipeline once.
-              </p>
-              <Link to="/graph-pipeline" className="mt-4 inline-block">
-                <Button variant="outline" size="sm" className="gap-2">
-                  <Play className="h-3.5 w-3.5" />
-                  Run first pipeline
-                </Button>
-              </Link>
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div className="mx-auto max-w-7xl px-4 pb-10 sm:px-6">
+      <div className="mx-auto w-full max-w-7xl shrink-0 px-4 pb-10 sm:px-6">
         <div className="rounded-xl border border-primary/20 bg-primary/5 p-4">
           <h3 className="mb-2 text-sm font-semibold text-foreground">Getting started</h3>
           <ul className="space-y-1.5 text-sm text-muted-foreground">

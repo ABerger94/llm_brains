@@ -14,7 +14,7 @@ const sm = {
   arousal: 0.5,
   constitution: '',
   intent: '',
-  moduleOutputs: { Attention: 'SALIENT: typescript and daily coding habits' },
+  moduleOutputs: { SensorySalience: 'SALIENT: typescript and daily coding habits' },
   personalityProfile: {
     version: 1,
     facets: [

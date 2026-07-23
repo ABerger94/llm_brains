@@ -1,5 +1,5 @@
 {
-  "name": "my-brain-app",
+  "name": "metaself-cognitivestack-app",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -15,6 +15,7 @@
     "generate:icons": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-apple-touch-icon.ps1",
     "lint": "eslint . --ext js,jsx --report-unused-disable-directives --max-warnings 0",
     "test:providers": "node scripts/verify-providers.mjs",
+    "test:glm-ocr": "node scripts/verify-glm-ocr.mjs",
     "test:pipeline-module": "node scripts/smoke-pipeline-module.mjs",
     "test:pipeline-sse-legs": "node scripts/verify-pipeline-sse-legs.mjs",
     "test:pipeline-pause-registry": "node scripts/verify-pipeline-pause-registry.mjs",
@@ -24,12 +25,17 @@
     "test:context-budget": "node scripts/test-llm-context-budget.mjs",
     "test:personality-facets": "node scripts/test-personality-facet-selection.mjs",
     "test:prior-prediction": "node scripts/test-prior-prediction-audit.mjs",
+    "test:llm-context-merge": "node scripts/test-llm-context-merge.mjs",
+    "test:pipeline-integration": "node scripts/test-pipeline-integration-normalizers.mjs",
+    "test:transient-failure": "node scripts/test-transient-pipeline-failure.mjs",
     "test:epistemic-fusion": "node scripts/test-epistemic-fusion.mjs",
+    "test:retrieval-policy": "node scripts/test-retrieval-policy.mjs",
     "test:cognitive-eval": "node scripts/eval-cognitive-scenarios.mjs",
     "preview": "vite preview",
     "check:tailscale": "node scripts/tailscale-dev-check.mjs"
   },
   "dependencies": {
+    "@huggingface/inference": "^4.13.15",
     "axios": "^1.6.0",
     "clsx": "^2.0.0",
     "concurrently": "^9.2.1",

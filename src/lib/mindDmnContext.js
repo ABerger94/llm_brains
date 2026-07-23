@@ -1,22 +1,39 @@
 import { clipTextComplete } from '../../shared/textClip.mjs';
 import { MODULES } from '../../shared/pipelineModules.mjs';
-import { ConversationMessage, MindBiography, SelfLedgerRevision } from './data';
+import {
+  getActiveMindEntityProfile,
+  getMindEntityStores,
+  getMindEntityStoresForProfile,
+  normalizeScheduledTaskMindStorageProfile,
+} from './mindEntityContext';
 import { buildMindBiographySharedMemoryDraft, fetchVoiceContextBlocksForBiography } from './mindBiographyContext';
-import { getRuntimeSettings } from './runtimeSettings';
+import { getPipelineIdentityRuntimeSlice, getRuntimeSettings } from './runtimeSettings';
 import { loadStructuralSelfForPipeline, buildWorkingMemorySeed } from './mindPersistence';
 import { rowsToRecentDialogue } from './pipelineDialogueContext';
 
+const E = () => getMindEntityStores();
+
+function storesForDmnCarryover(opts = {}) {
+  const p =
+    opts.mindStorageProfile !== undefined
+      ? normalizeScheduledTaskMindStorageProfile(opts.mindStorageProfile)
+      : getActiveMindEntityProfile();
+  return getMindEntityStoresForProfile(p);
+}
+
 /**
  * Text to inject as DMN carryover for drift/sleep pipeline runs (latest DMN ledger, else biography).
+ * @param {{ mindStorageProfile?: string }} [opts] - when omitted, uses active profile
  */
-export async function loadDmnCarryoverTextForPhase(phase) {
+export async function loadDmnCarryoverTextForPhase(phase, opts = {}) {
   if (phase !== 'drift' && phase !== 'sleep') return undefined;
-  const rows = await SelfLedgerRevision.list('-created_date', 24);
+  const S = storesForDmnCarryover(opts);
+  const rows = await S.SelfLedgerRevision.list('-created_date', 24);
   const dmn = rows.find((r) => r.reason === 'dmn_internal_narrative');
   if (dmn?.identity_excerpt?.trim()) {
     return clipTextComplete(String(dmn.identity_excerpt), 5500, { ellipsis: true });
   }
-  const bios = await MindBiography.list('-created_date', 1);
+  const bios = await S.MindBiography.list('-created_date', 1);
   const b = bios[0];
   if (b?.summary?.trim()) return clipTextComplete(String(b.summary), 3200, { ellipsis: true });
   if (b?.full_text?.trim()) return clipTextComplete(String(b.full_text), 3200, { ellipsis: true });
@@ -25,7 +42,8 @@ export async function loadDmnCarryoverTextForPhase(phase) {
 
 function voiceSystemPromptFromSettings() {
   const rt = getRuntimeSettings();
-  const ov = rt.modulePromptOverrides?.Voice;
+  const id = getPipelineIdentityRuntimeSlice(rt, getActiveMindEntityProfile());
+  const ov = id.modulePromptOverrides?.Voice;
   if (typeof ov === 'string' && ov.trim()) return ov.trim();
   const m = MODULES.find((x) => x.name === 'Voice');
   return m?.systemPrompt || '';
@@ -36,16 +54,17 @@ function voiceSystemPromptFromSettings() {
  */
 export async function buildPipelineOptionsForDmnReflection() {
   const rt = getRuntimeSettings();
+  const id = getPipelineIdentityRuntimeSlice(rt, getActiveMindEntityProfile());
   const structuralSelf = await loadStructuralSelfForPipeline({ maxItems: 12 });
-  const wmSeed = buildWorkingMemorySeed('', rt.pinnedWorkingMemory || []);
-  const dialogueRows = await ConversationMessage.list('-created_date', 16);
+  const wmSeed = buildWorkingMemorySeed('', id.pinnedWorkingMemory || []);
+  const dialogueRows = await E().ConversationMessage.list('-created_date', 16);
   return {
     phase: 'drift',
     arousal: 0.4,
     intent: 'Default mode: internal narrative, continuity, and embodiment without an external task.',
-    constitution: rt.mindConstitution || '',
-    userModel: rt.userModel || {},
-    mindDisplayName: String(rt.mindDisplayName || '').trim(),
+    constitution: id.mindConstitution || '',
+    userModel: id.userModel || {},
+    mindDisplayName: String(id.mindDisplayName || '').trim(),
     structuralSelf,
     workingMemorySeed: wmSeed,
     recentDialogue: rowsToRecentDialogue(dialogueRows, 16),
@@ -156,16 +175,17 @@ export async function composeDmnReflectionUserPrompt() {
   } catch (e) {
     console.warn('[dmn] voice-context-blocks failed, using fallback:', e);
     const rt = getRuntimeSettings();
-    policyBlock = `\n\nCONTEXT_AND_POLICY:\nRHYTHM: phase=drift arousal=0.4 (default mode).\nCONSTITUTION (binding on Identity/Voice):\n${clipTextComplete(String(rt.mindConstitution || ''), 6000, { ellipsis: true })}\n`;
-    if (rt.userModel && Object.keys(rt.userModel).length) {
-      policyBlock += `\nUSER_MODEL_JSON:\n${JSON.stringify(rt.userModel).slice(0, 8000)}\n`;
+    const id = getPipelineIdentityRuntimeSlice(rt, getActiveMindEntityProfile());
+    policyBlock = `\n\nCONTEXT_AND_POLICY:\nRHYTHM: phase=drift arousal=0.4 (default mode).\nCORE VALUES (this mind's evolved norms and commitments):\n${clipTextComplete(String(id.mindConstitution || ''), 6000, { ellipsis: true })}\n`;
+    if (id.userModel && Object.keys(id.userModel).length) {
+      policyBlock += `\nUSER_MODEL_JSON:\n${JSON.stringify(id.userModel).slice(0, 8000)}\n`;
     }
     sharedMemoryJson = JSON.stringify(draft, null, 2).slice(0, 200_000);
   }
 
   const [prevDmnRows, prevBioList] = await Promise.all([
-    SelfLedgerRevision.list('-created_date', 12),
-    MindBiography.list('-created_date', 1),
+    E().SelfLedgerRevision.list('-created_date', 12),
+    E().MindBiography.list('-created_date', 1),
   ]);
   const lastDmn = prevDmnRows.find((r) => r.reason === 'dmn_internal_narrative');
   const prevBio = prevBioList[0];

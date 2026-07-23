@@ -1,14 +1,11 @@
 import { clipTextComplete } from '../../shared/textClip.mjs';
 import { temporalEventsExcludingPauseNoise } from '../../shared/temporalTimelinePauseFilter.mjs';
 import {
-  BeliefStore,
-  ConsolidationDigest,
-  CuriosityItem,
-  LongTermMemory,
-  MindBiography,
-  TemporalEvent,
-  WorldModel,
-} from './data';
+  getActiveMindEntityProfile,
+  getMindEntityStores,
+  getMindEntityStoresForProfile,
+  normalizeScheduledTaskMindStorageProfile,
+} from './mindEntityContext';
 import { searchLongTermMemory } from './longTermMemorySearch';
 
 /**
@@ -16,16 +13,21 @@ import { searchLongTermMemory } from './longTermMemorySearch';
  * for pipeline POST options — mirrored into CONTEXT_AND_POLICY on the server for every module except Voice.
  */
 export async function fetchPersistedMindStoresForPipeline(userInput, opts = {}) {
+  const profile =
+    opts.mindStorageProfile !== undefined
+      ? normalizeScheduledTaskMindStorageProfile(opts.mindStorageProfile)
+      : getActiveMindEntityProfile();
+  const S = getMindEntityStoresForProfile(profile);
   const ltmCap = Math.min(24, Math.max(4, Number(opts.ltmCap) || 14));
   const beliefCap = Math.min(40, Math.max(6, Number(opts.beliefCap) || 28));
   const digestCap = Math.min(12, Math.max(2, Number(opts.digestCap) || 8));
   const q = String(userInput || '').trim();
 
   const [ltmRows, beliefAll, digests, bio] = await Promise.all([
-    q ? searchLongTermMemory(q, ltmCap) : LongTermMemory.list('-created_date', ltmCap),
-    BeliefStore.list('-created_date', 120),
-    ConsolidationDigest.list('-created_date', digestCap),
-    MindBiography.list('-created_date', 1),
+    q ? searchLongTermMemory(q, ltmCap, S.LongTermMemory) : S.LongTermMemory.list('-created_date', ltmCap),
+    S.BeliefStore.list('-created_date', 120),
+    S.ConsolidationDigest.list('-created_date', digestCap),
+    S.MindBiography.list('-created_date', 1),
   ]);
 
   const persistedLongTermMemories = (ltmRows || []).slice(0, ltmCap).map((m) => ({
@@ -83,13 +85,14 @@ export async function fetchPersistedMindStoresForPipeline(userInput, opts = {}) 
 
 /** One batch for graph pipeline: mind stores + auxiliary lists used for execution log lines. */
 export async function loadGraphPipelineClientContext(userInput) {
+  const S = getMindEntityStores();
   const inputText = String(userInput || '').trim();
   const [mindStores, recentTemporalEventsRaw, biographies, worldModel, curiosityItems] = await Promise.all([
     fetchPersistedMindStoresForPipeline(inputText),
-    TemporalEvent.list('-created_date', 16),
-    MindBiography.list('-created_date', 1),
-    WorldModel.list('-updated_date', 30),
-    CuriosityItem.list('-created_date', 15),
+    S.TemporalEvent.list('-created_date', 16),
+    S.MindBiography.list('-created_date', 1),
+    S.WorldModel.list('-updated_date', 30),
+    S.CuriosityItem.list('-created_date', 15),
   ]);
   const recentTemporalEvents = temporalEventsExcludingPauseNoise(recentTemporalEventsRaw);
   return { mindStores, recentTemporalEvents, biographies, worldModel, curiosityItems };

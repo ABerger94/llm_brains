@@ -1,4 +1,3 @@
-import { CuriosityItem, GoalItem } from './data';
 import { stopScheduledTaskRunFromUi } from './scheduledTaskRunner';
 import {
   abortActiveConsciousnessStreamRun,
@@ -18,8 +17,24 @@ import {
   abortRegisteredCuriosityPursuitGraph,
   abortRegisteredGoalPursuitGraph,
 } from './pursuitGraphPipelineAbortRegistry';
-import { removeCuriosityPursuit } from './curiosityPagePursuitStore';
-import { removeGoalPursuit } from './goalPagePursuitStore';
+import {
+  flushCuriosityPursuitsPersistNow,
+  getCuriosityPagePursuitSnapshot,
+  upsertCuriosityPursuit,
+  updateCuriosityPursuitPipelineUiForId,
+} from './curiosityPagePursuitStore';
+import {
+  flushGoalPursuitsPersistNow,
+  getGoalPagePursuitSnapshot,
+  upsertGoalPursuit,
+  updateGoalPagePursuitPipelineUiForId,
+} from './goalPagePursuitStore';
+import { syncDashboardScheduledRunningFromDb } from './dashboardScheduledRunningSync';
+import {
+  getMindEntityStores,
+  setActiveMindEntityProfile,
+  normalizeScheduledTaskMindStorageProfile,
+} from './mindEntityContext';
 
 function isAbortError(e) {
   if (!e) return false;
@@ -32,7 +47,7 @@ function isAbortError(e) {
 export { isAbortError };
 
 /** @param {{ href?: string }} row */
-function graphSessionIdFromActiveWorkRowHref(row) {
+export function graphSessionIdFromActiveWorkRowHref(row) {
   const href = String(row?.href || '');
   const m = href.match(/\/graph-pipeline\/([^/?#]+)/);
   if (!m?.[1]) return null;
@@ -94,7 +109,7 @@ export async function abortDashboardActivePipelineRow(row) {
       getLastOpenedGraphPipelineSessionId() ||
       DEFAULT_GRAPH_SESSION_ID;
     clearGraphSessionStaleRunningState(sid, { force: true });
-    return { ok: true, message: 'Checkpoint discarded. Use Resume all if you still need to resume other paused work.' };
+    return { ok: true, message: 'Checkpoint discarded. Use Load saved if rows are missing, or Resume on another card.' };
   }
 
   if (key.startsWith('graph-pipeline-session-')) {
@@ -120,12 +135,30 @@ export async function abortDashboardActivePipelineRow(row) {
   if (key.startsWith('curiosity-')) {
     const id = key.slice('curiosity-'.length);
     abortRegisteredCuriosityPursuitGraph(id);
-    removeCuriosityPursuit(id);
+    const curiosityEntry = getCuriosityPagePursuitSnapshot().pursuits?.[id];
+    const curiosityProfile = normalizeScheduledTaskMindStorageProfile(curiosityEntry?.mindStorageProfile);
+    setActiveMindEntityProfile(curiosityProfile);
+    upsertCuriosityPursuit(id, {
+      running: false,
+      interruptedByReload: false,
+      cooperativePaused: false,
+      pursuitProgress: 'Stopped from Dashboard.',
+    });
+    updateCuriosityPursuitPipelineUiForId(id, (prev) => ({
+      ...prev,
+      executionLog: [
+        ...(Array.isArray(prev.executionLog) ? prev.executionLog : []),
+        { time: Date.now(), msg: '── Stopped from Dashboard (active pipelines) ──' },
+      ],
+    }));
+    flushCuriosityPursuitsPersistNow();
     try {
+      const { CuriosityItem } = getMindEntityStores();
       await CuriosityItem.update(id, { status: 'open' });
     } catch {
       /* ignore */
     }
+    await syncDashboardScheduledRunningFromDb();
     return { ok: true, message: 'Curiosity pursuit stopped.' };
   }
 
@@ -138,12 +171,30 @@ export async function abortDashboardActivePipelineRow(row) {
   if (key.startsWith('goal-')) {
     const id = key.slice('goal-'.length);
     abortRegisteredGoalPursuitGraph(id);
-    removeGoalPursuit(id);
+    const goalEntry = getGoalPagePursuitSnapshot().pursuits?.[id];
+    const goalProfile = normalizeScheduledTaskMindStorageProfile(goalEntry?.mindStorageProfile);
+    setActiveMindEntityProfile(goalProfile);
+    upsertGoalPursuit(id, {
+      running: false,
+      interruptedByReload: false,
+      cooperativePaused: false,
+      pursuitProgress: 'Stopped from Dashboard.',
+    });
+    updateGoalPagePursuitPipelineUiForId(id, (prev) => ({
+      ...prev,
+      executionLog: [
+        ...(Array.isArray(prev.executionLog) ? prev.executionLog : []),
+        { time: Date.now(), msg: '── Stopped from Dashboard (active pipelines) ──' },
+      ],
+    }));
+    flushGoalPursuitsPersistNow();
     try {
+      const { GoalItem } = getMindEntityStores();
       await GoalItem.update(id, { status: 'open' });
     } catch {
       /* ignore */
     }
+    await syncDashboardScheduledRunningFromDb();
     return { ok: true, message: 'Goal pursuit stopped.' };
   }
 

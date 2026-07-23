@@ -3,24 +3,34 @@ import moment from 'moment';
 import { Link } from 'react-router-dom';
 import { Brain, Loader2, Moon, RefreshCw, Sparkles } from 'lucide-react';
 import { Button, Textarea } from '../components/ui';
-import {
-  ConsolidationDigest,
-  PipelineRun,
-  SelfLedgerRevision,
-  UserModelSnapshot,
-  WorldModel,
-} from '../lib/data';
 import { runConsolidationPass } from '../lib/mindPersistence';
 import { humanizeUnityRationaleForDisplay, normalizeWorldModelCategory } from '../lib/worldModelSchema';
 import { useMindStorageRefresh } from '../lib/mindStorageEvents';
 import { getRuntimeSettings } from '../lib/runtimeSettings';
 import { cn } from '../lib/utils';
+import PageDescriptionCollapsible from '../components/PageDescriptionCollapsible';
+import { useMindScope, useScopedEntities } from '../context/MindScopeContext';
+import MindScopeTabs from '../components/MindScopeTabs';
+import {
+  MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR,
+  MIND_STORAGE_PROFILE_PRIMARY,
+  setActiveMindEntityProfile,
+} from '../lib/mindEntityContext';
 
 function Panel({ className, children }) {
   return <div className={cn('rounded-2xl border border-border bg-card p-4', className)}>{children}</div>;
 }
 
 export default function MindSelfPage() {
+  const { isMirror } = useMindScope();
+  const { SelfLedgerRevision, ConsolidationDigest, UserModelSnapshot, WorldModel, PipelineRun } = useScopedEntities();
+
+  function snapshotPersonality() {
+    const rt = getRuntimeSettings();
+    const p = isMirror ? rt.personalityProfilePlaygroundMirror : rt.personalityProfile;
+    return p && typeof p === 'object' ? p : { version: 0, facets: [], relationalStance: null, systemTreatmentNotes: '' };
+  }
+
   const [ledger, setLedger] = useState([]);
   const [digests, setDigests] = useState([]);
   const [snapshots, setSnapshots] = useState([]);
@@ -30,7 +40,7 @@ export default function MindSelfPage() {
   const [structuralSelf, setStructuralSelf] = useState([]);
   const [lastPhenomenal, setLastPhenomenal] = useState(null);
   const [lastGlobalWorkspace, setLastGlobalWorkspace] = useState(null);
-  const [personality, setPersonality] = useState(() => getRuntimeSettings().personalityProfile || null);
+  const [personality, setPersonality] = useState(() => snapshotPersonality());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -46,9 +56,7 @@ export default function MindSelfPage() {
     setSnapshots(s);
     setUserModelPreview(getRuntimeSettings().userModel || null);
     setStructuralSelf(
-      wm.filter(
-        (row) => normalizeWorldModelCategory(row.category) === 'self' && !row.archived
-      )
+      wm.filter((row) => normalizeWorldModelCategory(row.category) === 'self' && !row.archived)
     );
     const pn = runs.find((r) => r.shared_memory?.phenomenalNow?.line);
     setLastPhenomenal(pn?.shared_memory?.phenomenalNow || null);
@@ -58,12 +66,7 @@ export default function MindSelfPage() {
     setLastGlobalWorkspace(gwr?.shared_memory?.globalWorkspace || null);
     setPersonality(snapshotPersonality());
     setLoading(false);
-  }, []);
-
-  function snapshotPersonality() {
-    const p = getRuntimeSettings().personalityProfile;
-    return p && typeof p === 'object' ? p : { version: 0, facets: [], relationalStance: null, systemTreatmentNotes: '' };
-  }
+  }, [SelfLedgerRevision, ConsolidationDigest, UserModelSnapshot, WorldModel, PipelineRun, isMirror]);
 
   useEffect(() => {
     load();
@@ -74,8 +77,17 @@ export default function MindSelfPage() {
   const onConsolidate = async () => {
     setConsolidating(true);
     try {
-      await runConsolidationPass({ maxTokens: 1000 });
-      await load();
+      if (isMirror) {
+        setActiveMindEntityProfile(MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR);
+      } else {
+        setActiveMindEntityProfile(MIND_STORAGE_PROFILE_PRIMARY);
+      }
+      try {
+        await runConsolidationPass({ maxTokens: 1000 });
+        await load();
+      } finally {
+        setActiveMindEntityProfile(MIND_STORAGE_PROFILE_PRIMARY);
+      }
     } catch (e) {
       console.error(e);
       alert(e?.message || 'Consolidation failed');
@@ -84,22 +96,33 @@ export default function MindSelfPage() {
     }
   };
 
+  const personalityPath = isMirror ? '/personality/mirror' : '/personality';
+
   return (
-    <div className="min-h-screen p-4 sm:p-6">
+    <div className="w-full min-h-0 p-4 sm:p-6">
       <div className="mx-auto max-w-4xl space-y-6">
+        <div className="flex flex-wrap items-center gap-2">
+          <MindScopeTabs />
+        </div>
+        {isMirror ? (
+          <p className="rounded-lg border border-border/80 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+            System B: self-ledger, digests, and structural self rows are scoped to the mirror mind. Constitution, user model,
+            and related runtime policy under Settings → System B are separate from the primary mind.
+          </p>
+        ) : null}
         <div className="min-w-0">
           <h1 className="flex items-center gap-2 text-2xl font-bold text-foreground">
             <Brain className="h-7 w-7 text-primary" />
             Self, rhythm & consolidation
           </h1>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <PageDescriptionCollapsible className="mt-1">
             Append-only self-ledger from pipeline identity passes, default-mode (DMN) reflections, offline consolidation
             digests, and versioned snapshots of the user model (Theory of Mind). Recent runs may also surface{' '}
             <span className="font-mono text-[11px] text-foreground/80">globalWorkspace</span> (integration stance, broadcast
             winners, hypotheses) for continuity checks. This page is part of a{' '}
             <span className="text-foreground/90">cognitive lab</span> for continuity and self-modeling—not a claim that the LLM
             is conscious. Run consolidation after sleep-phase sessions or a burst of streams.
-          </p>
+          </PageDescriptionCollapsible>
         </div>
 
         <Panel className="flex flex-wrap items-center justify-between gap-3">
@@ -127,7 +150,7 @@ export default function MindSelfPage() {
           <p className="mt-1 text-xs text-muted-foreground">
             Merged from Identity after each pipeline run. Facets steer Voice/Narrative tone; distinct from structural self rows
             in World Model. The model proposes updates with evidence each run.{' '}
-            <Link to="/personality" className="font-medium text-primary underline-offset-2 hover:underline">
+            <Link to={personalityPath} className="font-medium text-primary underline-offset-2 hover:underline">
               Edit strengths, confidence, and facets on the Personality page
             </Link>
             .

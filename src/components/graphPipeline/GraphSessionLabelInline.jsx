@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Check, Pencil, X } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { flushKvWrites } from '../../lib/browserStorage';
 import { NEW_GRAPH_PIPELINE_SESSION_LABEL, upsertGraphPipelineSession } from '../../lib/graphPipelineSessionRegistry';
 import { DEFAULT_GRAPH_SESSION_ID } from '../../lib/graphPipelineSessionScope';
 
@@ -79,6 +80,9 @@ export default function GraphSessionLabelInline({
     const t = draft.trim();
     const nextLabel = (t || fallbackLabelForSave(sessionId)).slice(0, MAX_LEN);
     upsertGraphPipelineSession({ id: sessionId, label: nextLabel, threadRootLabel: nextLabel });
+    void flushKvWrites().catch(() => {
+      /* ignore */
+    });
     setEditing(false);
   };
 

@@ -11,9 +11,10 @@ import {
   Fingerprint,
   Gauge,
   GitBranch,
+  GitMerge,
   Globe,
   Home,
-  MessageSquare,
+  Mic,
   Moon,
   Orbit,
   Radio,
@@ -22,6 +23,8 @@ import {
   Target,
   Zap,
 } from 'lucide-react';
+
+import { PRODUCT_NAME } from './productBranding';
 
 /**
  * Single source of truth for app routes, sidebar labels, and header titles.
@@ -53,12 +56,20 @@ export const APP_NAV_SECTIONS = [
 export const APP_ROUTES = [
   { path: '/', title: 'Dashboard', nav: { section: 'root', label: 'Dashboard' }, icon: Home, manualBlurb: 'Overview, backup, quick links, latest pipeline voice.' },
   {
-    path: '/dialogue',
-    title: 'Dialogue',
-    nav: { section: 'root', label: 'Dialogue' },
-    icon: MessageSquare,
+    path: '/voice',
+    title: 'Voice',
+    nav: { section: 'root', label: 'Voice' },
+    icon: Mic,
     manualBlurb:
-      'Index of sessions and recent answered questions or goals. Session transcript at /dialogue/:sessionId; full question or goal detail at /dialogue/curiosity/:id and /dialogue/goal/:id with View thread for pursuit clusters.',
+      'Aggregated Voice text: graph pipeline assistant lines, saved pipeline run summaries, and curiosity/goal pursuit resolution or thread text. System B mirror store: /voice/mirror. Open graph sessions at /graph-pipeline/:sessionId; curiosity and goals at /curiosity and /goals with ?focus=id.',
+  },
+  {
+    path: '/playground',
+    title: 'System Chat',
+    nav: { section: 'root', label: 'System Chat' },
+    icon: GitMerge,
+    manualBlurb:
+      'Dual full graph pipeline (System Chat): System A (primary mind) then System B (isolated mirror store); Voice from A feeds B. Random topic or your own line.',
   },
   {
     path: '/graph-pipeline',
@@ -66,7 +77,7 @@ export const APP_ROUTES = [
     nav: { section: 'cognition' },
     icon: GitBranch,
     manualBlurb:
-      'Runs list at /graph-pipeline; each session opens a workspace with curiosity-style pipeline UI (stage map, neural graph, execution.log) plus inspector and composer. Probabilistic features (adaptive temperature, soft metacognition thresholds, multi-sample modules, embedding-ranked memory) run transparently during each graph run. Scheduled graph tasks also open at /graph-pipeline/scheduled/:taskId. /consciousness-stream redirects here.',
+      'Runs list at /graph-pipeline; System B mirror run history at /graph-pipeline/mirror (MirrorPipelineRun, dual-playground session). Each session opens a workspace with curiosity-style pipeline UI (stage map, neural graph, execution.log) plus inspector and composer. Probabilistic features (adaptive temperature, soft metacognition thresholds, multi-sample modules, embedding-ranked memory) run transparently during each graph run. Scheduled graph tasks also open at /graph-pipeline/scheduled/:taskId. /consciousness-stream redirects here.',
   },
   { path: '/biography', title: 'Mind Biography', nav: { section: 'mind' }, icon: BookOpen, manualBlurb: 'First-person narrative versions and auto-appends from runs.' },
   { path: '/health', title: 'Cognitive Health', nav: { section: 'mind' }, icon: Activity, manualBlurb: 'Aggregate readiness and mind-health snapshot cards. Health endpoint now includes embedding cache stats and calibrated thresholds.' },
@@ -126,12 +137,11 @@ export const APP_ROUTES = [
   { path: '/rlhf', title: 'RLHF Loop', nav: { section: 'training' }, icon: Zap, manualBlurb: 'Rate outputs for dataset-style feedback.' },
   { path: '/datasets', title: 'Datasets', nav: { section: 'training' }, icon: Database, manualBlurb: 'Local dataset records from exports.' },
   { path: '/training', title: 'Training', nav: { section: 'training' }, icon: Cpu, manualBlurb: 'Training run log (objectives and status).' },
-  { path: '/playground', title: 'Playground', nav: { section: 'training' }, icon: Zap, manualBlurb: 'Sequential single-prompt module pass in the browser.' },
   { path: '/scheduler', title: 'Scheduler', nav: { section: 'footer' }, icon: Clock, manualBlurb: 'Deferred tasks (pipeline, dreams, extraction, etc.).' },
   { path: '/settings', title: 'Settings', nav: { section: 'footer' }, icon: Settings, manualBlurb: 'Runtime prompts, LLM prefs, automation toggles. Probabilistic features (embeddings, adaptive temperature, multi-sample, stochastic policy, calibration) are configured in .env.' },
   { path: '/user-manual', title: 'User Manual', nav: { section: 'footer' }, icon: FileText, manualBlurb: 'This documentation view.' },
   { path: '/neural-network', title: 'Neural Network', manualBlurb: 'Visualization-only page (not in the main sidebar).' },
-  { path: '/multi-mind', title: 'Multi-Mind (retired)', manualBlurb: 'Redirect: old advocate/skeptic flow removed; use Graph Pipeline or Playground.' },
+  { path: '/multi-mind', title: 'Multi-Mind (retired)', manualBlurb: 'Redirect: old advocate/skeptic flow removed; use Graph Pipeline or System Chat.' },
 ];
 
 /** Mobile header + tab title resolution (longest matching path wins after root). */
@@ -145,7 +155,7 @@ export function getAppNavTitle(pathname) {
   for (const r of sorted) {
     if (p === r.path || p.startsWith(`${r.path}/`)) return r.title;
   }
-  return 'MyBrain';
+  return PRODUCT_NAME;
 }
 
 /** Sidebar groups with items in display order. */

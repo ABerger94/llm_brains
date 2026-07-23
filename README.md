@@ -1,6 +1,6 @@
-# MyBrain
+# MetaSelf-CognitiveStack
 
-Local-first web application that runs a **sequential multi-module cognitive pipeline** through a **local OpenAI-compatible LLM** (LM Studio, Ollama, llama.cpp server, etc.). The UI presents **MyBrain** as a dashboard and a set of tools for inspecting **shared memory**, beliefs, biography, graph-style pipeline execution, and related “mind” affordances—while heavy inference happens on the **Express** backend, not in the browser.
+Local-first web application that runs a **sequential multi-module cognitive pipeline** through a **local OpenAI-compatible LLM** (LM Studio, Ollama, llama.cpp server, etc.). The UI presents **MetaSelf** on the **Dashboard** and **MetaSelf-CognitiveStack** elsewhere (sidebar, shell title), with tools for inspecting **shared memory**, beliefs, biography, graph-style pipeline execution, and related “mind” affordances—while heavy inference happens on the **Express** backend, not in the browser.
 
 ---
 
@@ -89,7 +89,7 @@ Continuity features (prediction audit across turns, epistemic tagging, consolida
 
 | Area | Role |
 |------|------|
-| `index.html` | Shell; mounts `src/main.jsx` on `#root`; document title **MyBrain**. |
+| `index.html` | Shell; mounts `src/main.jsx` on `#root`; default document title **MetaSelf-CognitiveStack** (home tab uses **Dashboard · MetaSelf** once the app loads). |
 | `vite.config.js` | React plugin; **dynamic `/api` proxy** via `http-proxy` reading **`.dev-backend-port`** or `API_PROXY_TARGET` / `VITE_API_PROXY`; SSE-friendly headers. |
 | `package.json` | Scripts; deps: React 18, React Router 6, Vite 5, Express 5, OpenAI SDK (for compatible endpoints), Tailwind, etc. |
 | `server/index.js` | Express app: CORS, large JSON body, **multer** uploads, **`callLLM`**, routes under **`/api/*`**, writes **`.dev-backend-port`**, port fallback if busy. |
@@ -132,7 +132,7 @@ Modules are grouped into **six layers** (`server/prompts.js` → **`LAYERS`**), 
 5. **Layer 5**: Metacognition, **Integration** (global workspace JSON), Language, Curiosity, Goal Generation, Somatic Marker  
 6. **Layer 6**: Narrative, Voice  
 
-**Metacognition** and **Workspace Metacognition** can request **RERUN**; the server re-enters layers 1–4 per `server/pipeline.js`. **`maxMetacognitionReruns`** limits reruns **per pipeline HTTP leg**; each continuation POST (deferred task or chained SSE) starts with a fresh rerun budget. With **`options.deferMetacognitionRerun: true`** (browser default when **Settings → Metacognition RERUN delay** is ≥1 minute), the stream ends with **`complete`** plus **`metacognitionRerunPending`** (no Voice on that leg) and the client enqueues a **`metacognition_pipeline_rerun`** **ScheduledTask**; at **0** delay the client chains immediate continuation POSTs instead. Requires **`maxMetacognitionReruns` ≥ 1** for reruns to execute. Optional **`META_ACTIONS`** JSON adjusts brevity, belief tensions, or effective phase for the rest of the run.
+**Metacognition** and **Workspace Metacognition** can request **RERUN**; the server re-enters layers 1–4 per `server/pipeline.js`. **`maxMetacognitionReruns`** limits supervisor reruns **per user message / logical run** (cumulative across chained SSE legs and scheduled continuations; `metacognitionRerunsUsed` is carried in shared memory, not reset each leg). With **`options.deferMetacognitionRerun: true`** (when **Settings → Metacognition RERUN delay** is ≥1 minute), the stream ends with **`complete`** plus **`metacognitionRerunPending`** (no Voice on that leg) and the client enqueues a **`supervisor_pipeline_rerun`** **ScheduledTask**; at **0** delay the client chains immediate continuation POSTs instead. Requires **`maxMetacognitionReruns` ≥ 1** for counted reruns to execute. Optional **`META_ACTIONS`** JSON adjusts brevity, belief tensions, or effective phase for the rest of the run.
 
 ### Probabilistic pipeline integrations
 
@@ -162,7 +162,7 @@ All features degrade gracefully: when embeddings are unavailable, env vars are u
 Use the block below as a **standalone specification** when you want another tool or team to reproduce the same system without reading the repo.
 
 ```text
-Build a full-stack app named "MyBrain" with this exact intent and structure:
+Build a full-stack app named "MetaSelf-CognitiveStack" with this exact intent and structure:
 
 GOAL
 - A local-first "cognitive architecture laboratory" where user text (and optional images) is processed by a FIXED SEQUENCE of 22 LLM modules that simulate layers of mind (perception → attention → memory → … → narrative → voice).
@@ -245,4 +245,4 @@ The following are **prioritized suggestions** for maintainability, safety, and p
 
 ## License / name
 
-Package name in `package.json` is **`my-brain-app`**; product title in UI and HTML is **MyBrain**. Add a `LICENSE` file if you distribute the project.
+Package name in `package.json` is **`metaself-cognitivestack-app`**; product title in UI and HTML is **MetaSelf-CognitiveStack** (Dashboard hero **MetaSelf**). Add a `LICENSE` file if you distribute the project.

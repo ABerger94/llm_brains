@@ -1,7 +1,12 @@
 import { clipTextComplete } from '../../shared/textClip.mjs';
 import { slimSharedMemoryForPipelinePost } from './slimSharedMemory';
 import { getKvSync, removeKvSync, setKvSync } from './browserStorage';
-import { graphPipelineUiLegacyFallbackKey, graphPipelineUiStorageKey } from './graphPipelineSessionScope';
+import {
+  getGraphPipelineSessionId,
+  graphPipelineUiLegacyFallbackKey,
+  graphPipelineUiStorageKey,
+} from './graphPipelineSessionScope';
+import { MIND_STORAGE_CHANGED } from './mindStorageEvents';
 
 const listeners = new Set();
 
@@ -45,10 +50,15 @@ const defaultState = {
   cooperativePauseToken: null,
   /**
    * Per-run metacognition caps for the next graph POST; null fields use global runtime defaults.
-   * maxMetacognitionReruns: max supervisor-triggered reruns per pipeline HTTP leg (same semantics as Mind Settings; continuation POSTs get a fresh budget).
+   * maxMetacognitionReruns: max supervisor-triggered reruns per user message/run (cumulative across continuation legs; same semantics as Mind Settings).
    * @type {{ maxMetacognitionReruns: number | null, metacognitionRerunDelayMinutes: number | null }}
    */
   pipelineMetacognitionOverrides: { maxMetacognitionReruns: null, metacognitionRerunDelayMinutes: null },
+  /**
+   * Ephemeral: another tab or pipeline persist updated IndexedDB — next SSE leg should merge fresh prep slices.
+   * Not written to session KV.
+   */
+  pipelineIntegrationPrepStale: false,
 };
 
 /**
@@ -164,6 +174,7 @@ function readStorage() {
             del != null && del !== '' && Number.isFinite(Number(del)) ? Number(del) : null,
         };
       })(),
+      pipelineIntegrationPrepStale: false,
     };
   } catch {
     return { ...defaultState };
@@ -174,12 +185,55 @@ let state = { ...defaultState };
 
 let persistTimer = null;
 
+/** Keep in-memory log bounded — long SSE runs used to grow without limit and OOM-crash WebKit (iOS). */
+const MAX_IN_MEMORY_EXECUTION_LOG_LINES = 400;
+
+/** System Chat (`playground-dual-a` / `playground-dual-b`) keeps the full execution.log for an accurate line count. */
+const PLAYGROUND_GRAPH_SESSION_IDS = new Set(['playground-dual-a', 'playground-dual-b']);
+
+function isPlaygroundSystemChatSession() {
+  const sid = getGraphPipelineSessionId();
+  return Boolean(sid && PLAYGROUND_GRAPH_SESSION_IDS.has(sid));
+}
+
+function maxExecutionLogLinesForCurrentSession() {
+  return isPlaygroundSystemChatSession() ? Number.POSITIVE_INFINITY : MAX_IN_MEMORY_EXECUTION_LOG_LINES;
+}
+
+function maxPersistExecutionLogLinesForCurrentSession() {
+  return isPlaygroundSystemChatSession() ? Number.POSITIVE_INFINITY : MAX_IN_MEMORY_EXECUTION_LOG_LINES;
+}
+
+/**
+ * @param {unknown} log
+ * @returns {Array<{ time?: number, msg?: string, detail?: string }>}
+ */
+function capExecutionLogInMemory(log) {
+  if (!Array.isArray(log)) return [];
+  const max = maxExecutionLogLinesForCurrentSession();
+  const windowed = log.length <= max ? log : log.slice(-max);
+  return windowed.map((e) => {
+    if (!e || typeof e !== 'object') return { time: Date.now(), msg: '' };
+    const msg = typeof e.msg === 'string' ? clipTextComplete(e.msg, 4000, { ellipsis: false }) : String(e.msg || '').slice(0, 4000);
+    const out = {
+      time: typeof e.time === 'number' && Number.isFinite(e.time) ? e.time : Date.now(),
+      msg,
+    };
+    if (e.detail != null && typeof e.detail === 'string') {
+      out.detail = clipTextComplete(e.detail, 12_000, { ellipsis: false });
+    }
+    return out;
+  });
+}
+
 function persistNow() {
   if (typeof window === 'undefined') return;
   const storageKey = graphPipelineUiStorageKey();
   if (!storageKey) return;
   try {
-    const rawLog = Array.isArray(state.executionLog) ? state.executionLog.slice(-400) : [];
+    const logArr = Array.isArray(state.executionLog) ? state.executionLog : [];
+    const persistCap = maxPersistExecutionLogLinesForCurrentSession();
+    const rawLog = logArr.length <= persistCap ? logArr : logArr.slice(-persistCap);
     const mo = clipModuleOutputs(state.moduleOutputs, 200_000);
     let smSave = null;
     if (state.lastSharedMemory && typeof state.lastSharedMemory === 'object') {
@@ -254,12 +308,18 @@ export const graphPipelineStore = {
   },
   setState(partial) {
     state = { ...state, ...partial };
+    if (Array.isArray(state.executionLog)) {
+      state = { ...state, executionLog: capExecutionLogInMemory(state.executionLog) };
+    }
     emit();
     schedulePersist();
   },
   /** Batch updates without multiple emits (still one persist schedule). */
   patch(partial) {
     state = { ...state, ...partial };
+    if (Array.isArray(state.executionLog)) {
+      state = { ...state, executionLog: capExecutionLogInMemory(state.executionLog) };
+    }
     emit();
     schedulePersist();
   },
@@ -322,4 +382,15 @@ export function patchDashboardLlmFromPipelineSseEvent(evt) {
       lastLlmModel: String(evt.modelUsed),
     });
   }
+}
+
+let mindStoragePrepStaleTimer = null;
+if (typeof window !== 'undefined') {
+  window.addEventListener(MIND_STORAGE_CHANGED, () => {
+    if (mindStoragePrepStaleTimer) clearTimeout(mindStoragePrepStaleTimer);
+    mindStoragePrepStaleTimer = setTimeout(() => {
+      mindStoragePrepStaleTimer = null;
+      graphPipelineStore.patch({ pipelineIntegrationPrepStale: true });
+    }, 400);
+  });
 }

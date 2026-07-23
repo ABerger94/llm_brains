@@ -3,7 +3,7 @@
  * Tags are stable prefixes so users can search/filter and map to the diagnosis table in docs.
  */
 
-/** @typedef {'health_preflight'|'network_fetch'|'payload_too_large'|'llm_or_provider'|'continuation_shared_memory'|'sse_incomplete'|'stale_running_cap'|'user_abort'|'unknown'} SchedulerFailureBucket */
+/** @typedef {'health_preflight'|'network_fetch'|'payload_too_large'|'llm_or_provider'|'continuation_shared_memory'|'sse_incomplete'|'stale_running_cap'|'timeout_explicit'|'user_abort'|'unknown'} SchedulerFailureBucket */
 
 /**
  * @param {string} raw
@@ -14,10 +14,13 @@ export function classifyScheduledTaskFailureMessage(raw) {
   const lower = s.toLowerCase();
 
   if (
-    /run exceeded the maximum time|tab closed before completion|stale running/i.test(s) ||
+    /run exceeded the maximum time|tab closed before completion|stale running|last start\/heartbeat/i.test(s) ||
     lower.includes('maximum time')
   ) {
     return { bucket: 'stale_running_cap', tag: '[stale_running_cap]' };
+  }
+  if (/timeout after\s+\d+\s*ms/i.test(lower)) {
+    return { bucket: 'timeout_explicit', tag: '[timeout_explicit]' };
   }
   if (lower.includes('stopped during run')) {
     return { bucket: 'user_abort', tag: '[user_abort]' };

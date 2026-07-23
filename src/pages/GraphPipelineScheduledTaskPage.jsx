@@ -4,11 +4,11 @@ import { Link, Navigate, useParams, useSearchParams } from 'react-router-dom';
 import SchedulerTaskPipelineLivePanel from '../components/pipeline/SchedulerTaskPipelineLivePanel';
 import { ScheduledTaskPipelineDetail } from '../components/graphPipeline/ScheduledTaskPipelineViews';
 import { DEFAULT_GRAPH_SESSION_ID } from '../lib/graphPipelineSessionScope';
+import { graphPipelineWorkspaceHref } from '../lib/graphSessionMindProfile';
 import { getFirstProcessingModuleId } from '../lib/cognitiveModules';
 import { getSchedulerPipelineEntryTopicSummary } from '../lib/schedulerTaskDisplayTopic';
 import { getSchedulerTaskTypeLabel } from '../lib/schedulerTaskLabels';
 import { getSchedulerPipelineUiSnapshot, subscribeSchedulerPipelineUi } from '../lib/schedulerPipelineUiStore';
-
 function WorkspaceHeaderDescription() {
   return (
     <p className="text-[11px] leading-snug text-muted-foreground">
@@ -39,7 +39,7 @@ export default function GraphPipelineScheduledTaskPage() {
 
   const fromRaw = searchParams.get('from');
   const fromSession = String(fromRaw || DEFAULT_GRAPH_SESSION_ID).trim() || DEFAULT_GRAPH_SESSION_ID;
-  const backHref = `/graph-pipeline/${encodeURIComponent(fromSession)}?tab=scheduled`;
+  const backHref = `${graphPipelineWorkspaceHref(fromSession)}?tab=scheduled`;
 
   const snap = useSyncExternalStore(
     subscribeSchedulerPipelineUi,
@@ -62,7 +62,7 @@ export default function GraphPipelineScheduledTaskPage() {
   }
 
   return (
-    <div className="scroll-mt-4 flex min-h-0 flex-1 flex-col bg-background">
+    <div className="scroll-mt-4 flex w-full min-w-0 min-h-0 flex-col bg-background text-foreground lg:min-h-0 lg:flex-1">
       <div className="shrink-0 border-b border-border bg-card/40 px-4 py-3 sm:px-6">
         <div className="mx-auto flex w-full max-w-5xl flex-col gap-3">
           <div className="flex flex-wrap items-center gap-2">
@@ -104,9 +104,9 @@ export default function GraphPipelineScheduledTaskPage() {
         </div>
       </div>
 
-      <div className="mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col">
+      <div className="mx-auto flex w-full max-w-5xl flex-col lg:min-h-0 lg:flex-1 lg:overflow-hidden max-lg:overflow-visible">
         <SchedulerTaskPipelineLivePanel taskId={taskId} />
-        <div className="min-h-0 flex-1 overflow-y-auto border-b border-border/70 bg-muted/5 px-3 py-3 sm:px-4">
+        <div className="border-b border-border/70 bg-muted/5 px-3 py-3 sm:px-4 lg:min-h-0 lg:flex-1 lg:overflow-y-auto max-lg:overflow-visible">
           <ScheduledTaskPipelineDetail taskId={taskId} />
         </div>
       </div>

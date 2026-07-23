@@ -9,7 +9,15 @@ import {
   idbGetRecordValue,
   idbGetAllForEntityType,
   idbDeleteAllForEntityType,
+  idbCountByEntityType,
 } from '../lib/browserStorage.js';
+
+/** Isolated IndexedDB entity types for dual-graph playground System B (mirror mind). */
+export const PLAYGROUND_MIRROR_ENTITY_SUFFIX = '__playground_mirror';
+
+function mirrorType(base) {
+  return `${base}${PLAYGROUND_MIRROR_ENTITY_SUFFIX}`;
+}
 
 class LocalStorageService {
   constructor() {
@@ -34,6 +42,26 @@ class LocalStorageService {
       BeliefTension: new EntityManager('BeliefTension'),
       UserModelSnapshot: new EntityManager('UserModelSnapshot'),
       ConsolidationDigest: new EntityManager('ConsolidationDigest'),
+      PendingMindUpdate: new EntityManager('PendingMindUpdate'),
+    };
+    this.entitiesMirror = {
+      LongTermMemory: new EntityManager(mirrorType('LongTermMemory')),
+      BeliefStore: new EntityManager(mirrorType('BeliefStore')),
+      PipelineRun: new EntityManager(mirrorType('PipelineRun')),
+      MindBiography: new EntityManager(mirrorType('MindBiography')),
+      WorldModel: new EntityManager(mirrorType('WorldModel')),
+      CuriosityItem: new EntityManager(mirrorType('CuriosityItem')),
+      GoalItem: new EntityManager(mirrorType('GoalItem')),
+      TemporalEvent: new EntityManager(mirrorType('TemporalEvent')),
+      ConversationMessage: new EntityManager(mirrorType('ConversationMessage')),
+      EmergenceEvent: new EntityManager(mirrorType('EmergenceEvent')),
+      SelfLedgerRevision: new EntityManager(mirrorType('SelfLedgerRevision')),
+      BeliefTension: new EntityManager(mirrorType('BeliefTension')),
+      UserModelSnapshot: new EntityManager(mirrorType('UserModelSnapshot')),
+      ConsolidationDigest: new EntityManager(mirrorType('ConsolidationDigest')),
+      FeedbackItem: new EntityManager(mirrorType('FeedbackItem')),
+      DreamRun: new EntityManager(mirrorType('DreamRun')),
+      PendingMindUpdate: new EntityManager(mirrorType('PendingMindUpdate')),
     };
   }
 
@@ -42,9 +70,9 @@ class LocalStorageService {
   }
 
   async clear() {
-    await Promise.all(
-      Object.keys(this.entities).map((name) => idbDeleteAllForEntityType(name))
-    );
+    const primary = Object.values(this.entities).map((m) => m.entityName);
+    const mirror = Object.values(this.entitiesMirror).map((m) => m.entityName);
+    await Promise.all([...primary, ...mirror].map((entityType) => idbDeleteAllForEntityType(entityType)));
   }
 }
 
@@ -101,6 +129,11 @@ class EntityManager {
   async retrieve(id) {
     const v = await idbGetRecordValue(id);
     return v || null;
+  }
+
+  /** Row count for this entity type (indexed; does not load rows). */
+  async count() {
+    return idbCountByEntityType(this.entityName);
   }
 
   async list(sortOrder = '-created_date', limit = 100) {

@@ -5,6 +5,11 @@ import { Button } from '../ui';
 import GraphSessionLabelInline, { graphSessionDisplayTitle } from './GraphSessionLabelInline';
 import { removeGraphPipelineSession } from '../../lib/graphPipelineSessionRegistry';
 import { DEFAULT_GRAPH_SESSION_ID } from '../../lib/graphPipelineSessionScope';
+import {
+  graphPipelineWorkspaceHref,
+  resolveGraphSessionMindStorageProfile,
+} from '../../lib/graphSessionMindProfile';
+import { MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR } from '../../lib/mindEntityContext';
 import { cn } from '../../lib/utils';
 
 function scheduleAfterReactFlush(fn) {
@@ -96,7 +101,7 @@ function StatusBadge({ mode }) {
 
 /**
  * @param {{
- *   s: { id: string, label: string, threadRootLabel?: string, updatedAt?: number, isProcessing?: boolean },
+ *   s: { id: string, label: string, threadRootLabel?: string, updatedAt?: number, isProcessing?: boolean, mindStorageProfile?: string },
  *   mode: 'idle' | 'running',
  *   onPeekSession: (payload: { sessionId: string, title: string }) => void,
  *   onSessionRemoved?: (sessionId: string) => void,
@@ -105,9 +110,10 @@ function StatusBadge({ mode }) {
  */
 export default function GraphPipelineRunsSessionCard({ s, mode, onPeekSession, onSessionRemoved, updatedLabel }) {
   const [pendingDelete, setPendingDelete] = useState(false);
-  const href = `/graph-pipeline/${encodeURIComponent(s.id)}`;
+  const href = graphPipelineWorkspaceHref(s.id);
   const title = graphSessionDisplayTitle(s.id, s.label, s.threadRootLabel);
   const canRemoveFromList = s.id !== DEFAULT_GRAPH_SESSION_ID;
+  const isMirrorMind = resolveGraphSessionMindStorageProfile(s.id) === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR;
 
   const confirmRemove = () => {
     removeGraphPipelineSession(s.id);
@@ -147,6 +153,15 @@ export default function GraphPipelineRunsSessionCard({ s, mode, onPeekSession, o
             </div>
           </div>
           <div className="flex shrink-0 flex-col items-end gap-1.5">
+            {isMirrorMind ? (
+              <span className="inline-flex rounded-full border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-800 dark:text-red-200">
+                System B
+              </span>
+            ) : (
+              <span className="inline-flex rounded-full border border-border bg-muted/40 px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+                System A
+              </span>
+            )}
             <StatusBadge mode={mode} />
             {updatedLabel ? (
               <span className="text-[11px] text-muted-foreground">{updatedLabel}</span>

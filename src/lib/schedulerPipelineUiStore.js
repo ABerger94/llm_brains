@@ -2,6 +2,7 @@ import {
   initialCuriosityPipelineUi,
   reduceCuriosityPipelineSse,
 } from './curiosityPipelineSseUi';
+import { slimSharedMemoryForGraphCheckpoint } from './slimSharedMemory';
 
 const listeners = new Set();
 
@@ -15,6 +16,7 @@ const listeners = new Set();
  *   paused?: boolean,
  *   pauseSummary?: string,
  *   pauseNextModule?: string,
+ *   lastGraphCheckpoint?: { sharedMemory: object, executionResume: object, pipelineRunId?: string|null },
  * }} SchedulerPipelineUiEntry
  */
 
@@ -110,16 +112,48 @@ export function applySchedulerPipelineUiSse(evt, taskId) {
   if (!id) return;
   const cur = snapshot.byTaskId[id];
   if (!cur) return;
+  let lastGraphCheckpoint = cur.lastGraphCheckpoint;
+  if (
+    evt?.type === 'module_complete' &&
+    evt.sharedMemory &&
+    typeof evt.sharedMemory === 'object' &&
+    evt.executionCheckpoint &&
+    typeof evt.executionCheckpoint === 'object' &&
+    Number(evt.executionCheckpoint.v) === 1
+  ) {
+    const sm = evt.sharedMemory;
+    lastGraphCheckpoint = {
+      sharedMemory: slimSharedMemoryForGraphCheckpoint(sm) ?? sm,
+      executionResume: evt.executionCheckpoint,
+      pipelineRunId: null,
+    };
+  }
   snapshot = {
     byTaskId: {
       ...snapshot.byTaskId,
       [id]: {
         ...cur,
+        lastGraphCheckpoint,
         ui: reduceCuriosityPipelineSse(cur.ui, evt),
       },
     },
   };
   emit();
+}
+
+/**
+ * Latest module checkpoint seen over SSE for this task (for Stop → cancelled + resume).
+ * @param {string} taskId
+ * @returns {{ sharedMemory: object, executionResume: object, pipelineRunId?: string|null } | null}
+ */
+export function getLastGraphCheckpointForSchedulerTask(taskId) {
+  const id = String(taskId || '').trim();
+  if (!id) return null;
+  const ent = snapshot.byTaskId[id];
+  const ck = ent?.lastGraphCheckpoint;
+  if (!ck?.sharedMemory || typeof ck.sharedMemory !== 'object') return null;
+  if (!ck.executionResume || typeof ck.executionResume !== 'object') return null;
+  return ck;
 }
 
 /**

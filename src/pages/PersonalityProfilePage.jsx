@@ -4,6 +4,9 @@ import { Fingerprint, Plus, Trash2 } from 'lucide-react';
 import { Button, Input, Label, Slider, Textarea } from '../components/ui';
 import { getRuntimeSettings, saveRuntimeSettings } from '../lib/runtimeSettings';
 import { cn } from '../lib/utils';
+import PageDescriptionCollapsible from '../components/PageDescriptionCollapsible';
+import { useMindScope } from '../context/MindScopeContext';
+import MindScopeTabs from '../components/MindScopeTabs';
 
 const MAX_FACETS = 24;
 const TRIGGERS = ['user_tone', 'user_content', 'self_reflection', 'constitution_tension'];
@@ -54,12 +57,17 @@ function Panel({ className, children }) {
 }
 
 export default function PersonalityProfilePage() {
-  const [profile, setProfile] = useState(() => normalizeProfile(getRuntimeSettings().personalityProfile));
+  const { isMirror } = useMindScope();
+  const profileStorageKey = isMirror ? 'personalityProfilePlaygroundMirror' : 'personalityProfile';
+
+  const [profile, setProfile] = useState(() =>
+    normalizeProfile(getRuntimeSettings()[profileStorageKey])
+  );
   const pendingScrollFacetIdRef = useRef(null);
 
   useEffect(() => {
     function syncFromStorage() {
-      setProfile(normalizeProfile(getRuntimeSettings().personalityProfile));
+      setProfile(normalizeProfile(getRuntimeSettings()[profileStorageKey]));
     }
     syncFromStorage();
     const onPageShow = (e) => {
@@ -67,16 +75,19 @@ export default function PersonalityProfilePage() {
     };
     window.addEventListener('pageshow', onPageShow);
     return () => window.removeEventListener('pageshow', onPageShow);
-  }, []);
+  }, [profileStorageKey]);
 
-  const commit = useCallback((next) => {
-    const merged = {
-      ...next,
-      version: (Number(next.version) || 0) + 1,
-    };
-    saveRuntimeSettings({ personalityProfile: merged });
-    setProfile(merged);
-  }, []);
+  const commit = useCallback(
+    (next) => {
+      const merged = {
+        ...next,
+        version: (Number(next.version) || 0) + 1,
+      };
+      saveRuntimeSettings({ [profileStorageKey]: merged });
+      setProfile(merged);
+    },
+    [profileStorageKey]
+  );
 
   const updateFacets = useCallback(
     (facets) => {
@@ -125,10 +136,10 @@ export default function PersonalityProfilePage() {
         facets,
         version: (Number(prev.version) || 0) + 1,
       };
-      saveRuntimeSettings({ personalityProfile: next });
+      saveRuntimeSettings({ [profileStorageKey]: next });
       return next;
     });
-  }, []);
+  }, [profileStorageKey]);
 
   useLayoutEffect(() => {
     const id = pendingScrollFacetIdRef.current;
@@ -167,32 +178,43 @@ export default function PersonalityProfilePage() {
   const resetAll = useCallback(() => {
     if (!window.confirm('Clear all personality facets, relational stance, and notes? This cannot be undone.')) return;
     const cleared = emptyProfile();
-    saveRuntimeSettings({ personalityProfile: cleared });
+    saveRuntimeSettings({ [profileStorageKey]: cleared });
     setProfile(cleared);
-  }, []);
+  }, [profileStorageKey]);
 
   const facetCount = profile.facets?.length ?? 0;
 
   return (
-    <div className="min-h-screen p-4 sm:p-6">
+    <div className="w-full min-h-0 p-4 sm:p-6">
       <div className="mx-auto max-w-3xl space-y-6">
+        <div className="flex flex-wrap items-center gap-2">
+          <MindScopeTabs />
+        </div>
+        {isMirror ? (
+          <p className="rounded-lg border border-border/80 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+            System B: edits here are stored separately from the primary mind (
+            <span className="font-mono text-foreground/80">personalityProfilePlaygroundMirror</span>). When System B runs
+            (graph/stream or System Chat leg B), pipeline prep uses this profile together with the mirror constitution, user
+            model, and other System B fields under Settings.
+          </p>
+        ) : null}
         <div className="min-w-0">
           <h1 className="flex items-center gap-2 text-2xl font-bold text-foreground">
             <Fingerprint className="h-7 w-7 text-primary" />
             Personality profile
           </h1>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <PageDescriptionCollapsible className="mt-1">
             Manual facets and strengths feed{' '}
             <span className="font-mono text-[11px] text-foreground/80">PERSONALITY_PROFILE_JSON</span> in pipeline prompts
             (Identity, Integration, Language, Narrative, Voice, Metacognition, Workspace Metacognition). Structural self stays in World Model (
             <span className="font-mono text-[11px]">SELF_MODEL_DELTA</span>). Each graph/stream run, Identity can merge a{' '}
             <span className="font-mono text-[11px]">TRAIT_DELTA</span> on top of what you set here.
-          </p>
+          </PageDescriptionCollapsible>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
           <Link
-            to="/mind-self"
+            to={isMirror ? '/mind-self/mirror' : '/mind-self'}
             className={cn(
               'inline-flex h-9 items-center justify-center rounded-md border border-input bg-background px-3 text-sm font-medium ring-offset-background transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2'
             )}

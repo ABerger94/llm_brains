@@ -3,6 +3,7 @@ import { graphPipelineStore } from './graphPipelineStore';
 import { consciousnessStreamStore } from './consciousnessStreamStore';
 import {
   getActiveConsciousnessStreamGraphSessionId,
+  isBackgroundedRunAliveForSession,
   isInteractiveStreamFetchAlive,
 } from './consciousnessStreamRunner';
 import {
@@ -95,7 +96,9 @@ export function clearGraphSessionStaleRunningState(sessionId, { force = false } 
 /**
  * If the registry still says “running” but persisted graph + stream draft both look idle, fix the registry.
  * Never clears the session this tab is actively streaming ({@link getActiveConsciousnessStreamGraphSessionId} +
- * in-memory busy), or when peek still shows a module in `processing` (KV can lead `isRunning` by one flush).
+ * in-memory busy), a {@link isBackgroundedRunAliveForSession} detached run, or when `isRunning` / `inFlight`
+ * still indicate a live run. Does clear **orphan** `moduleStatuses.processing` when run flags are already idle
+ * (reload/crash left processing stuck without `isRunning`).
  */
 export function healGraphRegistryWhenPersistSaysIdle() {
   if (typeof window === 'undefined') return;
@@ -116,6 +119,8 @@ export function healGraphRegistryWhenPersistSaysIdle() {
     // is sufficient proof that the pipeline is live.
     if (sseAlive && streamSid === id) continue;
     if (thisTabPipelineBusy && streamSid === id) continue;
+    // Detached background SSE still persisting for this session — do not clear KV.
+    if (isBackgroundedRunAliveForSession(id)) continue;
 
     const peek = peekGraphPipelineUiPersisted(id);
     const draft = peekConsciousnessStreamDraftForSession(id);
@@ -125,6 +130,14 @@ export function healGraphRegistryWhenPersistSaysIdle() {
 
     const anyFlagStuck = s.isProcessing || graphSaysRunning || streamSaysBusy;
     if (anyFlagStuck && !hasProcessing) {
+      clearGraphSessionStaleRunningState(id, { force: true });
+      continue;
+    }
+
+    // Orphan: moduleStatuses still say "processing" after a crash/reload but
+    // isRunning / inFlight / registry already went idle — otherwise heal never runs
+    // (the old condition required !hasProcessing).
+    if (!graphSaysRunning && !streamSaysBusy && hasProcessing) {
       clearGraphSessionStaleRunningState(id, { force: true });
     }
   }

@@ -13,6 +13,7 @@ import { getGoalPagePursuitSnapshot, subscribeGoalPagePursuit } from './goalPage
 import { isTransientReconnectFailure } from './reconnectRecovery';
 import { MIND_STORAGE_CHANGED } from './mindStorageEvents';
 import {
+  getDashboardScheduledPausedFromDbCache,
   getDashboardScheduledRunningFromDbCache,
   subscribeDashboardScheduledRunningSync,
   syncDashboardScheduledRunningFromDb,
@@ -39,6 +40,13 @@ import {
   subscribeGraphPipelineRegistry,
 } from './graphPipelineSessionRegistry';
 import { DEFAULT_GRAPH_SESSION_ID, getGraphPipelineSessionId } from './graphPipelineSessionScope';
+import {
+  getGraphWorkspaceMindSessionStorage,
+  graphPipelineWorkspaceHref,
+  resolveGraphSessionMindStorageProfile,
+} from './graphSessionMindProfile';
+import { PLAYGROUND_GRAPH_SESSION_A, PLAYGROUND_GRAPH_SESSION_B } from './playgroundDualGraphRunner';
+import { MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR } from './mindEntityContext';
 
 function clip(s, max = 160) {
   const t = String(s || '')
@@ -65,7 +73,108 @@ const ACTIVE_PIPELINE_PRIMARY_MAX = 200;
 
 function graphPipelineDeepLinkForSession(sessionId) {
   const sid = String(sessionId || '').trim() || DEFAULT_GRAPH_SESSION_ID;
-  return `/graph-pipeline/${encodeURIComponent(sid)}#graph-pipeline-bottom`;
+  return `${graphPipelineWorkspaceHref(sid)}#graph-pipeline-bottom`;
+}
+
+/** Dashboard / Live Analytics card tint: mirror registry + sticky sessionStorage, not only `playground-dual-b`. */
+function dashboardGraphSessionSystemAccent(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return 'a';
+  const remembered =
+    typeof window !== 'undefined' ? getGraphWorkspaceMindSessionStorage(sid) : null;
+  const profile = remembered ?? resolveGraphSessionMindStorageProfile(sid);
+  return profile === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR ? 'b' : 'a';
+}
+
+/**
+ * Which playground leg is foreground for Dashboard (only one row — avoid ghost “Module: Running” on the peer).
+ * @param {string} sessionForRow - from bound / stream / last-opened / default
+ */
+function resolvePlaygroundSystemChatForegroundSessionId(sessionForRow) {
+  const streamSid = getActiveConsciousnessStreamGraphSessionId();
+  if (streamSid === PLAYGROUND_GRAPH_SESSION_A || streamSid === PLAYGROUND_GRAPH_SESSION_B) {
+    return streamSid;
+  }
+  const bound = getGraphPipelineSessionId();
+  if (bound === PLAYGROUND_GRAPH_SESSION_A || bound === PLAYGROUND_GRAPH_SESSION_B) {
+    return bound;
+  }
+  if (sessionForRow === PLAYGROUND_GRAPH_SESSION_A || sessionForRow === PLAYGROUND_GRAPH_SESSION_B) {
+    return sessionForRow;
+  }
+  return PLAYGROUND_GRAPH_SESSION_A;
+}
+
+/**
+ * One row for System Chat dual graph (`playground-dual-a` / `playground-dual-b`): live store when that
+ * session is bound + running; otherwise persisted peek for the peer leg.
+ */
+function buildPlaygroundSystemChatGraphRow(sid, gp, cs, graphOrStreamActive, idle) {
+  const peek = peekGraphPipelineUiPersisted(sid);
+  const draft = peekConsciousnessStreamDraftForSession(sid);
+  const bound = getGraphPipelineSessionId();
+  const streamSid = getActiveConsciousnessStreamGraphSessionId();
+  const useLive =
+    graphOrStreamActive &&
+    bound === sid &&
+    (gp.isRunning || cs.isProcessing) &&
+    (streamSid === sid || streamSid == null);
+
+  const ms = useLive
+    ? gp.moduleStatuses && typeof gp.moduleStatuses === 'object'
+      ? gp.moduleStatuses
+      : {}
+    : peek?.moduleStatuses && typeof peek.moduleStatuses === 'object'
+      ? peek.moduleStatuses
+      : {};
+  const modName = getFirstProcessingModuleName(ms);
+  const uploading = useLive ? Boolean(gp.uploading) : Boolean(peek?.uploading);
+
+  let regEntry = null;
+  try {
+    const reg = typeof window !== 'undefined' ? getGraphPipelineSessionRegistry() : [];
+    regEntry = reg.find((r) => String(r?.id || '').trim() === sid) || null;
+  } catch {
+    regEntry = null;
+  }
+
+  const promptHint = useLive
+    ? clip(String(cs.activeRunTopic || '').trim(), ACTIVE_PIPELINE_PRIMARY_MAX) ||
+      clip(String(gp.runContextLabel || '').trim(), ACTIVE_PIPELINE_PRIMARY_MAX) ||
+      clip(lastUserPromptFromEntries(cs.entries), ACTIVE_PIPELINE_PRIMARY_MAX) ||
+      clip(gp.input, ACTIVE_PIPELINE_PRIMARY_MAX) ||
+      clip(String(cs.input || '').trim(), ACTIVE_PIPELINE_PRIMARY_MAX)
+    : clip(String(peek?.runContextLabel || '').trim(), ACTIVE_PIPELINE_PRIMARY_MAX) ||
+      clip(lastUserPromptFromEntries(draft.entries), ACTIVE_PIPELINE_PRIMARY_MAX) ||
+      clip(String(peek?.input || '').trim(), ACTIVE_PIPELINE_PRIMARY_MAX) ||
+      clip(graphSessionDisplayTitle(sid, regEntry?.label, regEntry?.threadRootLabel), ACTIVE_PIPELINE_PRIMARY_MAX);
+
+  const prefix = sid === PLAYGROUND_GRAPH_SESSION_A ? 'System A' : 'System B';
+  const title = `${prefix} · ${promptHint || 'Graph pipeline'}`;
+
+  const lead = formatGraphRunProgressLine({
+    uploading,
+    moduleName: modName,
+    isActive: useLive,
+  });
+  const tail = [];
+  const lc = useLive ? Number(gp.loopCount) || 0 : Number(peek?.loopCount) || 0;
+  if (lc > 0) tail.push(`Supervisor reruns: ${lc}`);
+  const detail = formatActivePipelineDetail(lead, tail, idle);
+
+  return {
+    key: `graph-pipeline-session-${sid}`,
+    pageName: prefix,
+    href: graphPipelineDeepLinkForSession(sid),
+    title,
+    detail,
+    variant: 'graph',
+    pipelineProgress: computeDashboardPipelineProgress(ms, useLive),
+    pipelineProgressIndeterminate: false,
+    moduleStatuses: ms,
+    interrupted: false,
+    playgroundSystemAccent: sid === PLAYGROUND_GRAPH_SESSION_A ? 'a' : 'b',
+  };
 }
 
 /**
@@ -104,6 +213,23 @@ export function isGraphPeekPipelineEffectivelyComplete(peek, draft) {
   if (!peek) return false;
   if (draft?.inFlight) return false;
   if (peek.uploading) return false;
+  /**
+   * Stale session KV: `flushPersist` no-ops when {@link graphPipelineUiStorageKey} is null (lobby / unbound
+   * session), so `isRunning` can stay true while every module is already settled — typical after a deferred
+   * supervisor rerun was enqueued from Executive Gate. Require the Voice/placeholder line that the graph
+   * saves for that case so we do not hide rows during a scheduled continuation that set `isRunning` before
+   * the first module marks `processing`.
+   */
+  if (peek.isRunning && !peekModuleStatusesShowProcessing(peek) && !draft.inFlight) {
+    const fo = String(peek.finalOutput || '').trim();
+    if (
+      /Supervisor RERUN scheduled/i.test(fo) ||
+      /Voice pending/i.test(fo) ||
+      /\bRERUN scheduled\b/i.test(fo)
+    ) {
+      return true;
+    }
+  }
   if (peek.isRunning) return false;
   if (peekModuleStatusesShowProcessing(peek)) return false;
   return true;
@@ -119,6 +245,18 @@ function graphSessionLooksActiveFromPeek(s, peek, draft) {
     return false;
   }
   if (isGraphPeekPipelineEffectivelyComplete(peek, draft)) return false;
+  /**
+   * Registry already cleared for this workspace but session KV still has `isRunning` (persist never bound
+   * to the graph session key). Do not keep a ghost “active pipeline” row.
+   */
+  if (
+    !s.isProcessing &&
+    peek?.isRunning &&
+    !peekModuleStatusesShowProcessing(peek) &&
+    !draft.inFlight
+  ) {
+    return false;
+  }
   const registryOrKvSaysRunning = Boolean(
     s.isProcessing || peek?.isRunning || draft.inFlight
   );
@@ -185,8 +323,38 @@ function computeDashboardPipelineProgress(moduleStatuses, isActive) {
  *   moduleStatuses?: Record<string, string> | null,
  *   interrupted?: boolean,
  *   paused?: boolean,
+ *   playgroundSystemAccent?: 'a' | 'b',
  * }} DashboardActiveWorkRow
  */
+
+/**
+ * Blue vs red UI accents: mirror graph session B only; everything else (primary mind) is A.
+ * Used by Live Analytics and Dashboard active-pipeline cards.
+ * @param {{ key: string, playgroundSystemAccent?: 'a'|'b' }} row
+ * @returns {'a'|'b'}
+ */
+export function resolveDashboardRowPlaygroundSystemAccent(row) {
+  if (row.playgroundSystemAccent === 'a' || row.playgroundSystemAccent === 'b') {
+    return row.playgroundSystemAccent;
+  }
+  if (row.key.startsWith('graph-pipeline-session-')) {
+    const sid = row.key.slice('graph-pipeline-session-'.length).trim();
+    return dashboardGraphSessionSystemAccent(sid);
+  }
+  if (
+    row.key === 'graph-pipeline' ||
+    row.key === 'graph-pipeline-checkpoint' ||
+    row.key === 'graph-pipeline-interrupted'
+  ) {
+    const sid =
+      getGraphPipelineSessionId() ||
+      getActiveConsciousnessStreamGraphSessionId() ||
+      getLastOpenedGraphPipelineSessionId() ||
+      DEFAULT_GRAPH_SESSION_ID;
+    return dashboardGraphSessionSystemAccent(sid);
+  }
+  return 'a';
+}
 
 /**
  * Build rows for “what is running” (interactive UI–tracked work plus in-flight scheduler pipeline jobs).
@@ -240,20 +408,27 @@ export function buildDashboardActiveWorkRows() {
       getActiveConsciousnessStreamGraphSessionId() ||
       getLastOpenedGraphPipelineSessionId() ||
       DEFAULT_GRAPH_SESSION_ID;
-    handledGraphSessionIds.add(sessionForRow);
 
-    rows.push({
-      key: 'graph-pipeline',
-      pageName: 'Graph Pipeline',
-      href: graphPipelineDeepLinkForSession(sessionForRow),
-      title,
-      detail,
-      variant: 'graph',
-      pipelineProgress: computeDashboardPipelineProgress(gp.moduleStatuses, graphOrStreamActive),
-      pipelineProgressIndeterminate: false,
-      moduleStatuses: gp.moduleStatuses,
-      interrupted: false,
-    });
+    if (sessionForRow === PLAYGROUND_GRAPH_SESSION_A || sessionForRow === PLAYGROUND_GRAPH_SESSION_B) {
+      handledGraphSessionIds.add(PLAYGROUND_GRAPH_SESSION_A);
+      handledGraphSessionIds.add(PLAYGROUND_GRAPH_SESSION_B);
+      const foregroundSid = resolvePlaygroundSystemChatForegroundSessionId(sessionForRow);
+      rows.push(buildPlaygroundSystemChatGraphRow(foregroundSid, gp, cs, graphOrStreamActive, idle));
+    } else {
+      handledGraphSessionIds.add(sessionForRow);
+      rows.push({
+        key: 'graph-pipeline',
+        pageName: 'Graph Pipeline',
+        href: graphPipelineDeepLinkForSession(sessionForRow),
+        title,
+        detail,
+        variant: 'graph',
+        pipelineProgress: computeDashboardPipelineProgress(gp.moduleStatuses, graphOrStreamActive),
+        pipelineProgressIndeterminate: false,
+        moduleStatuses: gp.moduleStatuses,
+        interrupted: false,
+      });
+    }
   }
 
   /**
@@ -262,7 +437,10 @@ export function buildDashboardActiveWorkRows() {
    * (e.g. cross-tab or registry-driven runs that do not mirror `gp.isRunning` in this tab).
    */
   const registry = typeof window !== 'undefined' ? getGraphPipelineSessionRegistry() : [];
-  for (const s of registry) {
+  const registrySorted = [...registry].sort((a, b) =>
+    String(a?.id || '').localeCompare(String(b?.id || ''))
+  );
+  for (const s of registrySorted) {
     const sid = String(s?.id || '').trim();
     if (!sid) continue;
     const peek = peekGraphPipelineUiPersisted(sid);
@@ -328,13 +506,13 @@ export function buildDashboardActiveWorkRows() {
         ? formatActivePipelineDetail(
             'Paused — cooperative checkpoint saved',
             [
-              'Resume from this save via Graph Pipeline (Continue), Dashboard Resume all, or dismiss the reload notice on the graph page — progress is kept until you discard.',
+              'Resume from this save via Graph Pipeline (Continue), Dashboard Load saved + Resume on this row, or dismiss the reload notice on the graph page — progress is kept until you discard.',
             ],
             'Paused'
           )
         : formatActivePipelineDetail(
             'Paused — cooperative checkpoint saved',
-            ['Continue in Graph Pipeline or use Dashboard Resume all.'],
+            ['Continue in Graph Pipeline or use Dashboard Load saved + Resume on this row.'],
             'Paused'
           );
       handledGraphSessionIds.add(sessionForCk);
@@ -415,14 +593,17 @@ export function buildDashboardActiveWorkRows() {
     let href = '/scheduler';
     let variant = 'scheduler';
 
+    const schMirror = String(sch.mind_storage_profile || '').trim() === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR;
     if (typeKey === 'curiosity_pursuit') {
-      pageName = 'Curiosity Queue';
+      pageName = schMirror ? 'Curiosity Queue (B)' : 'Curiosity Queue';
       variant = 'curiosity';
-      href = targetC ? `/curiosity?focus=${encodeURIComponent(targetC)}` : '/scheduler';
+      const cBase = schMirror ? '/curiosity/mirror' : '/curiosity';
+      href = targetC ? `${cBase}?focus=${encodeURIComponent(targetC)}` : '/scheduler';
     } else if (typeKey === 'goal_pursuit') {
-      pageName = 'Goals';
+      pageName = schMirror ? 'Goals (B)' : 'Goals';
       variant = 'goal';
-      href = targetG ? `/goals?focus=${encodeURIComponent(targetG)}` : '/scheduler';
+      const gBase = schMirror ? '/goals/mirror' : '/goals';
+      href = targetG ? `${gBase}?focus=${encodeURIComponent(targetG)}` : '/scheduler';
     } else {
       pageName = 'Graph Pipeline';
       href = `/graph-pipeline/scheduled/${encodeURIComponent(String(sch.id))}?from=default`;
@@ -447,6 +628,82 @@ export function buildDashboardActiveWorkRows() {
       pipelineProgressIndeterminate: false,
       moduleStatuses: ms || null,
       interrupted: false,
+      playgroundSystemAccent: schMirror ? 'b' : undefined,
+    });
+  }
+
+  const schedulerPaused = getDashboardScheduledPausedFromDbCache() || [];
+  const runningIds = new Set(schedulerRunning.map((r) => String(r?.id || '')));
+  for (const sch of schedulerPaused) {
+    if (!sch?.id) continue;
+    const sid = String(sch.id);
+    if (runningIds.has(sid)) continue;
+
+    const typeKey = String(sch.task_type || '').trim().toLowerCase();
+    const targetC = String(sch.target_curiosity_id || '').trim();
+    const targetG = String(sch.target_goal_id || '').trim();
+
+    if (typeKey === 'curiosity_pursuit') {
+      if (targetC && curiositySnap[targetC]?.running) continue;
+      if (!targetC && Object.values(curiositySnap).some((p) => p?.running)) continue;
+      if (targetC && curiositySnap[targetC]?.cooperativePaused) continue;
+      if (!targetC && Object.values(curiositySnap).some((p) => p?.cooperativePaused)) continue;
+    }
+    if (typeKey === 'goal_pursuit') {
+      if (targetG && goalsSnap[targetG]?.running) continue;
+      if (!targetG && Object.values(goalsSnap).some((p) => p?.running)) continue;
+      if (targetG && goalsSnap[targetG]?.cooperativePaused) continue;
+      if (!targetG && Object.values(goalsSnap).some((p) => p?.cooperativePaused)) continue;
+    }
+
+    const typeLabel = getSchedulerTaskTypeLabel(sch.task_type);
+    const topic = getScheduledTaskTopicSummary(sch);
+    const title =
+      clip(topic, ACTIVE_PIPELINE_PRIMARY_MAX) || clip(typeLabel, ACTIVE_PIPELINE_PRIMARY_MAX);
+
+    let pageName = 'Scheduler';
+    let href = '/scheduler';
+    let variant = 'scheduler';
+
+    const schPausedMirror = String(sch.mind_storage_profile || '').trim() === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR;
+    if (typeKey === 'curiosity_pursuit') {
+      pageName = schPausedMirror ? 'Curiosity Queue (B)' : 'Curiosity Queue';
+      variant = 'curiosity';
+      const cBase = schPausedMirror ? '/curiosity/mirror' : '/curiosity';
+      href = targetC ? `${cBase}?focus=${encodeURIComponent(targetC)}` : '/scheduler';
+    } else if (typeKey === 'goal_pursuit') {
+      pageName = schPausedMirror ? 'Goals (B)' : 'Goals';
+      variant = 'goal';
+      const gBase = schPausedMirror ? '/goals/mirror' : '/goals';
+      href = targetG ? `${gBase}?focus=${encodeURIComponent(targetG)}` : '/scheduler';
+    } else {
+      pageName = 'Graph Pipeline';
+      href = `/graph-pipeline/scheduled/${encodeURIComponent(String(sch.id))}?from=default`;
+    }
+
+    const schedEntry = schedulerUiSnap.byTaskId?.[String(sch.id)];
+    const ms = schedEntry?.ui?.moduleStatuses;
+    const detail = formatActivePipelineDetail(
+      'Paused — cooperative checkpoint saved',
+      [typeLabel, 'Use Dashboard Load saved + Resume on this row, or open Scheduler to continue.'],
+      idle
+    );
+
+    const pipelineProgress = computeDashboardPipelineProgress(ms || {}, false);
+
+    rows.push({
+      key: `scheduler-task-${sch.id}`,
+      pageName,
+      href,
+      title,
+      detail,
+      variant,
+      pipelineProgress,
+      pipelineProgressIndeterminate: false,
+      moduleStatuses: ms || null,
+      interrupted: false,
+      paused: true,
+      playgroundSystemAccent: schPausedMirror ? 'b' : undefined,
     });
   }
 
@@ -456,6 +713,8 @@ export function buildDashboardActiveWorkRows() {
     const prog = String(p.pursuitProgress || '').trim();
     const modName = getFirstProcessingModuleName(p.curiosityPipelineUi?.moduleStatuses);
     const coopPausedIdle = Boolean(p?.cooperativePaused) && !p?.running;
+    const isMirrorPursuit = p.mindStorageProfile === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR;
+    const curiosityBase = isMirrorPursuit ? '/curiosity/mirror' : '/curiosity';
     const detail = p?.interruptedByReload
       ? formatPursuitPipelineStatusDetailWithInterrupted({
           moduleName: modName,
@@ -475,8 +734,8 @@ export function buildDashboardActiveWorkRows() {
           });
     rows.push({
       key: `curiosity-${id}`,
-      pageName: 'Curiosity Queue',
-      href: `/curiosity?focus=${encodeURIComponent(String(id))}`,
+      pageName: isMirrorPursuit ? 'Curiosity Queue (B)' : 'Curiosity Queue',
+      href: `${curiosityBase}?focus=${encodeURIComponent(String(id))}`,
       title: q ? clip(q, ACTIVE_PIPELINE_PRIMARY_MAX) : `Curiosity ···${String(id).slice(-6)}`,
       detail,
       variant: 'curiosity',
@@ -488,6 +747,7 @@ export function buildDashboardActiveWorkRows() {
       moduleStatuses: p.curiosityPipelineUi?.moduleStatuses || null,
       interrupted: Boolean(p?.interruptedByReload),
       paused: coopPausedIdle,
+      playgroundSystemAccent: isMirrorPursuit ? 'b' : 'a',
     });
   }
 
@@ -497,6 +757,8 @@ export function buildDashboardActiveWorkRows() {
     const prog = String(p.pursuitProgress || '').trim();
     const modName = getFirstProcessingModuleName(p.goalPipelineUi?.moduleStatuses);
     const coopPausedIdle = Boolean(p?.cooperativePaused) && !p?.running;
+    const isMirrorGoal = p.mindStorageProfile === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR;
+    const goalBase = isMirrorGoal ? '/goals/mirror' : '/goals';
     const detail = p?.interruptedByReload
       ? formatPursuitPipelineStatusDetailWithInterrupted({
           moduleName: modName,
@@ -516,8 +778,8 @@ export function buildDashboardActiveWorkRows() {
           });
     rows.push({
       key: `goal-${id}`,
-      pageName: 'Goals',
-      href: `/goals?focus=${encodeURIComponent(String(id))}`,
+      pageName: isMirrorGoal ? 'Goals (B)' : 'Goals',
+      href: `${goalBase}?focus=${encodeURIComponent(String(id))}`,
       title: g ? clip(g, ACTIVE_PIPELINE_PRIMARY_MAX) : `Goal ···${String(id).slice(-6)}`,
       detail,
       variant: 'goal',
@@ -526,7 +788,12 @@ export function buildDashboardActiveWorkRows() {
       moduleStatuses: p.goalPipelineUi?.moduleStatuses || null,
       interrupted: Boolean(p?.interruptedByReload),
       paused: coopPausedIdle,
+      playgroundSystemAccent: isMirrorGoal ? 'b' : 'a',
     });
+  }
+
+  for (const row of rows) {
+    row.playgroundSystemAccent = resolveDashboardRowPlaygroundSystemAccent(row);
   }
 
   return rows;
@@ -534,7 +801,9 @@ export function buildDashboardActiveWorkRows() {
 
 function graphRegistryActiveWorkSnapshotKey() {
   if (typeof window === 'undefined') return '';
-  const reg = getGraphPipelineSessionRegistry();
+  const reg = [...getGraphPipelineSessionRegistry()].sort((a, b) =>
+    String(a?.id || '').localeCompare(String(b?.id || ''))
+  );
   return reg
     .map((s) => {
       const id = String(s?.id || '').trim();
@@ -553,6 +822,7 @@ function graphRegistryActiveWorkSnapshotKey() {
 
 function schedulerRunningRowKey() {
   const list = getDashboardScheduledRunningFromDbCache() || [];
+  const pausedList = getDashboardScheduledPausedFromDbCache() || [];
   const u = getSchedulerPipelineUiSnapshot();
   const by = u.byTaskId || {};
   const uiParts = Object.keys(by)
@@ -569,10 +839,16 @@ function schedulerRunningRowKey() {
   const listPart = list
     .map(
       (r) =>
-        `${r.id}\x00${r.task_type}\x00${r.reason}\x00${r.input_text}\x00${r.run_started_at}\x00${r.target_curiosity_id}\x00${r.target_goal_id}\x00`
+        `${r.id}\x00${r.task_type}\x00${r.reason}\x00${r.input_text}\x00${r.run_started_at}\x00${r.target_curiosity_id}\x00${r.target_goal_id}\x00${r.mind_storage_profile || ''}\x00`
     )
     .join('\x02');
-  return `${listPart}\x03${u.running ? '1' : '0'}\x00${uiParts}`;
+  const pausedPart = pausedList
+    .map(
+      (r) =>
+        `${r.id}\x00${r.task_type}\x00${r.reason}\x00${r.input_text}\x00${r.run_started_at}\x00${r.target_curiosity_id}\x00${r.target_goal_id}\x00${r.mind_storage_profile || ''}\x00`
+    )
+    .join('\x02');
+  return `${listPart}\x03${pausedPart}\x04${u.running ? '1' : '0'}\x00${uiParts}`;
 }
 
 function compactModuleStatusKey(ms) {
@@ -587,7 +863,7 @@ function activeWorkSnapshotKey(rows, schedKey) {
   const rowPart = rows
     .map(
       (r) =>
-        `${r.key}\x00${r.title}\x00${r.detail}\x00${r.variant}\x00${r.pipelineProgress ?? ''}\x00${r.pipelineProgressIndeterminate ? '1' : ''}\x00${r.interrupted ? '1' : ''}\x00${r.paused ? '1' : ''}\x00${compactModuleStatusKey(r.moduleStatuses)}`
+        `${r.key}\x00${r.title}\x00${r.detail}\x00${r.variant}\x00${r.pipelineProgress ?? ''}\x00${r.pipelineProgressIndeterminate ? '1' : ''}\x00${r.interrupted ? '1' : ''}\x00${r.paused ? '1' : ''}\x00${r.playgroundSystemAccent ?? ''}\x00${compactModuleStatusKey(r.moduleStatuses)}`
     )
     .join('\x01');
   return `${rowPart}\x02${schedKey}`;
@@ -612,6 +888,7 @@ export function getDashboardActiveWorkSnapshot() {
 
 /** Subscribe to every store that can change {@link getDashboardActiveWorkSnapshot}. */
 export function subscribeDashboardActiveWork(onStoreChange) {
+  void syncDashboardScheduledRunningFromDb().then(() => onStoreChange());
   const u1 = subscribeGraphPipeline(onStoreChange);
   const u2 = subscribeConsciousnessStream(onStoreChange);
   const u3 = subscribeCuriosityPagePursuit(onStoreChange);

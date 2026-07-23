@@ -1,4 +1,4 @@
-import { getKvSync } from './browserStorage';
+import { getKvSync, snapshotKvCache } from './browserStorage';
 import {
   DEFAULT_GRAPH_SESSION_ID,
   graphPipelineUiLegacyFallbackKeyForSessionId,
@@ -7,8 +7,37 @@ import {
 import { repairCooperativePipelineCheckpoint } from './graphPipelineStore';
 import { getGraphPipelineSessionRegistry, getLastOpenedGraphPipelineSessionId } from './graphPipelineSessionRegistry';
 
+const GRAPH_UI_V2_SESSION_PREFIX = 'mybrain_graph_pipeline_ui_v2__s_';
+const GRAPH_UI_V1_SESSION_PREFIX = 'mybrain_graph_pipeline_ui_v1__s_';
+
+/**
+ * Session ids that have a persisted graph UI blob in KV (`__s_<id>` keys), including sessions **not**
+ * listed in the graph registry (e.g. after import or cleared registry). Without this, Resume all
+ * never scans those blobs and cooperative checkpoints are invisible.
+ * @returns {string[]}
+ */
+export function listGraphSessionIdsFromGraphUiKvKeys() {
+  if (typeof window === 'undefined') return [];
+  const out = new Set();
+  try {
+    const snap = snapshotKvCache();
+    for (const k of Object.keys(snap)) {
+      if (k.startsWith(GRAPH_UI_V2_SESSION_PREFIX)) {
+        const id = k.slice(GRAPH_UI_V2_SESSION_PREFIX.length).trim();
+        if (id) out.add(id);
+      } else if (k.startsWith(GRAPH_UI_V1_SESSION_PREFIX)) {
+        const id = k.slice(GRAPH_UI_V1_SESSION_PREFIX.length).trim();
+        if (id) out.add(id);
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return [...out].sort((a, b) => a.localeCompare(b));
+}
+
 /** Same candidate ordering as legacy single-session discovery (registry + default). */
-function graphSessionIdsForCheckpointScan() {
+export function listGraphSessionIdsForCheckpointScan() {
   if (typeof window === 'undefined') return [];
 
   const seen = new Set();
@@ -23,6 +52,12 @@ function graphSessionIdsForCheckpointScan() {
 
   for (const row of getGraphPipelineSessionRegistry()) {
     const id = String(row?.id || '').trim();
+    if (!id || seen.has(id)) continue;
+    candidates.push(id);
+    seen.add(id);
+  }
+
+  for (const id of listGraphSessionIdsFromGraphUiKvKeys()) {
     if (!id || seen.has(id)) continue;
     candidates.push(id);
     seen.add(id);
@@ -46,7 +81,7 @@ export function listGraphSessionIdsWithPersistedCooperativeCheckpoints() {
   /** @type {{ sessionId: string, savedAt: number }[]} */
   const found = [];
 
-  for (const sessionId of graphSessionIdsForCheckpointScan()) {
+  for (const sessionId of listGraphSessionIdsForCheckpointScan()) {
     const pk = graphPipelineUiStorageKeyForSessionId(sessionId);
     if (!pk) continue;
     let raw = getKvSync(pk);

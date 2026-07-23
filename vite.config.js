@@ -6,8 +6,9 @@ import react from '@vitejs/plugin-react';
 import httpProxy from 'http-proxy';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(__dirname);
 
-/** Match server `MYBRAIN_DEV_PORT_FILE` (e.g. `.dev-backend-port.hf` for dev:hf) when VITE_API_PROXY is unset. */
+/** Match server `MYBRAIN_DEV_PORT_FILE` (MetaSelf-CognitiveStack; e.g. `.dev-backend-port.hf` for dev:hf) when VITE_API_PROXY is unset. */
 function readDevBackendTargetUrl(env) {
   const fileName =
     String(env.MYBRAIN_DEV_PORT_FILE || process.env.MYBRAIN_DEV_PORT_FILE || '.dev-backend-port').trim() ||
@@ -91,7 +92,18 @@ export default defineConfig(({ mode }) => {
    */
   const viteStrictPort = true;
   /** Tailscale/LAN: HMR WebSocket host must not be localhost when the phone uses the tailnet IP. */
-  const hmr = lanHost.length > 0 ? { host: lanHost, protocol: 'ws' } : undefined;
+  const hmrLan = lanHost.length > 0 ? { host: lanHost, protocol: 'ws' } : undefined;
+  /**
+   * HMR is **off by default**. The Vite HMR client reconnects over WS; on Tailscale/LAN that often fails and
+   * triggers a full page reload after a few seconds — killing long SSE / pipelines. Set `VITE_ENABLE_HMR=1`
+   * in `.env` when you want hot reload (refresh manually otherwise after code changes).
+   */
+  const disableHmrLegacy = /^1|true|yes$/i.test(
+    String(env.VITE_DISABLE_HMR || process.env.VITE_DISABLE_HMR || '').trim()
+  );
+  const enableHmr =
+    /^1|true|yes$/i.test(String(env.VITE_ENABLE_HMR || process.env.VITE_ENABLE_HMR || '').trim()) &&
+    !disableHmrLegacy;
   /**
    * Do not set `server.origin` when using DEV_LAN_HOST: it rewrites script/module URLs to the LAN host,
    * which breaks opening the same dev server at http://localhost:5174 (blank app / failed loads).
@@ -99,6 +111,10 @@ export default defineConfig(({ mode }) => {
    */
 
   return {
+    /**
+     * PWA: use `public/manifest.json` + icons + meta in `index.html` only (no service worker).
+     * Workbox precache / navigateFallback has caused blank standalone PWAs with large SPA bundles on iOS WebKit.
+     */
     plugins: [react(), dynamicApiProxyPlugin(env)],
     server: {
       port: DEV_PORT,
@@ -107,7 +123,36 @@ export default defineConfig(({ mode }) => {
       open: true,
       /** Dev: allow any Host (localhost, LAN IP, machine name, *.ts.net, etc.). Vite’s default check otherwise returns 403 for many network URLs. */
       allowedHosts: true,
-      ...(hmr ? { hmr } : {}),
+      ...(enableHmr ? (hmrLan ? { hmr: hmrLan } : {}) : { hmr: false }),
+      /**
+       * With `hmr: false` (default), any watched file change still triggers a **full page reload**.
+       * - Ignore the Express `server/` tree: `nodemon` touches files constantly; the UI bundle does not import it.
+       * - `awaitWriteFinish` avoids reload storms from editors that save in multiple passes (Windows / formatters).
+       * - Absolute paths help Windows chokidar reliably skip `.data` / port files.
+       */
+      watch: {
+        ignored: [
+          path.join(repoRoot, '.data'),
+          path.join(repoRoot, 'server'),
+          path.join(repoRoot, '.dev-backend-port'),
+          path.join(repoRoot, '.dev-backend-port.hf'),
+          '**/.data/**',
+          '**/server/**',
+          '**/.dev-backend-port',
+          '**/.dev-backend-port.hf',
+          '**/.env',
+          '**/.env.*',
+          '**/.cursor/**',
+          '**/.git/**',
+          '**/coverage/**',
+          '**/dist/**',
+          '**/.vite/**',
+        ],
+        awaitWriteFinish: {
+          stabilityThreshold: 700,
+          pollInterval: 120,
+        },
+      },
     },
     preview: {
       port: PREVIEW_PORT,

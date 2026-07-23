@@ -14,6 +14,20 @@ export const SCHEDULER_DASHBOARD_PIPELINE_TASK_TYPES = new Set([
   'goal_pursuit',
 ]);
 
+/** Paused tasks that can be resumed from a cooperative checkpoint (keep in sync with resume switch in scheduledTaskRunner). */
+export const RESUMABLE_PAUSED_GRAPH_TYPES = new Set([
+  'pipeline_run',
+  'pipeline_classic',
+  'consciousness_stream',
+  'supervisor_pipeline_rerun',
+  'metacognition_pipeline_rerun',
+  'metacognition_review',
+  'belief_tension_review',
+  'diagnostic',
+  'curiosity_pursuit',
+  'goal_pursuit',
+]);
+
 const listeners = new Set();
 
 /**
@@ -25,9 +39,24 @@ const listeners = new Set();
  *   run_started_at: string,
  *   target_curiosity_id: string,
  *   target_goal_id: string,
+ *   mind_storage_profile: string,
  * }>}
  */
 let cachedRunningPipelineTasks = [];
+
+/**
+ * @type {Array<{
+ *   id: string,
+ *   task_type: string,
+ *   reason: string,
+ *   input_text: string,
+ *   run_started_at: string,
+ *   target_curiosity_id: string,
+ *   target_goal_id: string,
+ *   mind_storage_profile: string,
+ * }>}
+ */
+let cachedPausedPipelineTasks = [];
 
 function emit() {
   listeners.forEach((l) => l());
@@ -41,6 +70,11 @@ export function subscribeDashboardScheduledRunningSync(listener) {
 /** Synchronous read for {@link buildDashboardActiveWorkRows} / useSyncExternalStore — all running pipeline-shaped tasks. */
 export function getDashboardScheduledRunningFromDbCache() {
   return cachedRunningPipelineTasks;
+}
+
+/** Synchronous read — paused cooperative-checkpoint pipeline tasks (still shown under Active pipelines). */
+export function getDashboardScheduledPausedFromDbCache() {
+  return cachedPausedPipelineTasks;
 }
 
 function normalizedStatus(st) {
@@ -70,6 +104,7 @@ function rowSnapshot(t) {
     run_started_at: typeof t.run_started_at === 'string' ? t.run_started_at : '',
     target_curiosity_id: typeof tc === 'string' ? tc.trim() : '',
     target_goal_id: typeof tg === 'string' ? tg.trim() : '',
+    mind_storage_profile: typeof t.mind_storage_profile === 'string' ? t.mind_storage_profile : '',
   };
 }
 
@@ -85,12 +120,17 @@ function runningRowsEqual(a, b) {
       x.input_text !== y.input_text ||
       x.run_started_at !== y.run_started_at ||
       x.target_curiosity_id !== y.target_curiosity_id ||
-      x.target_goal_id !== y.target_goal_id
+      x.target_goal_id !== y.target_goal_id ||
+      x.mind_storage_profile !== y.mind_storage_profile
     ) {
       return false;
     }
   }
   return true;
+}
+
+function pausedRowsEqual(a, b) {
+  return runningRowsEqual(a, b);
 }
 
 /**
@@ -101,14 +141,29 @@ function runningRowsEqual(a, b) {
 export async function syncDashboardScheduledRunningFromDb() {
   try {
     const all = await ScheduledTask.listAll('-created_date');
-    const next = all
+    const nextRunning = all
       .filter((t) => normalizedStatus(t.status) === 'running' && isPipelineSchedulerType(t.task_type))
       .map(rowSnapshot)
       .sort((a, b) => a.run_started_at.localeCompare(b.run_started_at) || a.id.localeCompare(b.id));
 
-    if (runningRowsEqual(next, cachedRunningPipelineTasks)) return;
+    const nextPaused = all
+      .filter(
+        (t) =>
+          normalizedStatus(t.status) === 'paused' &&
+          RESUMABLE_PAUSED_GRAPH_TYPES.has(String(t.task_type || ''))
+      )
+      .map(rowSnapshot)
+      .sort((a, b) => a.run_started_at.localeCompare(b.run_started_at) || a.id.localeCompare(b.id));
 
-    cachedRunningPipelineTasks = next;
+    if (
+      runningRowsEqual(nextRunning, cachedRunningPipelineTasks) &&
+      pausedRowsEqual(nextPaused, cachedPausedPipelineTasks)
+    ) {
+      return;
+    }
+
+    cachedRunningPipelineTasks = nextRunning;
+    cachedPausedPipelineTasks = nextPaused;
     emit();
   } catch (e) {
     console.warn('[dashboardScheduledRunningSync] sync failed', e);

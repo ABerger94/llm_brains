@@ -19,4 +19,24 @@ export const SelfLedgerRevision = localStorageService.entities.SelfLedgerRevisio
 export const BeliefTension = localStorageService.entities.BeliefTension;
 export const UserModelSnapshot = localStorageService.entities.UserModelSnapshot;
 export const ConsolidationDigest = localStorageService.entities.ConsolidationDigest;
+export const PendingMindUpdate = localStorageService.entities.PendingMindUpdate;
 export const ExecutionLog = localStorageService.entities.ExecutionLog;
+
+/** Playground mirror mind (System B) — separate IndexedDB entity namespaces. */
+export const MirrorBeliefStore = localStorageService.entitiesMirror.BeliefStore;
+export const MirrorPipelineRun = localStorageService.entitiesMirror.PipelineRun;
+export const MirrorMindBiography = localStorageService.entitiesMirror.MindBiography;
+export const MirrorWorldModel = localStorageService.entitiesMirror.WorldModel;
+export const MirrorCuriosityItem = localStorageService.entitiesMirror.CuriosityItem;
+export const MirrorGoalItem = localStorageService.entitiesMirror.GoalItem;
+export const MirrorTemporalEvent = localStorageService.entitiesMirror.TemporalEvent;
+export const MirrorConversationMessage = localStorageService.entitiesMirror.ConversationMessage;
+export const MirrorEmergenceEvent = localStorageService.entitiesMirror.EmergenceEvent;
+export const MirrorLongTermMemory = localStorageService.entitiesMirror.LongTermMemory;
+export const MirrorSelfLedgerRevision = localStorageService.entitiesMirror.SelfLedgerRevision;
+export const MirrorBeliefTension = localStorageService.entitiesMirror.BeliefTension;
+export const MirrorUserModelSnapshot = localStorageService.entitiesMirror.UserModelSnapshot;
+export const MirrorConsolidationDigest = localStorageService.entitiesMirror.ConsolidationDigest;
+export const MirrorFeedbackItem = localStorageService.entitiesMirror.FeedbackItem;
+export const MirrorDreamRun = localStorageService.entitiesMirror.DreamRun;
+export const MirrorPendingMindUpdate = localStorageService.entitiesMirror.PendingMindUpdate;

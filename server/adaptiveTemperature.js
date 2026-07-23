@@ -9,6 +9,37 @@ function adaptiveTemperatureDisabled() {
   return v === '1' || v === 'true' || v === 'yes';
 }
 
+function parseCriticalModuleSet() {
+  const raw = String(process.env.ADAPTIVE_TEMP_CRITICAL_MODULES || '').trim();
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+}
+
+let _criticalModuleCache = null;
+function criticalModuleSet() {
+  if (!_criticalModuleCache) {
+    _criticalModuleCache = parseCriticalModuleSet();
+  }
+  return _criticalModuleCache;
+}
+
+/** Clear cached ADAPTIVE_TEMP_CRITICAL_MODULES parse (e.g. after tests change env). */
+export function resetAdaptiveTemperaturePolicyCache() {
+  _criticalModuleCache = null;
+}
+
+/** @returns {number} */
+function criticalModuleCap() {
+  const v = parseFloat(String(process.env.ADAPTIVE_TEMP_CRITICAL_CAP || '').trim());
+  if (Number.isFinite(v) && v > 0 && v <= 2) return v;
+  return 0.45;
+}
+
 const MODULE_FIXED_TEMPS = new Set([
   '__map_ingest',
   '__merge_reasoning',
@@ -18,10 +49,11 @@ const MODULE_FIXED_TEMPS = new Set([
 /**
  * Resolve adaptive temperature from shared memory interoception.
  * @param {object} sharedMemory
- * @param {{ temperature?: number, _fixedTemp?: boolean }} [moduleDefaults]
+ * @param {{ temperature?: number, _fixedTemp?: boolean, minAdaptiveTemp?: number, maxAdaptiveTemp?: number }} [moduleDefaults]
+ * @param {string} [moduleName] - Used with ADAPTIVE_TEMP_CRITICAL_MODULES to cap exploration on user-critical modules.
  * @returns {number}
  */
-export function resolveAdaptiveTemperature(sharedMemory, moduleDefaults = {}) {
+export function resolveAdaptiveTemperature(sharedMemory, moduleDefaults = {}, moduleName = '') {
   const base = moduleDefaults.temperature ?? 0.55;
 
   if (adaptiveTemperatureDisabled() || moduleDefaults._fixedTemp) {
@@ -53,6 +85,22 @@ export function resolveAdaptiveTemperature(sharedMemory, moduleDefaults = {}) {
     case 'wake':
       t -= 0.02;
       break;
+  }
+
+  t = Math.round(Math.min(1.2, Math.max(0.15, t)) * 100) / 100;
+
+  const minT = moduleDefaults.minAdaptiveTemp;
+  const maxT = moduleDefaults.maxAdaptiveTemp;
+  if (typeof minT === 'number' && Number.isFinite(minT)) {
+    t = Math.max(t, minT);
+  }
+  if (typeof maxT === 'number' && Number.isFinite(maxT)) {
+    t = Math.min(t, maxT);
+  }
+
+  const mod = String(moduleName || '').trim();
+  if (mod && criticalModuleSet().has(mod)) {
+    t = Math.min(t, criticalModuleCap());
   }
 
   return Math.round(Math.min(1.2, Math.max(0.15, t)) * 100) / 100;

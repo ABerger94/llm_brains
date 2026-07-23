@@ -46,6 +46,7 @@ module.exports = {
         sans: ['ui-sans-serif', 'system-ui', 'sans-serif'],
         mono: ['ui-monospace', 'SFMono-Regular', 'monospace'],
       },
+      
     },
   },
   plugins: [],

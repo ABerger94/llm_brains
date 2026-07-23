@@ -10,7 +10,7 @@ import {
 } from './dashboardPauseAllAckStore';
 import {
   notifyCooperativePauseRequestOutcome,
-  pauseAllDispatchReachedBackendOrBroadcast,
+  pauseAllDashboardSettlementEligible,
   runCooperativePauseAllForThisTab,
 } from './cooperativePauseAllDashboard';
 
@@ -25,9 +25,9 @@ const COMPLETE_FLASH_MS = 6000;
  *
  * @param {object} input
  * @param {number} input.activeRowCount — `rows.length` from {@link getDashboardActiveWorkSnapshot}
- * @param {boolean} input.resumeAllPipelinesBusy — disables pause while Resume all runs; clears settlement when true
+ * @param {boolean} input.loadSavedPipelinesBusy — disables pause while Load saved runs; clears settlement when true
  */
-export function useDashboardPauseAllSettlement({ activeRowCount, resumeAllPipelinesBusy }) {
+export function useDashboardPauseAllSettlement({ activeRowCount, loadSavedPipelinesBusy }) {
   const ui = useSyncExternalStore(
     subscribeDashboardPauseAllUi,
     getDashboardPauseAllUiSnapshot,
@@ -48,13 +48,13 @@ export function useDashboardPauseAllSettlement({ activeRowCount, resumeAllPipeli
   const isCompleteFlash = pauseSettlementPhase === PAUSE_SETTLEMENT_COMPLETE_FLASH;
 
   useEffect(() => {
-    if (!resumeAllPipelinesBusy) return;
+    if (!loadSavedPipelinesBusy) return;
     if (completeFlashTimerRef.current) {
       clearTimeout(completeFlashTimerRef.current);
       completeFlashTimerRef.current = null;
     }
     resetDashboardPauseAllUi();
-  }, [resumeAllPipelinesBusy]);
+  }, [loadSavedPipelinesBusy]);
 
   useEffect(() => {
     if (
@@ -100,8 +100,7 @@ export function useDashboardPauseAllSettlement({ activeRowCount, resumeAllPipeli
     try {
       const { request, appended } = await runCooperativePauseAllForThisTab();
       notifyCooperativePauseRequestOutcome(request);
-      const dispatchOk = pauseAllDispatchReachedBackendOrBroadcast(request);
-      if (hadRowsAtPauseClickRef.current && dispatchOk) {
+      if (pauseAllDashboardSettlementEligible(request, hadRowsAtPauseClickRef.current)) {
         setDashboardPauseAllSucceededAck(true);
         setDashboardPauseSettlementPhase(PAUSE_SETTLEMENT_WAITING);
       } else if (appended) {
@@ -121,11 +120,11 @@ export function useDashboardPauseAllSettlement({ activeRowCount, resumeAllPipeli
 
   const pauseButtonTitle = isWaitingSettle
     ? 'Waiting for pipelines to finish: cooperative pause applies after each current module completes; checkpoints save when each run stops.'
-    : 'Notifies other MyBrain tabs, then requests pause on hooks in this tab. Pipelines stop after the current LLM module completes (not instant), then save checkpoints.';
+    : 'Notifies every open app tab (same origin), then POSTs pause for hooks registered in this tab. Other tabs POST their own hooks. Pipelines stop after the current LLM module completes (not instant), then save checkpoints.';
 
   const resumeButtonTitle = isCompleteFlash
-    ? 'All pipelines saved in this tab; you can resume from checkpoints or paused pursuits.'
-    : 'Resume interactive graph from a saved cooperative checkpoint (if any), and restart curiosity/goal graph pursuits that were interrupted by reload or left paused mid-stack (after import or reload).';
+    ? 'All pipelines saved in this tab; use Load saved if needed, then Resume on each card.'
+    : 'Merges saved curiosity/goal pursuit slots from storage and refreshes the list so cooperative-pause pipelines appear. Does not start runs — use Resume on each card to continue from the last checkpoint.';
 
   return {
     pauseAllBusy,

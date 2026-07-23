@@ -6,6 +6,7 @@ import {
   appendCooperativePauseAllRequestedToExecutionLogs,
   cooperativePauseAnyRequestOk,
 } from './pipelinePauseAllExecutionLogs';
+import { setDashboardPauseAllSucceededAck } from './dashboardPauseAllAckStore';
 import { requestCooperativePauseForAllRegisteredTokens } from './pipelineActiveRunRegistry';
 
 const CHANNEL_NAME = 'yourbrain-cooperative-pause-v1';
@@ -21,6 +22,7 @@ function onChannelMessage(ev) {
     const r = await requestCooperativePauseForAllRegisteredTokens();
     if (cooperativePauseAnyRequestOk(r)) {
       appendCooperativePauseAllRequestedToExecutionLogs();
+      setDashboardPauseAllSucceededAck(true);
     }
   })();
 }

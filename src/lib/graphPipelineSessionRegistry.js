@@ -1,5 +1,6 @@
 import { flushKvWrites, getKvSync, kvRefreshKeysFromDb, removeKvSync, setKvSync } from './browserStorage';
 import { DEFAULT_GRAPH_SESSION_ID } from './graphPipelineSessionScope';
+import { normalizeScheduledTaskMindStorageProfile } from './mindEntityContext';
 
 const LAST_OPENED_SESSION_KEY = 'mybrain_graph_last_session_v1';
 
@@ -63,14 +64,16 @@ export function ensureDefaultGraphPipelineSessionInRegistry() {
 /**
  * Create a new session id, add it to the registry, set last-opened, and return the id.
  * Caller should navigate to `/graph-pipeline/${encodeURIComponent(id)}`.
+ * @param {{ mindStorageProfile?: string }} [opts] - primary vs mirror mind for this workspace
  * @returns {string}
  */
-export function prepareNewGraphPipelineSession() {
+export function prepareNewGraphPipelineSession(opts = {}) {
   const id = createGraphPipelineSessionId();
   upsertGraphPipelineSession({
     id,
     label: NEW_GRAPH_PIPELINE_SESSION_LABEL,
     isProcessing: false,
+    mindStorageProfile: normalizeScheduledTaskMindStorageProfile(opts.mindStorageProfile),
   });
   setLastOpenedGraphPipelineSessionId(id);
   return id;
@@ -126,7 +129,8 @@ export function isGenericGraphSessionLabel(lab) {
  *   threadRootLabel?: string,
  *   createdAt: number,
  *   updatedAt: number,
- *   isProcessing?: boolean
+ *   isProcessing?: boolean,
+ *   mindStorageProfile?: string
  * }} GraphSessionRow */
 
 /** Stable empty list for SSR and empty registry — `useSyncExternalStore` requires referentially stable snapshots when data is unchanged. */
@@ -149,6 +153,19 @@ function readRegistryRaw() {
   }
 }
 
+/**
+ * Raw registry row for the session id (includes optional `mindStorageProfile`), or null.
+ * @param {string | null | undefined} sessionId
+ * @returns {object | null}
+ */
+export function findGraphSessionRegistryRowRaw(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const rows = readRegistryRaw();
+  const row = rows.find((r) => r && String(r.id).trim() === sid);
+  return row && typeof row === 'object' ? row : null;
+}
+
 function writeRegistry(rows) {
   if (typeof window === 'undefined') return;
   try {
@@ -166,6 +183,69 @@ function writeRegistry(rows) {
   } catch {
     /* BroadcastChannel unsupported */
   }
+}
+
+/**
+ * Merge registry fields for upsert/patch. When the pipeline updates `label` to the latest run topic,
+ * preserve a non-generic workspace title that previously lived only in `label` (empty `threadRootLabel`)
+ * by promoting it to `threadRootLabel` before overwriting `label`.
+ * @param {Partial<GraphSessionRow> & { id: string, seedFirstThreadLabel?: boolean }} partial
+ * @param {object} prev
+ * @param {string} id
+ * @param {number} now
+ */
+function mergeGraphSessionPartialIntoRow(partial, prev, id, now) {
+  const prevLabel =
+    typeof prev.label === 'string' ? prev.label : id === DEFAULT_GRAPH_SESSION_ID ? 'Default' : 'Graph session';
+  const incomingLabel = typeof partial.label === 'string' ? partial.label : null;
+  const prevTrRaw = typeof prev.threadRootLabel === 'string' ? String(prev.threadRootLabel).trim() : '';
+
+  let threadRootLabel = prevTrRaw;
+
+  if (
+    typeof partial.threadRootLabel !== 'string' &&
+    !threadRootLabel &&
+    prevLabel &&
+    !isGenericGraphSessionLabel(prevLabel) &&
+    incomingLabel != null &&
+    incomingLabel !== prevLabel
+  ) {
+    threadRootLabel = prevLabel.trim().slice(0, 160);
+  }
+
+  const nextLabel = incomingLabel !== null ? incomingLabel : prevLabel;
+
+  if (typeof partial.threadRootLabel === 'string') {
+    threadRootLabel = partial.threadRootLabel.trim().slice(0, 160);
+  } else if (partial.seedFirstThreadLabel === true) {
+    const lab = String(nextLabel || '').trim();
+    if (!threadRootLabel && lab && !isGenericGraphSessionLabel(lab)) {
+      threadRootLabel = lab.slice(0, 160);
+    }
+  }
+
+  const createdAt = Number(prev.createdAt) || now;
+  const isProcessing =
+    typeof partial.isProcessing === 'boolean' ? partial.isProcessing : Boolean(prev.isProcessing);
+
+  let mindStorageProfile = prev.mindStorageProfile;
+  if (Object.prototype.hasOwnProperty.call(partial, 'mindStorageProfile')) {
+    mindStorageProfile = normalizeScheduledTaskMindStorageProfile(partial.mindStorageProfile);
+  }
+  const profileKey =
+    mindStorageProfile != null && String(mindStorageProfile).trim() !== ''
+      ? normalizeScheduledTaskMindStorageProfile(mindStorageProfile)
+      : null;
+
+  return {
+    id,
+    label: nextLabel,
+    threadRootLabel,
+    createdAt,
+    updatedAt: now,
+    isProcessing,
+    ...(profileKey ? { mindStorageProfile: profileKey } : {}),
+  };
 }
 
 /** @returns {GraphSessionRow[]} */
@@ -187,6 +267,9 @@ export function getGraphPipelineSessionRegistry() {
       createdAt: Number(r.createdAt) || 0,
       updatedAt: Number(r.updatedAt) || 0,
       isProcessing: Boolean(r.isProcessing),
+      ...(r.mindStorageProfile != null && String(r.mindStorageProfile).trim()
+        ? { mindStorageProfile: normalizeScheduledTaskMindStorageProfile(r.mindStorageProfile) }
+        : {}),
     }))
     .sort((a, b) => b.updatedAt - a.updatedAt);
   registrySnapshotCache = rows.length ? rows : EMPTY_REGISTRY_SNAPSHOT;
@@ -204,27 +287,7 @@ export function upsertGraphPipelineSession(partial) {
   const now = Date.now();
   const idx = rows.findIndex((r) => r && String(r.id).trim() === id);
   const prev = idx >= 0 ? rows[idx] : {};
-  const prevLabel =
-    typeof prev.label === 'string' ? prev.label : id === DEFAULT_GRAPH_SESSION_ID ? 'Default' : 'Graph session';
-  const nextLabel = typeof partial.label === 'string' ? partial.label : prevLabel;
-  const prevTrRaw = typeof prev.threadRootLabel === 'string' ? String(prev.threadRootLabel).trim() : '';
-  let threadRootLabel = prevTrRaw;
-  if (typeof partial.threadRootLabel === 'string') {
-    threadRootLabel = partial.threadRootLabel.trim().slice(0, 160);
-  } else if (partial.seedFirstThreadLabel === true) {
-    const lab = String(nextLabel || '').trim();
-    if (!prevTrRaw && lab && !isGenericGraphSessionLabel(lab)) {
-      threadRootLabel = lab.slice(0, 160);
-    }
-  }
-  const next = {
-    id,
-    label: nextLabel,
-    threadRootLabel,
-    createdAt: Number(prev.createdAt) || now,
-    updatedAt: now,
-    isProcessing: typeof partial.isProcessing === 'boolean' ? partial.isProcessing : Boolean(prev.isProcessing),
-  };
+  const next = mergeGraphSessionPartialIntoRow(partial, prev, id, now);
   if (idx >= 0) rows[idx] = next;
   else rows.push({ ...next, createdAt: now });
   writeRegistry(rows);
@@ -244,27 +307,7 @@ export function patchGraphPipelineSessionIfInRegistry(partial) {
   if (idx < 0) return false;
   const prev = rows[idx];
   const now = Date.now();
-  const prevLabel =
-    typeof prev.label === 'string' ? prev.label : id === DEFAULT_GRAPH_SESSION_ID ? 'Default' : 'Graph session';
-  const nextLabel = typeof partial.label === 'string' ? partial.label : prevLabel;
-  const prevTrRaw = typeof prev.threadRootLabel === 'string' ? String(prev.threadRootLabel).trim() : '';
-  let threadRootLabel = prevTrRaw;
-  if (typeof partial.threadRootLabel === 'string') {
-    threadRootLabel = partial.threadRootLabel.trim().slice(0, 160);
-  } else if (partial.seedFirstThreadLabel === true) {
-    const lab = String(nextLabel || '').trim();
-    if (!prevTrRaw && lab && !isGenericGraphSessionLabel(lab)) {
-      threadRootLabel = lab.slice(0, 160);
-    }
-  }
-  const next = {
-    id,
-    label: nextLabel,
-    threadRootLabel,
-    createdAt: Number(prev.createdAt) || now,
-    updatedAt: now,
-    isProcessing: typeof partial.isProcessing === 'boolean' ? partial.isProcessing : Boolean(prev.isProcessing),
-  };
+  const next = mergeGraphSessionPartialIntoRow(partial, prev, id, now);
   rows[idx] = next;
   writeRegistry(rows);
   return true;

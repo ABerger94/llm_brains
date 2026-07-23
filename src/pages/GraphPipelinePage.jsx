@@ -1,32 +1,55 @@
-import { useEffect, useLayoutEffect, useState, useSyncExternalStore } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { Link, Navigate, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { ArrowLeft, ChevronRight, GitBranch, PanelLeftClose, PanelLeftOpen, Plus } from 'lucide-react';
+import { ArrowLeft, ChevronRight, GitBranch, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import GraphPipelineExecutionPanel from '../components/pipeline/GraphPipelineExecutionPanel';
 import GraphPipelineInteractiveControls from '../components/pipeline/GraphPipelineInteractiveControls';
+import GraphPipelineStreamResumeBanners from '../components/pipeline/GraphPipelineStreamResumeBanners';
 import GraphPipelineInspector from '../components/graphPipeline/GraphPipelineInspector';
 import GraphSessionLabelInline from '../components/graphPipeline/GraphSessionLabelInline';
+import PageShell from '../components/PageShell';
 import { Button } from '../components/ui';
-import { cn } from '../lib/utils';
 import {
+  isSessionPipelineLive,
   rehydrateGraphPipelineSessionStores,
   resetGraphPipelineSessionStoresAfterLeavingWorkspace,
 } from '../lib/graphPipelineSessionHydrate';
 import {
   getGraphPipelineSessionRegistry,
-  prepareNewGraphPipelineSession,
   registerOpenGraphPipelineWorkspace,
   subscribeGraphPipelineRegistry,
+  upsertGraphPipelineSession,
 } from '../lib/graphPipelineSessionRegistry';
-import { DEFAULT_GRAPH_SESSION_ID } from '../lib/graphPipelineSessionScope';
+import NewGraphWorkspaceControl from '../components/graphPipeline/NewGraphWorkspaceControl';
+import {
+  DEFAULT_GRAPH_SESSION_ID,
+  getGraphPipelineSessionId,
+  subscribeGraphPipelineSessionId,
+} from '../lib/graphPipelineSessionScope';
+import {
+  getPlaygroundOrchestrationDepthSnapshot,
+  PLAYGROUND_GRAPH_SESSION_A,
+  PLAYGROUND_GRAPH_SESSION_B,
+  subscribePlaygroundOrchestration,
+} from '../lib/playgroundDualGraphRunner';
 import { healGraphRegistryWhenPersistSaysIdle } from '../lib/graphSessionStaleRunningHeal';
+import {
+  graphPathMirrorSessionIdFromPathname,
+  graphPipelineWorkspaceHref,
+  graphPipelineWorkspaceMindProfileFromLocation,
+  setGraphWorkspaceMindSessionStorage,
+} from '../lib/graphSessionMindProfile';
+import { MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR, MIND_STORAGE_PROFILE_PRIMARY } from '../lib/mindEntityContext';
 import { graphPipelineStore, subscribeGraphPipeline } from '../lib/graphPipelineStore';
 import { consciousnessStreamStore, subscribeConsciousnessStream } from '../lib/consciousnessStreamStore';
+import { cn } from '../lib/utils';
 
 function SessionSelectDropdown({ sessionId, sessions, onSessionSelect }) {
   return (
     <div className="flex items-center gap-1.5 rounded-lg border border-input bg-background px-1">
       <GitBranch className="ml-1.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
-      <label className="sr-only" htmlFor="graph-session-select">Active session</label>
+      <label className="sr-only" htmlFor="graph-session-select">
+        Active session
+      </label>
       <select
         id="graph-session-select"
         value={sessionId}
@@ -35,15 +58,16 @@ function SessionSelectDropdown({ sessionId, sessions, onSessionSelect }) {
       >
         {!sessions.some((s) => s.id === sessionId) ? (
           <option value={sessionId}>
-            {sessionId === DEFAULT_GRAPH_SESSION_ID ? 'Default' : sessionId.slice(0, 14)}...
+            {sessionId === DEFAULT_GRAPH_SESSION_ID ? 'Default' : `${sessionId.slice(0, 14)}…`}
           </option>
         ) : null}
         {sessions.map((s) => {
           const label = String(s.threadRootLabel || s.label || '').trim();
-          const display = label ? label.slice(0, 40) : s.id.slice(0, 14) + '...';
+          const display = label ? label.slice(0, 40) : `${s.id.slice(0, 14)}…`;
           return (
             <option key={s.id} value={s.id}>
-              {display}{s.isProcessing ? ' \u00b7 running' : ''}
+              {display}
+              {s.isProcessing ? ' · running' : ''}
             </option>
           );
         })}
@@ -52,22 +76,29 @@ function SessionSelectDropdown({ sessionId, sessions, onSessionSelect }) {
   );
 }
 
+/**
+ * Graph workspace: one URL session id, one “pipeline” session id (may differ during System Chat),
+ * and one mind profile for runs — always derived from {@link graphPipelineWorkspaceMindProfileFromLocation}
+ * using the **pipeline** session id so System A/B matches what `startConsciousnessStreamRun` persists.
+ */
 export default function GraphPipelinePage() {
   const location = useLocation();
   const navigate = useNavigate();
-  const { sessionId: rawSessionId } = useParams();
-  const sessionId = String(rawSessionId || '').trim();
+  const { sessionId: routeSessionIdRaw } = useParams();
+  const routeSessionId = String(routeSessionIdRaw || '').trim();
   const [searchParams, setSearchParams] = useSearchParams();
   const schedulerFocusParam = searchParams.get('schedulerFocus');
+
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [inspectorTab, setInspectorTab] = useState(() => {
     try {
       const t = new URLSearchParams(window.location.search).get('tab');
-      if (t === 'scheduled' || t === 'sessions' || t === 'context' || t === 'graph' || t === 'execution') return t;
+      if (t === 'execution') return 'graph';
+      if (t === 'scheduled' || t === 'sessions' || t === 'context' || t === 'graph') return t;
     } catch {
       /* ignore */
     }
-    return 'execution';
+    return 'graph';
   });
 
   const sessions = useSyncExternalStore(
@@ -87,21 +118,99 @@ export default function GraphPipelinePage() {
     () => consciousnessStreamStore.getState()
   );
 
+  const boundGraphSessionId = useSyncExternalStore(
+    subscribeGraphPipelineSessionId,
+    getGraphPipelineSessionId,
+    getGraphPipelineSessionId
+  );
+  const orchestrationDepth = useSyncExternalStore(
+    subscribePlaygroundOrchestration,
+    getPlaygroundOrchestrationDepthSnapshot,
+    getPlaygroundOrchestrationDepthSnapshot
+  );
+
+  const boundPlaygroundSession =
+    boundGraphSessionId === PLAYGROUND_GRAPH_SESSION_A || boundGraphSessionId === PLAYGROUND_GRAPH_SESSION_B;
+  const playgroundPipelineStillLive =
+    isSessionPipelineLive(PLAYGROUND_GRAPH_SESSION_A) || isSessionPipelineLive(PLAYGROUND_GRAPH_SESSION_B);
+  const playgroundRunLocksWorkspace =
+    boundPlaygroundSession && (orchestrationDepth > 0 || playgroundPipelineStillLive);
+
+  /** KV + composer + runs: playground may temporarily own the interactive pipeline. */
+  const pipelineSessionId =
+    playgroundRunLocksWorkspace && boundGraphSessionId ? boundGraphSessionId : routeSessionId;
+
+  /** Single mind profile for badges, chrome, and `startConsciousnessStreamRun` (must use pipelineSessionId). */
+  const mindProfile = graphPipelineWorkspaceMindProfileFromLocation(pipelineSessionId, location.pathname);
+  const isSystemB = mindProfile === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR;
+
+  const showSystemChatRouteHint = Boolean(
+    playgroundRunLocksWorkspace && boundGraphSessionId && routeSessionId && boundGraphSessionId !== routeSessionId
+  );
+  const showPlaygroundResumeStrip =
+    pipelineSessionId === PLAYGROUND_GRAPH_SESSION_A || pipelineSessionId === PLAYGROUND_GRAPH_SESSION_B;
+
+  const mirrorPathSessionId = graphPathMirrorSessionIdFromPathname(location.pathname);
+  const routeMirrorUrlMatches = mirrorPathSessionId != null && mirrorPathSessionId === routeSessionId;
+
+  const orchestrationDepthPrevRef = useRef(null);
+
   useLayoutEffect(() => {
-    if (!sessionId) return undefined;
-    rehydrateGraphPipelineSessionStores(sessionId);
-    registerOpenGraphPipelineWorkspace(sessionId);
+    if (!routeSessionId) return undefined;
+    rehydrateGraphPipelineSessionStores(routeSessionId);
+    registerOpenGraphPipelineWorkspace(routeSessionId);
     return () => {
-      resetGraphPipelineSessionStoresAfterLeavingWorkspace(sessionId);
+      resetGraphPipelineSessionStoresAfterLeavingWorkspace(routeSessionId);
     };
-  }, [sessionId]);
+  }, [routeSessionId]);
+
+  /** Registry + sessionStorage mirror primary for the **route** workspace (MindScope + new workspace). */
+  useLayoutEffect(() => {
+    const sid = routeSessionId;
+    if (!sid || sid === 'scheduled' || sid === 'run' || sid === 'mirror') return;
+
+    if (sid === PLAYGROUND_GRAPH_SESSION_B) {
+      if (routeMirrorUrlMatches) {
+        setGraphWorkspaceMindSessionStorage(sid, MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR);
+        upsertGraphPipelineSession({ id: sid, mindStorageProfile: MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR });
+      }
+      return;
+    }
+    if (sid === PLAYGROUND_GRAPH_SESSION_A) {
+      if (!routeMirrorUrlMatches) {
+        setGraphWorkspaceMindSessionStorage(sid, MIND_STORAGE_PROFILE_PRIMARY);
+        upsertGraphPipelineSession({ id: sid, mindStorageProfile: MIND_STORAGE_PROFILE_PRIMARY });
+      }
+      return;
+    }
+
+    if (routeMirrorUrlMatches) {
+      setGraphWorkspaceMindSessionStorage(sid, MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR);
+      upsertGraphPipelineSession({ id: sid, mindStorageProfile: MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR });
+    } else {
+      setGraphWorkspaceMindSessionStorage(sid, MIND_STORAGE_PROFILE_PRIMARY);
+      upsertGraphPipelineSession({ id: sid, mindStorageProfile: MIND_STORAGE_PROFILE_PRIMARY });
+    }
+  }, [routeSessionId, routeMirrorUrlMatches]);
+
+  useLayoutEffect(() => {
+    if (!routeSessionId) return;
+    const prev = orchestrationDepthPrevRef.current;
+    orchestrationDepthPrevRef.current = orchestrationDepth;
+    if (prev != null && prev > 0 && orchestrationDepth === 0) {
+      rehydrateGraphPipelineSessionStores(routeSessionId);
+    }
+  }, [routeSessionId, orchestrationDepth]);
 
   useLayoutEffect(() => {
     const h = (location.hash || '').replace(/^#/, '');
     if (h !== 'graph-pipeline-bottom' && h !== 'graph-pipeline-anchor') return;
-    document.getElementById('graph-pipeline-bottom')?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-    const path = `${location.pathname}${location.search || ''}`;
-    navigate(path, { replace: true });
+    try {
+      document.getElementById('graph-pipeline-bottom')?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    } catch {
+      /* iOS */
+    }
+    navigate(`${location.pathname}${location.search || ''}`, { replace: true });
   }, [location.hash, location.pathname, location.search, navigate]);
 
   useLayoutEffect(() => {
@@ -120,14 +229,26 @@ export default function GraphPipelinePage() {
       return;
     }
     navigate(
-      `/graph-pipeline/scheduled/${encodeURIComponent(focusId)}?from=${encodeURIComponent(sessionId)}`,
+      `/graph-pipeline/scheduled/${encodeURIComponent(focusId)}?from=${encodeURIComponent(routeSessionId)}`,
       { replace: true }
     );
-  }, [schedulerFocusParam, sessionId, navigate]);
+  }, [schedulerFocusParam, routeSessionId, navigate, setSearchParams]);
 
   useLayoutEffect(() => {
     const t = searchParams.get('tab');
-    if (t !== 'scheduled' && t !== 'sessions' && t !== 'context' && t !== 'graph' && t !== 'execution') return;
+    if (t === 'execution') {
+      setInspectorTab('graph');
+      setSearchParams(
+        (p) => {
+          const n = new URLSearchParams(p);
+          n.delete('tab');
+          return n;
+        },
+        { replace: true }
+      );
+      return;
+    }
+    if (t !== 'scheduled' && t !== 'sessions' && t !== 'context' && t !== 'graph') return;
     setInspectorTab(t);
     setSearchParams(
       (p) => {
@@ -143,122 +264,200 @@ export default function GraphPipelinePage() {
     healGraphRegistryWhenPersistSaysIdle();
   }, []);
 
-  if (!sessionId) {
+  if (!routeSessionId) {
     return <Navigate to="/graph-pipeline" replace />;
   }
 
   const onSessionSelect = (e) => {
     const next = String(e.target.value || '').trim();
-    if (!next || next === sessionId) return;
-    navigate(`/graph-pipeline/${encodeURIComponent(next)}`);
-  };
-
-  const newWorkspace = () => {
-    const id = prepareNewGraphPipelineSession();
-    navigate(`/graph-pipeline/${encodeURIComponent(id)}`);
+    if (!next || next === routeSessionId) return;
+    navigate(`${graphPipelineWorkspaceHref(next)}${location.search || ''}`);
   };
 
   const runLabel = String(gpSnap.runContextLabel || '').trim();
   const isProcessing = Boolean(gpSnap.isRunning || csSnap.isProcessing);
-
-  const currentSession = sessions.find((x) => x.id === sessionId);
+  const currentSession = sessions.find((x) => x.id === routeSessionId);
+  const workspaceTitle =
+    String(currentSession?.threadRootLabel || currentSession?.label || '').trim() || 'Graph workspace';
 
   return (
-    <div className="scroll-mt-4 flex min-h-0 flex-1 flex-col overflow-x-hidden bg-background">
-      {/* Header */}
-      <div className="shrink-0 border-b border-border bg-card/40 px-4 py-2.5 sm:px-6">
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-2">
-          {/* Breadcrumb row */}
-          <div className="flex items-center gap-1 text-xs text-muted-foreground">
-            <Link
-              to="/graph-pipeline"
-              className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 font-medium transition-colors hover:bg-accent hover:text-accent-foreground"
-            >
-              <ArrowLeft className="h-3 w-3" aria-hidden />
-              All runs
-            </Link>
-            <ChevronRight className="h-3 w-3 text-border" aria-hidden />
-            <span className="truncate font-medium text-foreground">
-              {currentSession?.threadRootLabel || currentSession?.label || 'Workspace'}
+    <PageShell
+      icon={GitBranch}
+      title={workspaceTitle}
+      description="Live stages, execution log, and composer for this graph session. System A (primary) and System B (mirror) use the same UI; mirror workspaces use a red border accent (like active pipeline cards) and /graph-pipeline/mirror/:id."
+      maxWidth="max-w-6xl"
+      fillMain
+      className={cn(
+        isSystemB && 'shadow-[inset_4px_0_0_0_rgba(239,68,68,0.5)] ring-1 ring-inset ring-red-500/25'
+      )}
+      actions={
+        <div className="flex flex-wrap items-center gap-2">
+          <Link
+            to="/graph-pipeline"
+            className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-md border border-input bg-background px-3 text-sm font-medium text-foreground ring-offset-background transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 touch-manipulation"
+          >
+            <ArrowLeft className="h-3.5 w-3.5" aria-hidden />
+            All runs
+          </Link>
+          <NewGraphWorkspaceControl />
+        </div>
+      }
+    >
+      <div className="space-y-4" data-graph-workspace-mind={isSystemB ? 'mirror' : 'primary'}>
+        <div className="flex flex-wrap items-center gap-2 text-xs" style={{ color: 'inherit' }}>
+          <Link
+            to="/graph-pipeline"
+            className="inline-flex items-center gap-1 font-medium underline-offset-2 hover:underline"
+            style={{ color: 'inherit' }}
+          >
+            Sessions
+          </Link>
+          <ChevronRight className="h-3 w-3 opacity-60" aria-hidden />
+          <span className="font-mono text-[11px] opacity-75">{routeSessionId.slice(0, 12)}…</span>
+          {isProcessing ? (
+            <span className="inline-flex items-center gap-1 rounded-full bg-primary px-2 py-0.5 text-[10px] font-medium text-primary-foreground">
+              Running
             </span>
-            {isProcessing ? (
-              <span className="ml-1 inline-flex h-2 w-2 animate-ping rounded-full bg-primary" />
-            ) : null}
-          </div>
-          {/* Toolbar row */}
-          <div className="flex flex-wrap items-center gap-2">
-            <SessionSelectDropdown sessionId={sessionId} sessions={sessions} onSessionSelect={onSessionSelect} />
+          ) : (
+            <span className="text-[10px] opacity-60">Idle</span>
+          )}
+        </div>
+
+        <div
+          className={cn(
+            'flex flex-col gap-3 rounded-xl border p-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:p-4',
+            isSystemB ? 'border-red-500/40' : 'border-border'
+          )}
+          style={{ backgroundColor: 'var(--card, white)', color: 'inherit' }}
+        >
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <SessionSelectDropdown
+              sessionId={routeSessionId}
+              sessions={sessions}
+              onSessionSelect={onSessionSelect}
+            />
+            <span
+              className={
+                isSystemB
+                  ? 'rounded-full border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-800 dark:text-red-200'
+                  : 'rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[10px] font-medium text-muted-foreground'
+              }
+              title="Mind store used for this pipeline binding (System Chat may bind playground A/B while the URL shows another workspace)."
+            >
+              {isSystemB ? 'System B (mirror)' : 'System A (primary)'}
+            </span>
             <GraphSessionLabelInline
-              sessionId={sessionId}
+              sessionId={routeSessionId}
               label={currentSession?.label}
               threadRootLabel={currentSession?.threadRootLabel}
               compact
             />
-            <div className="ml-auto flex items-center gap-2">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="hidden h-8 gap-1 text-xs text-muted-foreground lg:inline-flex"
-                onClick={() => setInspectorOpen((v) => !v)}
-                aria-label={inspectorOpen ? 'Hide inspector' : 'Show inspector'}
-              >
-                {inspectorOpen ? (
-                  <PanelLeftClose className="h-3.5 w-3.5" aria-hidden />
-                ) : (
-                  <PanelLeftOpen className="h-3.5 w-3.5" aria-hidden />
-                )}
-                <span>{inspectorOpen ? 'Hide inspector' : 'Inspector'}</span>
-              </Button>
-              <Button type="button" size="sm" className="h-8 gap-1 text-xs" onClick={newWorkspace}>
-                <Plus className="h-3.5 w-3.5" aria-hidden />
-                <span className="hidden sm:inline">New workspace</span>
-              </Button>
-            </div>
           </div>
-          {runLabel ? (
-            <p className="line-clamp-1 text-xs text-muted-foreground" title={runLabel}>
-              <span className="font-medium">Topic:</span> {runLabel}
-            </p>
-          ) : null}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1 text-xs"
+              onClick={() => setInspectorOpen((v) => !v)}
+              aria-expanded={inspectorOpen}
+              aria-label={inspectorOpen ? 'Hide inspector panel' : 'Show inspector panel'}
+            >
+              {inspectorOpen ? <PanelLeftClose className="h-3.5 w-3.5" aria-hidden /> : <PanelLeftOpen className="h-3.5 w-3.5" aria-hidden />}
+              <span className="hidden sm:inline">{inspectorOpen ? 'Hide inspector' : 'Inspector'}</span>
+              <span className="sm:hidden">{inspectorOpen ? 'Hide' : 'Panel'}</span>
+            </Button>
+          </div>
         </div>
-      </div>
 
-      {/* Main content: tabbed on mobile, two-panel on lg */}
-      <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 overflow-hidden">
-        {/* Inspector: full area on mobile (tabs include execution log), sidebar on lg */}
-        {inspectorOpen ? (
-          <div
+        {runLabel ? (
+          <p
             className={cn(
-              'shrink-0 overflow-y-auto border-border/70 bg-muted/5',
-              'w-full lg:w-[340px] lg:border-r',
-              'min-h-0 flex-1 lg:flex-none'
+              'rounded-lg border px-3 py-2 text-xs',
+              isSystemB ? 'border-red-500/40' : 'border-border'
             )}
+            title={runLabel}
+            style={{ backgroundColor: 'var(--muted, #f1f5f9)', color: 'inherit' }}
           >
-            <div className="px-3 py-3">
-              <GraphPipelineInspector
-                tab={inspectorTab}
-                onTabChange={setInspectorTab}
-                currentSessionId={sessionId}
-                executionLogSlot={<GraphPipelineExecutionPanel />}
-                className="max-w-none"
-              />
-            </div>
+            <span className="font-medium">Topic:</span> {runLabel}
+          </p>
+        ) : null}
+
+        {showSystemChatRouteHint ? (
+          <div
+            className="rounded-lg border border-amber-500 px-3 py-2 text-xs sm:px-4"
+            style={{ backgroundColor: 'rgb(254 243 199)', color: 'rgb(120 53 15)' }}
+          >
+            <span className="font-medium">System Chat</span> is still using this pipeline — the workspace in the URL
+            applies after the run finishes.{' '}
+            <Link
+              to="/playground"
+              className="font-medium underline-offset-2 hover:underline"
+              style={{ color: 'rgb(180 83 9)' }}
+            >
+              Open System Chat
+            </Link>
           </div>
         ) : null}
 
-        {/* Standalone execution panel -- visible on lg always, hidden on mobile (it's a tab in the inspector) */}
-        <div className={cn(
-          'min-h-0 min-w-0 flex-1 overflow-y-auto',
-          'hidden lg:block'
-        )}>
-          <GraphPipelineExecutionPanel />
+        {showPlaygroundResumeStrip ? (
+          <div
+            className={cn(
+              'rounded-lg border',
+              isSystemB ? 'border-red-500/40' : 'border-border'
+            )}
+            style={{ backgroundColor: 'var(--background, white)' }}
+          >
+            <GraphPipelineStreamResumeBanners
+              graphSessionId={pipelineSessionId}
+              mindStorageProfileOverride={mindProfile}
+            />
+          </div>
+        ) : null}
+
+        <div className="grid w-full min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(260px,340px)_minmax(0,1fr)] lg:items-start lg:gap-4">
+          {inspectorOpen ? (
+            <section
+              className={cn(
+                'min-w-0 rounded-xl border lg:max-h-[720px] lg:overflow-y-auto lg:overscroll-y-contain',
+                isSystemB ? 'border-red-500/40' : 'border-border'
+              )}
+              style={{ backgroundColor: 'var(--muted, #f8fafc)', color: 'inherit' }}
+              aria-label="Pipeline inspector"
+            >
+              <div className="p-3 sm:p-4">
+                <GraphPipelineInspector
+                  tab={inspectorTab}
+                  onTabChange={setInspectorTab}
+                  currentSessionId={pipelineSessionId}
+                  mirrorWorkspace={isSystemB}
+                  className="max-w-none"
+                />
+              </div>
+            </section>
+          ) : null}
+
+          <section
+            className={cn(
+              'min-w-0 rounded-xl border lg:max-h-[720px] lg:overflow-y-auto lg:overscroll-y-contain',
+              isSystemB ? 'border-red-500/40' : 'border-border'
+            )}
+            style={{ backgroundColor: 'var(--background, white)', color: 'inherit' }}
+            aria-label="Execution view"
+          >
+            <GraphPipelineExecutionPanel workspaceSystemAccent={isSystemB ? 'b' : 'a'} />
+          </section>
         </div>
+
+        <GraphPipelineInteractiveControls
+          graphSessionId={pipelineSessionId}
+          hideResumeBanners={showPlaygroundResumeStrip}
+          mindStorageProfileForRun={mindProfile}
+          mirrorWorkspace={isSystemB}
+        />
+
+        <div id="graph-pipeline-bottom" className="h-px w-full scroll-mt-4" aria-hidden />
       </div>
-
-      <GraphPipelineInteractiveControls graphSessionId={sessionId} />
-
-      <div id="graph-pipeline-bottom" className="h-px w-full shrink-0 scroll-mt-4" aria-hidden />
-    </div>
+    </PageShell>
   );
 }

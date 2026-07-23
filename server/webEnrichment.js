@@ -5,13 +5,23 @@
 import dns from 'node:dns/promises';
 import net from 'node:net';
 
-/** Only these pipeline modules may emit WEB_REQUEST and trigger outbound fetch. */
+/** Pipeline modules that may emit WEB_REQUEST and trigger outbound fetch. */
 const WEB_REQUEST_HOOK_ALLOWLIST = new Set([
+  'Deliberation',
+  'Beliefs',
+  'ExecutiveGate',
+  'Motivation',
+  'Integration',
+  'IntegrationFinalize',
+  'ContextMemory',
+  // Legacy names (env WEB_HOOK_MODULES / stored configs)
   'Planning',
   'Reasoning',
   'Belief Store',
   'Metacognition',
   'Curiosity',
+  'Memory',
+  'Goal Generation',
 ]);
 
 function envInt(name, fallback) {
@@ -25,7 +35,7 @@ function truthyDisabled(name) {
 }
 
 export function getWebFetchMaxPerRun() {
-  return envInt('WEB_FETCH_MAX_PER_RUN', 4);
+  return envInt('WEB_FETCH_MAX_PER_RUN', 8);
 }
 
 export function getWebFetchTimeoutMs() {
@@ -54,20 +64,23 @@ export function ensureWebFieldsInit(sm) {
   if (!Number.isFinite(sm.webFetchesUsed)) sm.webFetchesUsed = 0;
   if (typeof sm.webFetchSuppressedForRun !== 'boolean') sm.webFetchSuppressedForRun = false;
   if (typeof sm.webFetchSuppressReason !== 'string') sm.webFetchSuppressReason = '';
+  if (!(sm.webFetchSuppressedTargets instanceof Set)) sm.webFetchSuppressedTargets = new Set();
 }
 
 /**
- * After a failed outbound web attempt, skip all further WEB_REQUEST handling this run (saves time).
+ * After a failed outbound web attempt, suppress only the specific target that failed (not the entire run).
  * @param {object} sm sharedMemory
+ * @param {string} target  The URL or search query that failed
  * @param {string} reason
  */
-function markWebFetchSuppressedForRun(sm, reason) {
+function markWebFetchSuppressedForTarget(sm, target, reason) {
   ensureWebFieldsInit(sm);
-  if (sm.webFetchSuppressedForRun) return;
-  sm.webFetchSuppressedForRun = true;
+  const key = String(target || '').slice(0, 500).toLowerCase().trim();
+  if (!key || sm.webFetchSuppressedTargets.has(key)) return;
+  sm.webFetchSuppressedTargets.add(key);
   sm.webFetchSuppressReason = String(reason || 'web request failed').slice(0, 500);
   const stamp = new Date().toISOString();
-  const note = `[${stamp}] Pipeline: outbound web fetch is disabled for the rest of this run (${sm.webFetchSuppressReason}).`;
+  const note = `[${stamp}] Pipeline: suppressed further fetches for target "${key}" (${sm.webFetchSuppressReason}).`;
   sm.webFindings = [sm.webFindings, note].filter(Boolean).join('\n').trim();
 }
 
@@ -206,7 +219,7 @@ export async function fetchUrlText(urlString) {
       signal: ac.signal,
       redirect: 'follow',
       headers: {
-        'User-Agent': 'YourBrainPipeline/1.0 (local research; +https://github.com)',
+        'User-Agent': 'MetaSelf-CognitiveStack-Pipeline/1.0 (local research; +https://github.com)',
         Accept: 'text/html,text/plain;q=0.9,*/*;q=0.1',
       },
     });
@@ -370,14 +383,15 @@ export async function maybeFulfillWebRequests(sharedMemory, moduleName, ctx = {}
 
     ensureWebFieldsInit(sharedMemory);
 
-    if (sharedMemory.webFetchSuppressedForRun) return;
-
     const maxRun = getWebFetchMaxPerRun();
     if (sharedMemory.webFetchesUsed >= maxRun) return;
 
     const output = sharedMemory.moduleOutputs?.[moduleName];
     const parsed = parseWebRequestFromOutput(String(output || ''));
     if (!parsed) return;
+
+    const targetKey = String(parsed.target || '').slice(0, 500).toLowerCase().trim();
+    if (targetKey && sharedMemory.webFetchSuppressedTargets.has(targetKey)) return;
 
     /* SEARCH without Brave key: record once in findings, do not burn WEB_FETCH_MAX_PER_RUN budget. */
     if (parsed.kind === 'SEARCH' && !String(process.env.BRAVE_SEARCH_API_KEY || '').trim()) {
@@ -441,13 +455,13 @@ export async function maybeFulfillWebRequests(sharedMemory, moduleName, ctx = {}
     });
 
     if (!entry.ok) {
-      markWebFetchSuppressedForRun(sharedMemory, entry.error || 'fetch or search failed');
+      markWebFetchSuppressedForTarget(sharedMemory, parsed.target, entry.error || 'fetch or search failed');
     }
   } catch (err) {
     console.error('[maybeFulfillWebRequests] non-fatal', moduleName, err);
     try {
       ensureWebFieldsInit(sharedMemory);
-      markWebFetchSuppressedForRun(sharedMemory, err?.message || String(err));
+      markWebFetchSuppressedForTarget(sharedMemory, '', err?.message || String(err));
       sharedMemory.webFetchesUsed += 1;
       const stamp = new Date().toISOString();
       const safeMsg = String(err?.message || err).slice(0, 600);

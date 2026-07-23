@@ -8,13 +8,8 @@ import GraphPipelinePage from './pages/GraphPipelinePage';
 import GraphPipelineRunsPage from './pages/GraphPipelineRunsPage';
 import GraphPipelineScheduledTaskPage from './pages/GraphPipelineScheduledTaskPage';
 import GraphPipelineLegacyRunRedirect from './pages/GraphPipelineLegacyRunRedirect';
-import DialogueTranscriptIndexPage from './pages/DialogueTranscriptIndexPage';
-import DialogueTranscriptSessionPage from './pages/DialogueTranscriptSessionPage';
-import DialogueCuriosityDetailPage from './pages/DialogueCuriosityDetailPage';
-import DialogueCuriosityThreadPage from './pages/DialogueCuriosityThreadPage';
-import DialogueGoalDetailPage from './pages/DialogueGoalDetailPage';
-import DialogueGoalThreadPage from './pages/DialogueGoalThreadPage';
 import MindSelfPage from './pages/MindSelfPage';
+import VoiceOutputsPage from './pages/VoiceOutputsPage';
 import PersonalityProfilePage from './pages/PersonalityProfilePage';
 import BeliefMapPage from './pages/BeliefMapPage';
 import PipelineOutputSearchPage from './pages/PipelineOutputSearchPage';
@@ -50,56 +45,107 @@ import {
 export default function App() {
   return (
     <Router future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <Routes>
-        <Route path="/consciousness-stream" element={<Navigate to="/graph-pipeline" replace />} />
+      <div className="flex h-full min-h-0 w-full min-w-0 flex-1 flex-col overflow-hidden">
+        <Routes>
+          <Route path="/consciousness-stream" element={<Navigate to="/graph-pipeline" replace />} />
 
-        <Route element={<AppLayout />}>
-          <Route path="/" element={<Dashboard />} />
+          <Route path="/dialogue" element={<Navigate to="/voice" replace />} />
+          <Route path="/dialogue/" element={<Navigate to="/voice" replace />} />
+          <Route path="/dialogue/mirror" element={<Navigate to="/voice/mirror" replace />} />
+          <Route path="/dialogue/mirror/" element={<Navigate to="/voice/mirror" replace />} />
 
-          <Route path="/dialogue/curiosity/:curiosityId/thread" element={<DialogueCuriosityThreadPage />} />
-          <Route path="/dialogue/curiosity/:curiosityId" element={<DialogueCuriosityDetailPage />} />
-          <Route path="/dialogue/goal/:goalId/thread" element={<DialogueGoalThreadPage />} />
-          <Route path="/dialogue/goal/:goalId" element={<DialogueGoalDetailPage />} />
-          <Route path="/dialogue/:sessionId" element={<DialogueTranscriptSessionPage />} />
-          <Route path="/dialogue" element={<DialogueTranscriptIndexPage />} />
+          {/** Trailing slashes → canonical paths */}
+          <Route path="/voice/" element={<Navigate to="/voice" replace />} />
+          <Route path="/voice/mirror/" element={<Navigate to="/voice/mirror" replace />} />
 
-          <Route path="/graph-pipeline/scheduled/:taskId" element={<GraphPipelineScheduledTaskPage />} />
-          <Route path="/graph-pipeline/run/:sessionId" element={<GraphPipelineLegacyRunRedirect />} />
-          <Route path="/graph-pipeline/:sessionId" element={<GraphPipelinePage />} />
-          <Route path="/graph-pipeline" element={<GraphPipelineRunsPage />} />
-          <Route path="/biography" element={<MindBiographyPage />} />
-          <Route path="/health" element={<HealthPage />} />
-          <Route path="/mind-self" element={<MindSelfPage />} />
-          <Route path="/dmn-reflections" element={<DmnReflectionsPage />} />
-          <Route path="/personality" element={<PersonalityProfilePage />} />
-          <Route path="/beliefs" element={<BeliefMapPage />} />
-          <Route path="/curiosity" element={<CuriosityPage />} />
-          <Route path="/goals" element={<GoalStackPage />} />
-          <Route path="/temporal" element={<TemporalPage />} />
-          <Route path="/world-model" element={<WorldModelPage />} />
-          <Route path="/shared-memory" element={<SharedMemoryPage />} />
-          <Route path="/memory" element={<LongTermMemoryPage />} />
-          <Route path="/dreaming" element={<DreamingPage />} />
-          <Route path="/emergence" element={<EmergencePage />} />
-          <Route path="/output-search" element={<PipelineOutputSearchPage />} />
-          <Route path="/live-analytics" element={<LiveAnalyticsPage />} />
-          <Route path="/iterations" element={<IterationsPage />} />
-          <Route path="/experiments" element={<ExperimentsPage />} />
-          <Route path="/rlhf" element={<RLHFPage />} />
-          <Route path="/datasets" element={<DatasetPage />} />
-          <Route path="/training" element={<TrainingPage />} />
-          <Route path="/playground" element={<Playground />} />
-          <Route path="/scheduler" element={<SchedulerPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="/user-manual" element={<UserManualPage />} />
-          <Route path="/neural-network" element={<NeuralNetworkPage />} />
+          {/**
+           * Voice: two layout routes, each with only an index child — avoids pathless-layout + absolute path matching issues
+           * (entire Voice missing) and avoids a single `/voice` parent whose `mirror` child can fail to render in &lt;Outlet /&gt;.
+           */}
+          <Route path="/voice/mirror" element={<AppLayout />}>
+            <Route index element={<VoiceOutputsPage />} />
+          </Route>
+          <Route path="/voice" element={<AppLayout />}>
+            <Route index element={<VoiceOutputsPage />} />
+          </Route>
 
-          <Route path="/multi-mind" element={<MultiMindRedirectPage />} />
+          {/**
+           * Graph pipeline: nested under a real `/graph-pipeline` segment (same pattern as `/voice`) so
+           * AppLayout’s &lt;Outlet /&gt; always receives a child in production; avoids blank mobile views.
+           */}
+          <Route path="/graph-pipeline" element={<AppLayout />}>
+            <Route index element={<GraphPipelineRunsPage />} />
+            <Route path="mirror/:sessionId" element={<GraphPipelinePage />} />
+            <Route path="mirror" element={<GraphPipelineRunsPage />} />
+            <Route path="scheduled/:taskId" element={<GraphPipelineScheduledTaskPage />} />
+            <Route path="run/:sessionId" element={<GraphPipelineLegacyRunRedirect />} />
+            <Route path=":sessionId" element={<GraphPipelinePage />} />
+          </Route>
+          <Route path="/graph-pipeline/" element={<Navigate to="/graph-pipeline" replace />} />
+          <Route path="/graph-pipeline/mirror/" element={<Navigate to="/graph-pipeline/mirror" replace />} />
 
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-      </Routes>
-      <ToastViewport />
+          <Route element={<AppLayout />}>
+            <Route path="/" element={<Dashboard />} />
+
+            <Route path="/pending-mind-updates/mirror" element={<Navigate to="/beliefs/mirror" replace />} />
+            <Route path="/pending-mind-updates" element={<Navigate to="/beliefs" replace />} />
+            <Route path="/beliefs/mirror" element={<BeliefMapPage />} />
+            <Route path="/beliefs" element={<BeliefMapPage />} />
+            <Route path="/memory/mirror" element={<LongTermMemoryPage />} />
+            <Route path="/memory" element={<LongTermMemoryPage />} />
+            <Route path="/curiosity/mirror" element={<CuriosityPage />} />
+            <Route path="/curiosity" element={<CuriosityPage />} />
+            <Route path="/goals/mirror" element={<GoalStackPage />} />
+            <Route path="/goals" element={<GoalStackPage />} />
+            <Route path="/biography/mirror" element={<MindBiographyPage />} />
+            <Route path="/biography" element={<MindBiographyPage />} />
+            <Route path="/world-model/mirror" element={<WorldModelPage />} />
+            <Route path="/world-model" element={<WorldModelPage />} />
+            <Route path="/temporal/mirror" element={<TemporalPage />} />
+            <Route path="/temporal" element={<TemporalPage />} />
+            <Route path="/emergence/mirror" element={<EmergencePage />} />
+            <Route path="/emergence" element={<EmergencePage />} />
+            <Route path="/shared-memory/mirror" element={<SharedMemoryPage />} />
+            <Route path="/shared-memory" element={<SharedMemoryPage />} />
+            <Route path="/iterations/mirror" element={<IterationsPage />} />
+            <Route path="/iterations" element={<IterationsPage />} />
+            <Route path="/output-search/mirror" element={<PipelineOutputSearchPage />} />
+            <Route path="/output-search" element={<PipelineOutputSearchPage />} />
+
+            <Route path="/health/mirror" element={<HealthPage />} />
+            <Route path="/health" element={<HealthPage />} />
+            <Route path="/mind-self/mirror" element={<MindSelfPage />} />
+            <Route path="/mind-self" element={<MindSelfPage />} />
+            <Route path="/dmn-reflections/mirror" element={<DmnReflectionsPage />} />
+            <Route path="/dmn-reflections" element={<DmnReflectionsPage />} />
+            <Route path="/personality/mirror" element={<PersonalityProfilePage />} />
+            <Route path="/personality" element={<PersonalityProfilePage />} />
+            <Route path="/dreaming/mirror" element={<DreamingPage />} />
+            <Route path="/dreaming" element={<DreamingPage />} />
+            <Route path="/live-analytics" element={<LiveAnalyticsPage />} />
+            <Route path="/experiments" element={<ExperimentsPage />} />
+            <Route path="/rlhf" element={<RLHFPage />} />
+            <Route path="/datasets" element={<DatasetPage />} />
+            <Route path="/training" element={<TrainingPage />} />
+
+            <Route path="/playground/mirror/beliefs" element={<Navigate to="/beliefs/mirror" replace />} />
+            <Route path="/playground/mirror/memory" element={<Navigate to="/memory/mirror" replace />} />
+            <Route path="/playground/mirror" element={<Navigate to="/playground" replace />} />
+            <Route path="/playground" element={<Playground />} />
+            <Route path="/scheduler/mirror" element={<SchedulerPage />} />
+            <Route path="/scheduler" element={<SchedulerPage />} />
+            <Route path="/settings/mirror" element={<SettingsPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/user-manual" element={<UserManualPage />} />
+            <Route path="/neural-network" element={<NeuralNetworkPage />} />
+
+            <Route path="/multi-mind" element={<MultiMindRedirectPage />} />
+
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
+        </Routes>
+        <ToastViewport />
+      </div>
     </Router>
   );
 }

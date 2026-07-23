@@ -79,12 +79,12 @@ export default function PipelineExecutionLogEntries({ entries, lineKeyPrefix = '
                 </span>
               </span>
             </summary>
-            <pre className="max-h-[min(52vh,520px)] overflow-auto border-t border-border/50 bg-background/40 p-3 font-sans text-[11px] leading-relaxed text-foreground/90 whitespace-pre-wrap break-words">
+            <pre className="max-h-[min(52svh,520px)] overflow-auto border-t border-border/50 bg-background/40 p-3 font-sans text-[11px] leading-relaxed text-foreground/90 whitespace-pre-wrap break-words">
               {detail}
             </pre>
           </details>
         ) : detail ? (
-          <pre className="mt-2 max-h-[min(42vh,380px)] overflow-auto rounded-md border border-border/40 bg-muted/10 p-2.5 font-sans text-[11px] leading-relaxed text-foreground/85 whitespace-pre-wrap break-words">
+          <pre className="mt-2 max-h-[min(42svh,380px)] overflow-auto rounded-md border border-border/40 bg-muted/10 p-2.5 font-sans text-[11px] leading-relaxed text-foreground/85 whitespace-pre-wrap break-words">
             {detail}
           </pre>
         ) : null}

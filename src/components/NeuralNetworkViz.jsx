@@ -20,6 +20,8 @@ const DEFAULT_ARIA_LABEL = 'Cognitive modules connected in a ring';
 
 export default function NeuralNetworkViz({
   activeModuleId = null,
+  /** Dual playground: pulse/edge color while System A (blue) or B (red) is active; default cyan. */
+  runAccent = null,
   variant = 'default',
   ariaLabel = DEFAULT_ARIA_LABEL,
   className,
@@ -30,6 +32,8 @@ export default function NeuralNetworkViz({
   const nodesRef = useRef([]);
   const activeModuleIdRef = useRef(null);
   activeModuleIdRef.current = activeModuleId;
+  const runAccentRef = useRef(runAccent);
+  runAccentRef.current = runAccent;
   /** Pinned card: module + position in wrapper coords */
   const [pinned, setPinned] = useState(null);
   const pinnedRef = useRef(null);
@@ -115,9 +119,29 @@ export default function NeuralNetworkViz({
     };
 
     let time = 0;
+    const accentRgb = () => {
+      const a = runAccentRef.current;
+      if (a === 'a') return [59, 130, 246];
+      if (a === 'b') return [239, 68, 68];
+      return [6, 182, 212];
+    };
+
     const animate = () => {
       ctx.clearRect(0, 0, width(), height());
       time += 0.01;
+
+      const [r, g, b] = accentRgb();
+      const cx = width() / 2;
+      const cy = height() / 2;
+      const maxR = Math.min(width(), height()) * 0.42;
+      if (runAccentRef.current) {
+        const hub = ctx.createRadialGradient(cx, cy, 0, cx, cy, maxR);
+        hub.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.14)`);
+        hub.addColorStop(0.55, `rgba(${r}, ${g}, ${b}, 0.04)`);
+        hub.addColorStop(1, 'transparent');
+        ctx.fillStyle = hub;
+        ctx.fillRect(0, 0, width(), height());
+      }
 
       const nodes = getNodePositions();
       nodesRef.current = nodes;
@@ -131,7 +155,7 @@ export default function NeuralNetworkViz({
         ctx.beginPath();
         ctx.moveTo(nodeA.x, nodeA.y);
         ctx.lineTo(nodeB.x, nodeB.y);
-        ctx.strokeStyle = `rgba(6, 182, 212, ${0.06 + pulse * 0.12})`;
+        ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${0.06 + pulse * 0.12})`;
         ctx.lineWidth = 1;
         ctx.stroke();
 
@@ -140,7 +164,7 @@ export default function NeuralNetworkViz({
         const py = nodeA.y + (nodeB.y - nodeA.y) * progress;
         ctx.beginPath();
         ctx.arc(px, py, 1.5, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(6, 182, 212, ${pulse * 0.6})`;
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${pulse * 0.6})`;
         ctx.fill();
       });
 
@@ -224,9 +248,21 @@ export default function NeuralNetworkViz({
       setPinned({ module: mod, x: pos.x, y: pos.y });
     };
 
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        if (animRef.current) {
+          cancelAnimationFrame(animRef.current);
+          animRef.current = null;
+        }
+      } else if (!animRef.current) {
+        animRef.current = requestAnimationFrame(animate);
+      }
+    };
+
     resize();
     animate();
     window.addEventListener('resize', resize);
+    document.addEventListener('visibilitychange', onVisibility);
     const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => resize()) : null;
     if (ro) ro.observe(wrap);
     canvas.addEventListener('mousemove', onMouseMove);
@@ -234,6 +270,7 @@ export default function NeuralNetworkViz({
     canvas.addEventListener('click', onClick);
 
     return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
       if (ro) ro.disconnect();
       window.removeEventListener('resize', resize);
       canvas.removeEventListener('mousemove', onMouseMove);

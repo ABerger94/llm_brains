@@ -1,5 +1,5 @@
 import { clipTextComplete } from '../../shared/textClip.mjs';
-import { initialCuriosityPipelineUi } from './curiosityPipelineSseUi';
+import { freshPursuitPipelineUiForNewGraphRun, initialCuriosityPipelineUi } from './curiosityPipelineSseUi';
 import { getKvSync, removeKvSync, setKvSync } from './browserStorage';
 
 const STORAGE_KEY = 'mybrain_curiosity_page_pursuits_v1';
@@ -13,6 +13,7 @@ const listeners = new Set();
  *   question?: string,
  *   interruptedByReload?: boolean,
  *   cooperativePaused?: boolean,
+ *   mindStorageProfile?: string,
  * }} CuriosityPursuitEntry
  */
 
@@ -24,6 +25,7 @@ function emptyEntry() {
     question: undefined,
     interruptedByReload: false,
     cooperativePaused: false,
+    mindStorageProfile: undefined,
   };
 }
 
@@ -70,6 +72,7 @@ function normalizeLoadedEntry(e) {
     question: typeof e.question === 'string' ? e.question : undefined,
     interruptedByReload: Boolean(e.interruptedByReload),
     cooperativePaused: coopPause,
+    mindStorageProfile: typeof e.mindStorageProfile === 'string' ? e.mindStorageProfile : undefined,
   };
 
   if (running) {
@@ -84,6 +87,10 @@ function normalizeLoadedEntry(e) {
       out.cooperativePaused = false;
       if (!out.pursuitProgress) out.pursuitProgress = 'Interrupted by page reload';
     }
+  }
+
+  if (!out.cooperativePaused && !out.interruptedByReload) {
+    out.curiosityPipelineUi = freshPursuitPipelineUiForNewGraphRun(out.curiosityPipelineUi);
   }
   return out;
 }
@@ -122,6 +129,7 @@ function persistCuriosityPursuitsNow() {
         cooperativePaused: Boolean(e.cooperativePaused),
         pursuitProgress: e.pursuitProgress,
         question: e.question,
+        mindStorageProfile: e.mindStorageProfile || undefined,
         curiosityPipelineUi: {
           executionLog: Array.isArray(ui.executionLog) ? ui.executionLog.slice(-40) : [],
           moduleStatuses: ui.moduleStatuses || {},
@@ -210,7 +218,9 @@ export function reloadCuriosityPursuitsFromPersistedDisk() {
       !String(e.curiosityPipelineUi?.finalOutput || '').trim()
     )
       continue;
-    next[id] = e;
+    const normalized = normalizeLoadedEntry(e);
+    if (!normalized) continue;
+    next[id] = normalized;
     n += 1;
   }
   snapshot = { pursuits: next };
@@ -229,6 +239,27 @@ export function replaceCuriosityPursuitsSnapshotFromImportedKv() {
 }
 
 /**
+ * After a mind archive import, stale `interruptedByReload` flags from the backup
+ * (running was false) would make "Resume all" fan out hundreds of pursuits.
+ * Clear reload flags when there is no cooperative checkpoint pause — real
+ * reload-interrupted work is still covered by `interruptedByReload` in a live session.
+ */
+export function sanitizeCuriosityPursuitsReloadFlagsAfterMindImport() {
+  const next = { ...snapshot.pursuits };
+  let changed = false;
+  for (const [id, e] of Object.entries(next)) {
+    if (e?.interruptedByReload && !e?.cooperativePaused) {
+      next[id] = { ...e, interruptedByReload: false };
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  snapshot = { pursuits: next };
+  emit();
+  flushCuriosityPursuitsPersistNow();
+}
+
+/**
  * Merge fields into one pursuit slot (creates slot if missing).
  * @param {string} curiosityId
  * @param {Partial<CuriosityPursuitEntry>} patch
@@ -237,7 +268,13 @@ export function upsertCuriosityPursuit(curiosityId, patch) {
   const id = String(curiosityId || '');
   if (!id) return;
   const prev = snapshot.pursuits[id] || emptyEntry();
-  const nextEntry = { ...prev, ...patch };
+  let nextEntry = { ...prev, ...patch };
+  if (nextEntry.running === false && !nextEntry.cooperativePaused && !nextEntry.interruptedByReload) {
+    nextEntry = {
+      ...nextEntry,
+      curiosityPipelineUi: freshPursuitPipelineUiForNewGraphRun(nextEntry.curiosityPipelineUi),
+    };
+  }
   snapshot = {
     ...snapshot,
     pursuits: { ...snapshot.pursuits, [id]: nextEntry },
@@ -252,11 +289,18 @@ export function upsertCuriosityPursuit(curiosityId, patch) {
 export function patchCuriosityPursuitEntry(curiosityId, patch) {
   const id = String(curiosityId || '');
   if (!id || !snapshot.pursuits[id]) return;
+  let merged = { ...snapshot.pursuits[id], ...patch };
+  if (merged.running === false && !merged.cooperativePaused && !merged.interruptedByReload) {
+    merged = {
+      ...merged,
+      curiosityPipelineUi: freshPursuitPipelineUiForNewGraphRun(merged.curiosityPipelineUi),
+    };
+  }
   snapshot = {
     ...snapshot,
     pursuits: {
       ...snapshot.pursuits,
-      [id]: { ...snapshot.pursuits[id], ...patch },
+      [id]: merged,
     },
   };
   emit();
@@ -279,6 +323,32 @@ export function updateCuriosityPursuitPipelineUiForId(curiosityId, updater) {
       [id]: { ...entry, curiosityPipelineUi: next },
     },
   };
+  emit();
+}
+
+/**
+ * Append one execution log line to every running pursuit in a single emit.
+ * Used by Dashboard “Pause & save all” so N running pursuits do not trigger N Dashboard re-renders.
+ * @param {{ time: number, msg: string }} line
+ */
+export function appendCuriosityPursuitExecutionLogLineAllRunning(line) {
+  const pursuits = snapshot.pursuits;
+  const next = { ...pursuits };
+  let changed = false;
+  for (const [id, e] of Object.entries(pursuits)) {
+    if (!e?.running) continue;
+    const prev = e.curiosityPipelineUi || initialCuriosityPipelineUi();
+    next[id] = {
+      ...e,
+      curiosityPipelineUi: {
+        ...prev,
+        executionLog: [...(prev.executionLog || []), line].slice(-40),
+      },
+    };
+    changed = true;
+  }
+  if (!changed) return;
+  snapshot = { pursuits: next };
   emit();
 }
 

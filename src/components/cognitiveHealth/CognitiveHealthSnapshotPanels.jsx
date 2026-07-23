@@ -14,7 +14,11 @@ import {
   YAxis,
 } from 'recharts';
 import { cn } from '../../lib/utils';
-import { HEALTH_CHART, PIPELINE_BIOGRAPHY_SNAPSHOT_EVERY_N_RUNS } from '../../lib/cognitiveHealthDerived';
+import {
+  HEALTH_CHART,
+  HEALTH_GROWTH_RUN_ARTIFACT_GRACE_MS,
+  PIPELINE_BIOGRAPHY_SNAPSHOT_EVERY_N_RUNS,
+} from '../../lib/cognitiveHealthDerived';
 
 /** Series order and colors match the LineChart in Growth over pipeline runs. */
 const GROWTH_CHART_LEGEND_ITEMS = [
@@ -28,7 +32,7 @@ const GROWTH_CHART_LEGEND_ITEMS = [
 ];
 
 function Panel({ className, children }) {
-  return <div className={cn('rounded-2xl border border-border bg-card p-4', className)}>{children}</div>;
+  return <div className={cn('min-w-0 rounded-2xl border border-border bg-card p-4', className)}>{children}</div>;
 }
 
 function EmptyState({ title, description }) {
@@ -43,7 +47,7 @@ function EmptyState({ title, description }) {
 function HealthMetricTile({ label, value, format, trend, colorClass = 'text-primary' }) {
   const display = format ? format(value) : value;
   return (
-    <div className="rounded-xl border border-border bg-card p-4">
+    <div className="min-w-0 rounded-xl border border-border bg-card p-4">
       <div className="mb-1 text-xs text-muted-foreground">{label}</div>
       <div className={cn('text-2xl font-bold', colorClass)}>{display}</div>
       {trend !== undefined ? (
@@ -67,7 +71,7 @@ function StatCard({ label, value, hint }) {
     <Panel>
       <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">{label}</div>
       <div className="mt-2 text-2xl font-bold">{value}</div>
-      {hint ? <div className="mt-1 text-xs text-muted-foreground">{hint}</div> : null}
+      {hint ? <div className="mt-1 break-words text-xs text-muted-foreground">{hint}</div> : null}
     </Panel>
   );
 }
@@ -91,8 +95,8 @@ export default function CognitiveHealthSnapshotPanels({ derived, loading }) {
   if (!derived) return null;
 
   return (
-    <div className="space-y-6">
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+    <div className="min-w-0 space-y-6">
+      <div className="grid min-w-0 grid-cols-2 gap-4 md:grid-cols-3">
         <HealthMetricTile
           label="Total beliefs"
           value={derived.totalBeliefs}
@@ -126,6 +130,12 @@ export default function CognitiveHealthSnapshotPanels({ derived, loading }) {
           trend={derived.curiosityTrend}
         />
         <HealthMetricTile
+          label="Goal items"
+          value={derived.goalTotal}
+          colorClass="text-violet-300 dark:text-violet-400"
+          trend={derived.goalTrend}
+        />
+        <HealthMetricTile
           label="Belief volatility (σ conf.)"
           value={derived.beliefVolatility}
           format={(v) => v.toFixed(3)}
@@ -153,23 +163,32 @@ export default function CognitiveHealthSnapshotPanels({ derived, loading }) {
         />
       </div>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <StatCard label="Pipeline runs" value={derived.runCount} hint="Saved graph / stream runs" />
+      <div className="grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-3">
         <StatCard
-          label="Open curiosity"
+          label="Pipeline runs"
+          value={derived.runCount}
+          hint="All saved PipelineRun rows (graph + stream); other pages may show a capped list"
+        />
+        <StatCard
+          label="Open + pursuing (curiosity)"
           value={derived.openOrPursuing}
-          hint={`${derived.resolvedCuriosity} resolved total`}
+          hint={`${derived.curiosityOpen} open · ${derived.curiosityPursuing} pursuing · ${derived.curiosityDormant} dormant · ${derived.resolvedCuriosity} resolved — matches Curiosity Queue rules`}
+        />
+        <StatCard
+          label="Open + pursuing (goals)"
+          value={derived.goalOpenOrPursuing}
+          hint={`${derived.goalOpen} open · ${derived.goalPursuing} pursuing · ${derived.goalDormant} dormant · ${derived.goalResolved} resolved — matches Goals stack`}
         />
         <StatCard label="RLHF feedback" value={derived.feedbackBalance} hint="Thumbs up / thumbs down" />
         <StatCard label="Dream runs" value={derived.dreamCount} hint="Dreaming mode syntheses" />
         <StatCard
           label="Active / tense beliefs"
           value={`${derived.activeBeliefs} / ${derived.contradictedBeliefs}`}
-          hint={`${derived.resolvedBeliefs} marked resolved`}
+          hint={`${derived.resolvedBeliefs} resolved${derived.deprecatedBeliefs ? ` · ${derived.deprecatedBeliefs} deprecated` : ''}`}
         />
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <div className="grid min-w-0 grid-cols-1 gap-6 lg:grid-cols-2">
         <Panel className="p-4">
           <h3 className="mb-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Cognitive profile</h3>
           <div className="h-[260px] w-full min-w-0">
@@ -188,9 +207,9 @@ export default function CognitiveHealthSnapshotPanels({ derived, loading }) {
             </ResponsiveContainer>
           </div>
           <p className="mt-2 text-[10px] text-muted-foreground">
-            Normalized 0–100 from local counts. Contradiction resolution (% of beliefs marked contradicted or resolved that
-            are resolved) appears only when that set is non-empty. Identity uses keyword overlap between the two newest
-            biographies.
+            Normalized 0–100 from local counts (full store). Curiosity and Goals axes use open+pursuing backlog plus total
+            items. Contradiction resolution (% of beliefs marked contradicted or resolved that are resolved) appears only
+            when that set is non-empty. Identity uses keyword overlap between the two newest biographies.
           </p>
         </Panel>
 
@@ -327,15 +346,19 @@ export default function CognitiveHealthSnapshotPanels({ derived, loading }) {
             </div>
           )}
           <p className="mt-2 text-[10px] text-muted-foreground">
-            One point per saved pipeline run (full history loaded for this page). Axis shows date; same-day runs use time.
-            Hover for full timestamp. Per run: counts on or before that run&apos;s time. The emerald line is the{' '}
+            One point per non-checkpoint pipeline run (cooperative mid-graph checkpoints are excluded). Axis shows date;
+            same-day runs use time. Hover for full timestamp. Per run: counts on or before that run&apos;s time plus{' '}
+            {Math.round(HEALTH_GROWTH_RUN_ARTIFACT_GRACE_MS / 60_000)} min so beliefs and other artifacts saved right after
+            the run row still count. The emerald line is the{' '}
             <strong>cumulative count</strong> of
             beliefs marked <span className="font-mono text-foreground/70">resolved</span> whose{' '}
             <span className="font-mono text-foreground/70">updated_date</span> (or{' '}
             <span className="font-mono text-foreground/70">created_date</span> if missing) is on or before that run — not
             the same as the headline rate (a ratio over contradicted+resolved beliefs). Goals counts goal stack items by{' '}
             <span className="font-mono text-foreground/70">created_date</span>. Identity uses Mind Biography rows; emergence
-            uses pending + approved events only (same as metrics above).
+            uses pending + approved events only (same as metrics above). A trailing <span className="font-medium text-foreground/80">Now</span>{' '}
+            point is added when any cumulative count (including biography snapshots) is higher than at the last run — e.g.
+            manual biography after your newest pipeline run.
           </p>
           <p className="mt-2 text-[10px] text-muted-foreground">
             <Link to="/biography" className="text-primary underline-offset-2 hover:underline">

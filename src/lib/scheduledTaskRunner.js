@@ -1,12 +1,30 @@
+/**
+ * Due tasks live in IndexedDB and run in the browser tab. When the app is closed, nothing executes until reopen;
+ * {@link flushSchedulerDueTasksNow} and the scheduler tick pick up overdue work with {@link schedulerCatchUpMaxDuePerTick} limiting burst size.
+ */
 import { collectPipelineEmergenceMarkers } from '../../shared/biographyIdentityExtract.mjs';
 import { splitVoiceOutputBeliefRevisionsAppendix } from '../../shared/beliefRevisionsVoice.mjs';
 import { llmService } from '../services/llmService';
 import { normalizeModuleOutputsFromServer } from './cognitiveModules';
-import { getRuntimeSettings, runtimeSettingsForPersistence } from './runtimeSettings';
+import {
+  getRuntimeSettings,
+  resolveSchedulerHeartbeatIntervalMs,
+  resolveSchedulerMaxConcurrentRunningTasks,
+  resolveStaleRunningScheduledTaskMs,
+  runtimeSettingsForPersistence,
+} from './runtimeSettings';
 import { computeNextBackoffIso, shouldAutoRetryTask } from './schedulerAutoRetry';
+import { slimSharedMemoryForGraphCheckpoint } from './slimSharedMemory';
 import { appendRateLimitRecoveryHint } from './pipelineSse';
-import { tagScheduledTaskFailureSummary } from './schedulerFailureDiagnostics';
+import { classifyScheduledTaskFailureMessage, tagScheduledTaskFailureSummary } from './schedulerFailureDiagnostics';
 import { isPipelinePauseOutcome } from './pipelinePauseOutcome';
+import {
+  runPlaygroundDualTurn,
+  suggestRandomPlaygroundTopic,
+  beginPlaygroundDualOrchestration,
+  endPlaygroundDualOrchestration,
+  PLAYGROUND_DUAL_TURNS_PER_BLOCK,
+} from './playgroundDualGraphRunner';
 import { excludeCheckpointPipelineRuns } from './pipelineRunCheckpoint';
 import { resolvePipelineVoiceText } from './pipelineVoiceGate';
 import {
@@ -28,13 +46,9 @@ import {
 } from './worldModelSchema';
 import {
   BeliefStore,
-  BeliefTension,
-  ConversationMessage,
   CuriosityItem,
   GoalItem,
-  DreamRun,
   EmergenceEvent,
-  FeedbackItem,
   LongTermMemory,
   MindBiography,
   PipelineRun,
@@ -69,24 +83,32 @@ import {
   endBackgroundCognitiveWork,
   isBackgroundCognitiveWorkActive,
   resetLeakedBackgroundCognitiveGate,
+  waitUntilScheduledSlotAvailable,
 } from './pipelineBusyGate';
 import { maybeQueueCuriosityPursuitAfterGeneration } from './mindFollowThroughQueue';
 import {
   COOPERATIVE_PAUSE_HOLD_SCHEDULER_MESSAGE,
   isCooperativePauseAllExternalHoldActive,
+  setCooperativePauseAllExternalHold,
 } from './cooperativePauseAllExternalHold';
 import { enqueueCognitiveWork } from './cognitiveWorkloadQueue';
 import {
   clearPersistedSchedulerHeadlessFlight,
   clearPersistedSchedulerHeadlessFlightIfMatches,
 } from './schedulerHeadlessFlightStore';
-import { syncDashboardScheduledRunningFromDb } from './dashboardScheduledRunningSync';
+import {
+  RESUMABLE_PAUSED_GRAPH_TYPES,
+  syncDashboardScheduledRunningFromDb,
+} from './dashboardScheduledRunningSync';
 import {
   beginSchedulerPipelineUi,
   applySchedulerPipelineUiSse,
   endSchedulerPipelineUi,
+  getLastGraphCheckpointForSchedulerTask,
   markSchedulerPipelinePausedInUi,
 } from './schedulerPipelineUiStore';
+import { awaitIncrementalCheckpointChain } from './incrementalModuleCheckpointPersist';
+import { normalizeExecutionResume } from '../../shared/pipelineExecutionResume.mjs';
 import { initialCuriosityPipelineUi, reduceCuriosityPipelineSse } from './curiosityPipelineSseUi';
 import { initialGoalPipelineUi } from './goalPipelineSseUi';
 import {
@@ -102,8 +124,14 @@ import {
   updateGoalPagePursuitPipelineUiForId,
 } from './goalPagePursuitStore';
 import { finalizeNewCuriosityRoot } from './curiosityLineage';
-import { ensureApiReachable, describeNetworkOrOfflineError } from './apiReachability';
+import { describeNetworkOrOfflineError } from './apiReachability';
 import { clipTextComplete } from '../../shared/textClip.mjs';
+import {
+  getActiveMindEntityProfile,
+  getMindEntityStores,
+  normalizeScheduledTaskMindStorageProfile,
+  setActiveMindEntityProfile,
+} from './mindEntityContext';
 import { temporalEventsExcludingPauseNoise } from '../../shared/temporalTimelinePauseFilter.mjs';
 import { generateMindBiographyViaLlm, persistMindBiographyVersion } from './mindBiographyLlm.js';
 import {
@@ -145,8 +173,8 @@ function schedulerPipelineUiBridge(task) {
 const SCHEDULER_PHASE_IDS = new Set(MIND_PHASE_OPTIONS.map((p) => p.id));
 
 const POLL_MS = 5000;
-/** Running tasks older than this are treated as crashed tabs and marked failed so the queue can advance. */
-const STALE_RUNNING_SCHEDULED_TASK_MS = 20 * 60 * 1000;
+/** In-flight automatic due-task runs (see {@link resolveSchedulerMaxConcurrentRunningTasks}); manual retry/resume bypass. */
+let activeScheduledDueTaskRuns = 0;
 let intervalId = null;
 /** Mobile browsers throttle background timers; resume polling when the tab is visible or the network returns. */
 let visibilityResumeHandler = null;
@@ -176,7 +204,24 @@ export function requestAbortScheduledTaskRun(taskId) {
 }
 
 /**
+ * Resume payload stored on {@link ScheduledTask} rows (cooperative pause, or Stop with checkpoint).
+ */
+function getScheduledTaskCheckpointResume(task) {
+  const sm = task?.pipeline_checkpoint_shared_memory;
+  const er = task?.pipeline_checkpoint_execution_resume;
+  if (!sm || typeof sm !== 'object' || !er || typeof er !== 'object') return null;
+  return { sharedMemory: sm, executionResume: er };
+}
+
+function graphResumeOptsFromScheduledTaskRow(task) {
+  const r = getScheduledTaskCheckpointResume(task);
+  if (!r) return null;
+  return { initialFullSharedMemory: r.sharedMemory, executionResume: r.executionResume };
+}
+
+/**
  * Abort + mark cancelled + drop queue/UI bookkeeping so the scheduler and dashboard stay consistent.
+ * When at least one module has completed, persists the last module checkpoint so Run again can resume.
  * Used by Dashboard Stop and Scheduler page Cancel. Safe if the task is not running.
  * @param {string} taskId
  * @param {{ resultSummary?: string }} [opts]
@@ -185,17 +230,47 @@ export function requestAbortScheduledTaskRun(taskId) {
 export async function stopScheduledTaskRunFromUi(taskId, opts = {}) {
   const id = String(taskId ?? '').trim();
   if (!id) return { ok: false, message: 'Invalid task id.' };
-  const result_summary = String(opts.resultSummary ?? 'Stopped from UI.').slice(0, 2000);
+
+  await awaitIncrementalCheckpointChain();
+  const ck = getLastGraphCheckpointForSchedulerTask(id);
+  const nextMod = String(ck?.executionResume?.nextModuleName || '').trim();
+  const defaultSummary = ck
+    ? `Cancelled — checkpoint saved${nextMod ? ` before ${nextMod}` : ''}. Use Run again to resume.`
+    : 'Stopped from UI.';
+  const result_summary = String(opts.resultSummary ?? defaultSummary).slice(0, 2000);
 
   requestAbortScheduledTaskRun(id);
+
+  /** Snapshot checkpoint before {@link endSchedulerPipelineUi} clears live SSE state. */
+  const smPersist =
+    ck?.sharedMemory && typeof ck.sharedMemory === 'object'
+      ? slimSharedMemoryForGraphCheckpoint(ck.sharedMemory) ?? ck.sharedMemory
+      : null;
+  const erPersist =
+    ck?.executionResume && typeof ck.executionResume === 'object'
+      ? normalizeExecutionResume(ck.executionResume) || ck.executionResume
+      : null;
+
   endSchedulerPipelineUi(id);
 
   try {
-    await ScheduledTask.update(id, {
+    /** @type {Record<string, unknown>} */
+    const patch = {
       status: 'cancelled',
       completed_at: new Date().toISOString(),
       result_summary,
-    });
+      scheduler_last_progress_at: null,
+    };
+    if (smPersist && erPersist) {
+      patch.pipeline_checkpoint_shared_memory = smPersist;
+      patch.pipeline_checkpoint_execution_resume = erPersist;
+      patch.pipeline_checkpoint_pipeline_run_id = null;
+    } else {
+      patch.pipeline_checkpoint_shared_memory = null;
+      patch.pipeline_checkpoint_execution_resume = null;
+      patch.pipeline_checkpoint_pipeline_run_id = null;
+    }
+    await ScheduledTask.update(id, patch);
   } catch (e) {
     return { ok: false, message: e instanceof Error ? e.message : String(e) };
   }
@@ -204,13 +279,63 @@ export async function stopScheduledTaskRunFromUi(taskId, opts = {}) {
   clearPersistedSchedulerHeadlessFlightIfMatches(id);
   notifyMindStorageChanged({ source: 'scheduled-tasks' });
   await syncDashboardScheduledRunningFromDb();
-  return { ok: true, message: 'Scheduled run stopped.' };
+  return {
+    ok: true,
+    message: smPersist && erPersist ? 'Stopped — checkpoint saved. Run again to resume.' : 'Scheduled run stopped.',
+  };
 }
 
 function isAbortError(err) {
   if (!err || typeof err !== 'object') return false;
   if (err.name === 'AbortError') return true;
   return typeof DOMException !== 'undefined' && err instanceof DOMException && err.name === 'AbortError';
+}
+
+/**
+ * Stale detection uses max(`run_started_at`, `scheduler_last_progress_at`) when heartbeats are enabled.
+ * @param {object} t - ScheduledTask row
+ * @returns {number} epoch ms, or 0 if unknown
+ */
+function scheduledTaskLivenessEpochMs(t) {
+  const started = t?.run_started_at ? new Date(t.run_started_at).getTime() : 0;
+  const prog = t?.scheduler_last_progress_at ? new Date(t.scheduler_last_progress_at).getTime() : 0;
+  const a = Number.isFinite(started) && started > 0 ? started : 0;
+  const b = Number.isFinite(prog) && prog > 0 ? prog : 0;
+  return Math.max(a, b);
+}
+
+/**
+ * While `status === 'running'`, bump `scheduler_last_progress_at` so long pipelines are not mistaken for crashed tabs.
+ * @param {string} taskId
+ * @param {number} intervalMs - from {@link resolveSchedulerHeartbeatIntervalMs}; 0 disables
+ * @returns {() => void} disposer
+ */
+function startScheduledTaskRunHeartbeat(taskId, intervalMs) {
+  if (typeof window === 'undefined' || !intervalMs || intervalMs < 30_000) {
+    return () => {};
+  }
+  const id = String(taskId ?? '').trim();
+  if (!id) return () => {};
+  const handle = window.setInterval(() => {
+    void (async () => {
+      try {
+        const latest = await ScheduledTask.retrieve(id);
+        if (!latest || normalizedSchedulerStatus(latest.status) !== 'running') return;
+        await ScheduledTask.update(id, {
+          scheduler_last_progress_at: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.warn('[scheduler] heartbeat failed', id, e);
+      }
+    })();
+  }, intervalMs);
+  return () => {
+    try {
+      clearInterval(handle);
+    } catch {
+      /* ignore */
+    }
+  };
 }
 
 /** Drop in-memory ids when storage already shows a terminal state (avoids wedging the tick loop). */
@@ -224,7 +349,19 @@ async function pruneScheduledWorkEnqueuedIds() {
         continue;
       }
       const st = normalizedSchedulerStatus(t.status);
-      if (st === 'completed' || st === 'failed' || st === 'cancelled' || st === 'paused') {
+      if (st === 'completed' || st === 'failed' || st === 'cancelled') {
+        scheduledWorkEnqueuedIds.delete(id);
+        continue;
+      }
+      // `paused` is not terminal while resumePausedScheduledPipelineTask is in flight: it adds this id and
+      // registers an AbortController before the row leaves `paused`. Old code deleted every paused id here,
+      // which cleared the set mid-resume and led to duplicate attempts / "already running or queued" errors.
+      if (st === 'paused' && !scheduledTaskRunAbortControllers.has(id)) {
+        scheduledWorkEnqueuedIds.delete(id);
+        continue;
+      }
+      // Orphan bookkeeping: row says running but this tab has no in-flight handle (crash / partial teardown).
+      if (st === 'running' && !scheduledTaskRunAbortControllers.has(id)) {
         scheduledWorkEnqueuedIds.delete(id);
       }
     } catch {
@@ -262,8 +399,11 @@ export function isSchedulerTaskManuallyRerunnableStatus(st) {
 }
 
 /**
- * True when "Run again" / manual retry is allowed: failed, cancelled, or pending auto-retry rows
- * (requeued after failure; {@link scheduler_retry_attempt} &gt; 0).
+ * True when the Scheduler UI may run a task immediately ("Run again" / "Run now"):
+ * - failed or cancelled (retry)
+ * - pending after auto-retry requeue ({@link scheduler_retry_attempt} &gt; 0)
+ * - pending and **due** ({@link scheduled_at} in the past) — same row the automatic tick would pick up
+ * - pending with **schedule paused** — auto-fire is off but you can still run once manually
  * @param {unknown} task - ScheduledTask row
  */
 export function isSchedulerTaskManuallyRerunnable(task) {
@@ -271,6 +411,12 @@ export function isSchedulerTaskManuallyRerunnable(task) {
   const s = normalizedSchedulerStatus(task.status);
   if (s === 'failed' || s === 'cancelled') return true;
   if (s === 'pending' && Number(task.scheduler_retry_attempt) > 0) return true;
+  if (s === 'pending') {
+    if (isScheduledTaskSchedulePaused(task)) return true;
+    const at = task.scheduled_at;
+    const t = at ? new Date(at).getTime() : NaN;
+    if (Number.isFinite(t) && t <= Date.now()) return true;
+  }
   return false;
 }
 
@@ -290,6 +436,11 @@ async function listAllScheduledTasksForRunner() {
 
 export async function healLeakedBackgroundCognitiveGateIfNoRunningTask() {
   if (!isBackgroundCognitiveWorkActive()) return;
+  // Parallel scheduler runs are allowed. A new "Run again" calls beginBackgroundCognitiveWork() before
+  // ScheduledTask.update(..., status: 'running') is visible to listAll — IndexedDB can briefly show no
+  // running row. Resetting the depth then corrupts the counter (second pipeline / cancel / rerun crashes).
+  if (scheduledWorkEnqueuedIds.size > 0) return;
+  if (scheduledTaskRunAbortControllers.size > 0) return;
   let anyRunning = false;
   try {
     const all = await listAllScheduledTasksForRunner();
@@ -299,6 +450,25 @@ export async function healLeakedBackgroundCognitiveGateIfNoRunningTask() {
   }
   if (!anyRunning) {
     resetLeakedBackgroundCognitiveGate('no running ScheduledTask in storage — reset leaked background gate');
+  }
+}
+
+/**
+ * On startup, clear the cooperative pause hold if no tasks are actively running in storage.
+ * This prevents a stale hold (e.g. from a previous session where "Pause & save all" was used
+ * but "Resume all" was never clicked) from permanently freezing the scheduler.
+ */
+async function healStaleCooperativePauseHold() {
+  if (!isCooperativePauseAllExternalHoldActive()) return;
+  try {
+    const all = await listAllScheduledTasksForRunner();
+    const anyRunning = all.some((t) => normalizedSchedulerStatus(t.status) === 'running');
+    if (!anyRunning) {
+      console.warn('[scheduler] clearing stale cooperative pause hold — no tasks are running');
+      setCooperativePauseAllExternalHold(false);
+    }
+  } catch {
+    /* ignore — next tick will retry */
   }
 }
 
@@ -425,6 +595,7 @@ async function enqueueRecurrence(completedTask) {
     metacognition_rerun_goal_pursuit_context: completedTask.metacognition_rerun_goal_pursuit_context,
     metacognition_max_reruns_override: completedTask.metacognition_max_reruns_override,
     metacognition_rerun_delay_minutes_override: completedTask.metacognition_rerun_delay_minutes_override,
+    mind_storage_profile: completedTask.mind_storage_profile,
   });
 }
 
@@ -433,6 +604,7 @@ async function enqueueRecurrence(completedTask) {
  * contexts; fall back to `target_curiosity_id` / `target_goal_id` (e.g. recurrence copies).
  */
 async function resolveMetacognitionRerunPursuitContextsForTask(task) {
+  const stores = getMindEntityStores();
   let curiosity =
     task.metacognition_rerun_curiosity_pursuit_context &&
     typeof task.metacognition_rerun_curiosity_pursuit_context === 'object' &&
@@ -445,7 +617,7 @@ async function resolveMetacognitionRerunPursuitContextsForTask(task) {
     if (id) {
       let root = id;
       try {
-        const item = await CuriosityItem.retrieve(id);
+        const item = await stores.CuriosityItem.retrieve(id);
         if (item?.root_curiosity_id) root = String(item.root_curiosity_id);
       } catch {
         /* keep root = id */
@@ -466,7 +638,7 @@ async function resolveMetacognitionRerunPursuitContextsForTask(task) {
     if (id) {
       let root = id;
       try {
-        const item = await GoalItem.retrieve(id);
+        const item = await stores.GoalItem.retrieve(id);
         if (item?.root_goal_id) root = String(item.root_goal_id);
       } catch {
         /* keep root = id */
@@ -479,7 +651,11 @@ async function resolveMetacognitionRerunPursuitContextsForTask(task) {
 }
 
 async function runGraphPipelineForScheduler(promptText, task = null, abortSignal, onSseEvent, resumeOpts = null) {
-  const ro = resumeOpts && typeof resumeOpts === 'object' ? resumeOpts : null;
+  let ro = resumeOpts && typeof resumeOpts === 'object' ? resumeOpts : null;
+  if (!ro && task) {
+    const fromRow = graphResumeOptsFromScheduledTaskRow(task);
+    if (fromRow) ro = fromRow;
+  }
   const result = await runGraphPipelineOneShot({
     inputText: promptText,
     task: task || { task_type: 'pipeline_run' },
@@ -488,7 +664,6 @@ async function runGraphPipelineForScheduler(promptText, task = null, abortSignal
     acquireGlobalGate: false,
     abortSignal,
     onSseEvent,
-    skipApiReachabilityProbe: true,
     mirrorCooperativePauseToGraphSession: false,
     ...(ro?.initialFullSharedMemory != null ? { initialFullSharedMemory: ro.initialFullSharedMemory } : {}),
     ...(ro?.executionResume != null ? { executionResume: ro.executionResume } : {}),
@@ -517,7 +692,11 @@ async function runMetacognitionPipelineRerunScheduled(task, abortSignal, onSseEv
     acquireGlobalGate: false,
     abortSignal,
     onSseEvent,
-    executionResume: opts.executionResume ?? null,
+    executionResume:
+      opts.executionResume ??
+      (task?.pipeline_checkpoint_execution_resume && typeof task.pipeline_checkpoint_execution_resume === 'object'
+        ? task.pipeline_checkpoint_execution_resume
+        : null),
   });
 
   if (isPipelinePauseOutcome(result)) {
@@ -530,18 +709,26 @@ async function runMetacognitionPipelineRerunScheduled(task, abortSignal, onSseEv
     };
   }
 
-  const voice = resolvePipelineVoiceText({
-    voiceOutput: result.voiceText,
-    sharedMemory: result.sharedMemory,
-  }).trim();
-
-  if (voice && ctxC?.parentCuriosityId) {
-    await finalizePursuedCuriosityAfterGraph(String(ctxC.parentCuriosityId), voice, result.pipelineRunId);
-    notifyMindStorageChanged({ source: 'curiosity' });
-  }
-  if (voice && ctxG?.parentGoalId) {
-    await finalizePursuedGoalAfterGraph(String(ctxG.parentGoalId), voice, result.pipelineRunId);
-    notifyMindStorageChanged({ source: 'goals' });
+  const rerunProfile = normalizeScheduledTaskMindStorageProfile(task?.mind_storage_profile);
+  const prevRerunFinalizeProfile = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(rerunProfile);
+  try {
+    if (ctxC?.parentCuriosityId) {
+      await finalizePursuedCuriosityAfterGraph(String(ctxC.parentCuriosityId), result.voiceText, result.pipelineRunId, {
+        rawOutputs: result.rawOutputs,
+        sharedMemory: result.sharedMemory,
+      });
+      notifyMindStorageChanged({ source: 'curiosity' });
+    }
+    if (ctxG?.parentGoalId) {
+      await finalizePursuedGoalAfterGraph(String(ctxG.parentGoalId), result.voiceText, result.pipelineRunId, {
+        rawOutputs: result.rawOutputs,
+        sharedMemory: result.sharedMemory,
+      });
+      notifyMindStorageChanged({ source: 'goals' });
+    }
+  } finally {
+    setActiveMindEntityProfile(prevRerunFinalizeProfile);
   }
   notifyMindStorageChanged({ source: 'pipeline' });
   return result.summary;
@@ -558,127 +745,150 @@ async function runConsciousnessStreamScheduled(
     promptText.trim() ||
     'Scheduled graph pipeline: notice what matters now from recent context, then respond as Voice.';
 
+  const effResume = resume ?? (task ? getScheduledTaskCheckpointResume(task) : null);
+
   const runtimeSettings = getRuntimeSettings();
   const { phase, arousal } = resolveSchedulerMindOptions(task || { task_type: 'consciousness_stream' });
 
-  const prepOpts = {
-    inputText: userInput,
-    task: task || { task_type: 'consciousness_stream', mind_phase: phase, mind_arousal: arousal },
-    mindPhase: phase,
-    mindArousal: arousal,
-  };
-  if (resume?.sharedMemory != null) {
-    prepOpts.initialFullSharedMemory = resume.sharedMemory;
-  }
-  const prep = await prepareGraphPipelineSseInputs(prepOpts);
-
-  const pauseToken = createPipelinePauseToken();
-  registerPipelinePauseToken(pauseToken, { kind: 'scheduled-consciousness-stream', id: String(task?.id || '') });
+  const normalizedProfile = normalizeScheduledTaskMindStorageProfile(task?.mind_storage_profile);
+  const previousMindProfile = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(normalizedProfile);
   try {
-    const { streamResult, finalNote } = await executePreparedGraphPipelineSse({
-      prep,
-      fetchImpl: fetchScheduler,
-      abortSignal,
-      onSseEvent,
-      executionResume: resume?.executionResume ?? null,
-      pauseSupport: true,
-      pauseToken,
-      pipelineSource: 'scheduled-consciousness-stream',
-      graphSessionIdForPipelineRun: null,
-    });
-
-    if (streamResult?.pipelinePaused) {
-      return await persistGraphPipelineStreamResult({
-        streamResult,
-        promptText: userInput,
-        runtimeSettings: prep.runtimeSettings,
-        source: 'scheduled-consciousness-stream',
-        executionPlan: prep.executionPlan,
-        curiosityPursuitContext: null,
-        goalPursuitContext: null,
-        finalOutputForRunRow: finalNote,
-      });
+    const prepOpts = {
+      inputText: userInput,
+      task: task || { task_type: 'consciousness_stream', mind_phase: phase, mind_arousal: arousal },
+      mindPhase: phase,
+      mindArousal: arousal,
+      mindStorageProfile: normalizedProfile,
+    };
+    if (effResume?.sharedMemory != null) {
+      prepOpts.initialFullSharedMemory = effResume.sharedMemory;
     }
+    const prep = await prepareGraphPipelineSseInputs(prepOpts);
 
-    const rawOutputs = streamResult.sharedMemory?.moduleOutputs || {};
-    const norm = normalizeModuleOutputsFromServer(rawOutputs);
-    const narrativeText = norm.narrative || rawOutputs.Narrative || '';
-    const smDone = streamResult.sharedMemory || null;
-    const voiceTextRaw = resolvePipelineVoiceText({
-      voiceOutput: streamResult.voiceOutput,
-      sharedMemory: smDone,
-    });
-    const { displayText: voiceText } = splitVoiceOutputBeliefRevisionsAppendix(voiceTextRaw);
-
-    if (voiceText) {
-      const userMsg = await ConversationMessage.create({
-        role: 'user',
-        content: userInput,
-        attachment_ids: [],
+    const pauseToken = createPipelinePauseToken();
+    registerPipelinePauseToken(pauseToken, { kind: 'scheduled-consciousness-stream', id: String(task?.id || '') });
+    try {
+      const { streamResult, finalNote } = await executePreparedGraphPipelineSse({
+        prep,
+        fetchImpl: fetchScheduler,
+        abortSignal,
+        onSseEvent,
+        executionResume: effResume?.executionResume ?? null,
+        pauseSupport: true,
+        pauseToken,
+        pipelineSource: 'scheduled-consciousness-stream',
+        graphSessionIdForPipelineRun: null,
+        mindStorageProfile: normalizedProfile,
       });
 
-      await ConversationMessage.create({
-        role: 'assistant',
-        content: voiceText,
+      if (streamResult?.pipelinePaused) {
+        return await persistGraphPipelineStreamResult({
+          streamResult,
+          promptText: userInput,
+          runtimeSettings: prep.runtimeSettings,
+          source: 'scheduled-consciousness-stream',
+          executionPlan: prep.executionPlan,
+          curiosityPursuitContext: null,
+          goalPursuitContext: null,
+          finalOutputForRunRow: finalNote,
+          mindStorageProfile: normalizedProfile,
+        });
+      }
+
+      setActiveMindEntityProfile(normalizedProfile);
+      const rawOutputs = streamResult.sharedMemory?.moduleOutputs || {};
+      const norm = normalizeModuleOutputsFromServer(rawOutputs);
+      const narrativeText = norm.narrative || rawOutputs.Narrative || '';
+      const smDone = streamResult.sharedMemory || null;
+      const voiceTextRaw = resolvePipelineVoiceText({
+        voiceOutput: streamResult.voiceOutput,
+        sharedMemory: smDone,
+      });
+      const { displayText: voiceText } = splitVoiceOutputBeliefRevisionsAppendix(voiceTextRaw);
+
+      const stores = getMindEntityStores();
+      if (voiceText) {
+        const userMsg = await stores.ConversationMessage.create({
+          role: 'user',
+          content: userInput,
+          attachment_ids: [],
+        });
+
+        await stores.ConversationMessage.create({
+          role: 'assistant',
+          content: voiceText,
+          module_outputs: rawOutputs,
+          shared_memory: smDone,
+          reruns_used: streamResult.rerunsUsed || 0,
+          provider_used: streamResult.providerUsed,
+          model_used: streamResult.modelUsed,
+          reply_to: userMsg.id,
+        });
+      }
+
+      const runRow = await stores.PipelineRun.create({
+        input: userInput,
         module_outputs: rawOutputs,
         shared_memory: smDone,
-        reruns_used: streamResult.rerunsUsed || 0,
+        execution_plan: ['sse-graph'],
+        loop_count: Number(streamResult.rerunsUsed) || 0,
+        final_output: finalNote || voiceText || '(no Voice output)',
+        runtime_settings: runtimeSettingsForPersistence(runtimeSettings),
         provider_used: streamResult.providerUsed,
         model_used: streamResult.modelUsed,
-        reply_to: userMsg.id,
+        source: 'graph-pipeline',
+        phase: smDone?.phase,
+        arousal: smDone?.arousal,
+        intent: smDone?.intent,
+        phenomenal_now: smDone?.phenomenalNow || null,
+        cognitive_policy: smDone?.cognitivePolicy || null,
       });
+
+      await persistMindAfterPipeline({
+        sharedMemory: smDone,
+        voiceOutput: voiceText || '',
+        narrativeText,
+        runtimeSettings,
+        source: 'graph-pipeline',
+        pipelineRunId: runRow?.id,
+        mindStorageProfile: normalizedProfile,
+      });
+
+      notifyMindStorageChanged({ source: 'graph-pipeline' });
+      return truncate(voiceText, 400) || 'Graph pipeline run complete (no Voice text).';
+    } finally {
+      unregisterPipelinePauseToken(pauseToken);
     }
-
-    const runRow = await PipelineRun.create({
-      input: userInput,
-      module_outputs: rawOutputs,
-      shared_memory: smDone,
-      execution_plan: ['sse-graph'],
-      loop_count: Number(streamResult.rerunsUsed) || 0,
-      final_output: finalNote || voiceText || '(no Voice output)',
-      runtime_settings: runtimeSettingsForPersistence(runtimeSettings),
-      provider_used: streamResult.providerUsed,
-      model_used: streamResult.modelUsed,
-      source: 'graph-pipeline',
-      phase: smDone?.phase,
-      arousal: smDone?.arousal,
-      intent: smDone?.intent,
-      phenomenal_now: smDone?.phenomenalNow || null,
-      cognitive_policy: smDone?.cognitivePolicy || null,
-    });
-
-    await persistMindAfterPipeline({
-      sharedMemory: smDone,
-      voiceOutput: voiceText || '',
-      narrativeText,
-      runtimeSettings,
-      source: 'graph-pipeline',
-      pipelineRunId: runRow?.id,
-    });
-
-    notifyMindStorageChanged({ source: 'graph-pipeline' });
-    return truncate(voiceText, 400) || 'Graph pipeline run complete (no Voice text).';
   } finally {
-    unregisterPipelinePauseToken(pauseToken);
+    setActiveMindEntityProfile(previousMindProfile);
   }
 }
 
 async function runMetacognitionReviewScheduled(task, abortSignal, onSseEvent, resumeOpts = null) {
-  const runs = excludeCheckpointPipelineRuns(await PipelineRun.list('-created_date', 15));
-  const snippets = [];
-  for (const run of runs) {
-    const flags = run.shared_memory?.metaCognitionFlags || [];
-    for (const f of flags.slice(-4)) {
-      snippets.push(`run ${String(run.id).slice(-8)} · rerun ${f.rerunIndex ?? '?'}: ${f.reason || ''}`);
+  const prevProf = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(normalizeScheduledTaskMindStorageProfile(task?.mind_storage_profile));
+  try {
+    const runs = excludeCheckpointPipelineRuns(
+      await getMindEntityStores().PipelineRun.list('-created_date', 15)
+    );
+    const snippets = [];
+    for (const run of runs) {
+      const flags = run.shared_memory?.metaCognitionFlags || [];
+      for (const f of flags.slice(-4)) {
+        snippets.push(`run ${String(run.id).slice(-8)} · rerun ${f.rerunIndex ?? '?'}: ${f.reason || ''}`);
+      }
     }
-  }
-  const ctx =
-    snippets.length > 0
-      ? snippets.join('\n').slice(0, 4500)
-      : 'No supervisor rerun records yet — review overall calibration and confidence habits.';
+    const ctx =
+      snippets.length > 0
+        ? snippets.join('\n').slice(0, 4500)
+        : 'No supervisor rerun records yet — review overall calibration and confidence habits.';
 
-  const prompt = `[Metacognition review — scheduled]\nRecent rerun / calibration notes:\n${ctx}\n\nWhat should this mind adjust about its reasoning style, confidence, or focus for the next active session? Answer as Voice: concise, actionable.`;
-  return runGraphPipelineForScheduler(prompt, task, abortSignal, onSseEvent, resumeOpts);
+    const prompt = `[Metacognition review — scheduled]\nRecent rerun / calibration notes:\n${ctx}\n\nWhat should this mind adjust about its reasoning style, confidence, or focus for the next active session? Answer as Voice: concise, actionable.`;
+    return await runGraphPipelineForScheduler(prompt, task, abortSignal, onSseEvent, resumeOpts);
+  } finally {
+    setActiveMindEntityProfile(prevProf);
+  }
 }
 
 async function runConsolidationScheduled() {
@@ -686,8 +896,23 @@ async function runConsolidationScheduled() {
   return truncate(text, 400) || 'Consolidation complete.';
 }
 
+async function runAutonomousConsolidationScheduled(task, abortSignal, onSseEvent) {
+  const prompt =
+    String(task.input_text || '').trim() ||
+    `[Autonomous consolidation — scheduled]\nSynthesize recent themes from memory and tensions; output a brief Voice summary suitable for consolidation.`;
+  return runGraphPipelineForScheduler(prompt, task, abortSignal, onSseEvent);
+}
+
+async function runPendingInboxDigestScheduled(task, abortSignal, onSseEvent) {
+  const prompt =
+    String(task.input_text || '').trim() ||
+    '[Mind sync — digest]\nBelief and world-model updates from scheduled runs now merge automatically. Give a brief Voice summary of what to verify on Belief Map and World Model after recent background activity (concise).';
+  return runGraphPipelineForScheduler(prompt, task, abortSignal, onSseEvent);
+}
+
 async function runEmergenceDetectionScheduled() {
-  const runs = excludeCheckpointPipelineRuns(await PipelineRun.list('-created_date', 6));
+  const stores = getMindEntityStores();
+  const runs = excludeCheckpointPipelineRuns(await stores.PipelineRun.list('-created_date', 6));
   let created = 0;
   for (const run of runs) {
     const mo = run.module_outputs || {};
@@ -701,7 +926,7 @@ async function runEmergenceDetectionScheduled() {
 
     if (markers.length > 0) {
       const severity = markers.length >= 5 ? 'high' : markers.length >= 3 ? 'medium' : 'low';
-      await EmergenceEvent.create({
+      await stores.EmergenceEvent.create({
         title: `Emergence markers in run ${run.id.slice(-6)}`,
         details: `Detected: ${markers.join(', ')}`,
         severity,
@@ -719,26 +944,37 @@ async function runEmergenceDetectionScheduled() {
 }
 
 async function runCognitiveHealthSnapshotScheduled() {
-  const [runs, beliefs, memories, curios, goals, dreams, feedback] = await Promise.all([
-    PipelineRun.list('-created_date', 200),
-    BeliefStore.list('-created_date', 200),
-    LongTermMemory.list('-created_date', 200),
-    CuriosityItem.list('-created_date', 200),
-    GoalItem.list('-created_date', 200),
-    DreamRun.list('-created_date', 200),
-    FeedbackItem.list('-created_date', 200),
+  const stores = getMindEntityStores();
+  /** Never PipelineRun.listAll — each row can embed huge shared_memory and OOM mobile WebKit. */
+  const HEALTH_LIST_CAP = 2500;
+  const [
+    runCount,
+    beliefCount,
+    memoryCount,
+    curios,
+    goals,
+    dreamCount,
+    feedback,
+  ] = await Promise.all([
+    stores.PipelineRun.count(),
+    stores.BeliefStore.count(),
+    stores.LongTermMemory.count(),
+    stores.CuriosityItem.list('-created_date', HEALTH_LIST_CAP),
+    stores.GoalItem.list('-created_date', HEALTH_LIST_CAP),
+    stores.DreamRun.count(),
+    stores.FeedbackItem.list('-created_date', HEALTH_LIST_CAP),
   ]);
 
   const metrics = {
-    runCount: runs.length,
-    beliefCount: beliefs.length,
-    memoryCount: memories.length,
+    runCount,
+    beliefCount,
+    memoryCount,
     openCuriosity: curios.filter((item) => (item.status || 'open') !== 'resolved').length,
     openGoals: goals.filter((g) => {
       const s = g.status || 'open';
       return s === 'open' || s === 'pursuing' || s === 'dormant';
     }).length,
-    dreamCount: dreams.length,
+    dreamCount,
     thumbsUp: feedback.filter((f) => f.rating === 'up').length,
     thumbsDown: feedback.filter((f) => f.rating === 'down').length,
   };
@@ -752,7 +988,7 @@ async function runCognitiveHealthSnapshotScheduled() {
     'Health snapshot'
   );
 
-  await TemporalEvent.create({
+  await stores.TemporalEvent.create({
     title: 'Cognitive health snapshot',
     details: summary,
     source: 'scheduled-health',
@@ -762,10 +998,11 @@ async function runCognitiveHealthSnapshotScheduled() {
 }
 
 async function runTemporalReflectionScheduled() {
+  const stores = getMindEntityStores();
   const [eventsRaw, runsRaw, beliefs] = await Promise.all([
-    TemporalEvent.list('-created_date', 25),
-    PipelineRun.list('-created_date', 8),
-    BeliefStore.list('-created_date', 15),
+    stores.TemporalEvent.list('-created_date', 25),
+    stores.PipelineRun.list('-created_date', 8),
+    stores.BeliefStore.list('-created_date', 15),
   ]);
   const events = temporalEventsExcludingPauseNoise(eventsRaw);
   const runs = excludeCheckpointPipelineRuns(runsRaw);
@@ -808,7 +1045,7 @@ Return JSON with: now (one sentence), threads (array of 2 short strings), milest
     .filter(Boolean)
     .join('\n');
 
-  await TemporalEvent.create({
+  await stores.TemporalEvent.create({
     title: mtitle.slice(0, 200),
     details: mdet.slice(0, 4000),
     source: 'scheduled-temporal',
@@ -818,7 +1055,8 @@ Return JSON with: now (one sentence), threads (array of 2 short strings), milest
 }
 
 async function runMemorySynthesisScheduled() {
-  const mems = await LongTermMemory.list('-created_date', 20);
+  const stores = getMindEntityStores();
+  const mems = await stores.LongTermMemory.list('-created_date', 20);
   if (mems.length === 0) return 'No memories to synthesize.';
 
   const result = await invokeLLM({
@@ -835,7 +1073,7 @@ ${mems.map((m) => `- ${m.title}: ${truncate(m.content, 220)}`).join('\n').slice(
     },
   });
 
-  await LongTermMemory.create({
+  await stores.LongTermMemory.create({
     title: result.title || 'Integrated reflection',
     content: result.integration || '',
     memory_type: 'semantic',
@@ -846,9 +1084,10 @@ ${mems.map((m) => `- ${m.title}: ${truncate(m.content, 220)}`).join('\n').slice(
 }
 
 async function runDreamingScheduled() {
+  const stores = getMindEntityStores();
   const [memories, beliefs] = await Promise.all([
-    LongTermMemory.list('-created_date', 6),
-    BeliefStore.list('-created_date', 6),
+    stores.LongTermMemory.list('-created_date', 6),
+    stores.BeliefStore.list('-created_date', 6),
   ]);
   const dreamText = assertLlmTextOk(
     await llmService.InvokeLLM({
@@ -857,8 +1096,8 @@ async function runDreamingScheduled() {
     }),
     'Dreaming'
   );
-  await DreamRun.create({ output: dreamText });
-  await LongTermMemory.create({
+  await stores.DreamRun.create({ output: dreamText });
+  await stores.LongTermMemory.create({
     title: `Dream synthesis ${new Date().toLocaleString()}`,
     content: dreamText,
     memory_type: 'dream',
@@ -873,10 +1112,14 @@ async function runBeliefExtractionScheduled() {
 }
 
 async function runBeliefTensionReviewScheduled(task, abortSignal, onSseEvent, resumeOpts = null) {
-  const tensions = await BeliefTension.filter({ tension_state: 'active' }, '-created_date', 28);
+  const prevProf = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(normalizeScheduledTaskMindStorageProfile(task?.mind_storage_profile));
+  try {
+  const stores = getMindEntityStores();
+  const tensions = await stores.BeliefTension.filter({ tension_state: 'active' }, '-created_date', 28);
   if (!tensions.length) return 'No active belief tensions — skipped.';
 
-  const beliefs = await BeliefStore.filter({ status: 'active' }, '-created_date', 22);
+  const beliefs = await stores.BeliefStore.filter({ status: 'active' }, '-created_date', 22);
   const tLines = tensions
     .map((t) => `- ${String(t.description || '').trim().slice(0, 520)}`)
     .join('\n');
@@ -894,7 +1137,10 @@ ${bLines}
 
 This mind is reviewing its own contradictions. Work through what can be reconciled, what should stay unresolved for now, and what would change the stance or confidence on related beliefs. Answer as Voice: first person, honest, actionable.`;
 
-  return runGraphPipelineForScheduler(prompt, task, abortSignal, onSseEvent, resumeOpts);
+    return await runGraphPipelineForScheduler(prompt, task, abortSignal, onSseEvent, resumeOpts);
+  } finally {
+    setActiveMindEntityProfile(prevProf);
+  }
 }
 
 async function countCuriosityPursuitsCompletedToday() {
@@ -935,98 +1181,111 @@ async function runGoalPursuitScheduled(task, abortSignal, onSseEvent, resume = n
     }
   }
 
-  const resolved = await resolveGoalItemForScheduledPursuit(task);
-  if (!resolved.item) {
-    return resolved.message || 'No open or dormant goal items — skipped.';
-  }
-  const item = resolved.item;
-
-  await GoalItem.update(item.id, { status: 'pursuing' });
-  notifyMindStorageChanged({ source: 'goals' });
-
+  const normalizedProfile = normalizeScheduledTaskMindStorageProfile(task?.mind_storage_profile);
+  const previousMindProfile = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(normalizedProfile);
   try {
-    if (rt.goalPursuitUseGraphPipeline === true) {
-      const gid = item.id;
-      upsertGoalPursuit(gid, {
-        running: true,
-        interruptedByReload: false,
-        cooperativePaused: false,
-        pursuitProgress: resume ? 'Resuming…' : 'Starting…',
-        goalPipelineUi: initialGoalPipelineUi(),
-        goalStatement: String(item.goal_statement || '').trim() || undefined,
-      });
-      let cooperativeGraphPaused = false;
-      try {
-        const prompt = buildGoalPursuitGraphPrompt(item);
-        const rootId = item.root_goal_id || item.id;
-        const combinedOnSse = (evt) => {
-          try {
-            onSseEvent?.(evt);
-          } catch (e) {
-            console.warn('[runGoalPursuitScheduled] onSseEvent', e);
-          }
-          updateGoalPagePursuitPipelineUiForId(gid, (prev) => reduceCuriosityPipelineSse(prev, evt));
-        };
-        const result = await runGraphPipelineOneShot({
-          inputText: prompt,
-          task,
-          source: 'scheduled-goal-pursuit',
-          goalPursuitContext: {
-            parentGoalId: item.id,
-            rootGoalId: rootId,
-          },
-          acquireGlobalGate: false,
-          abortSignal,
-          onSseEvent: combinedOnSse,
-          skipApiReachabilityProbe: true,
-          mirrorCooperativePauseToGraphSession: false,
-          ...(resume?.sharedMemory != null ? { initialFullSharedMemory: resume.sharedMemory } : {}),
-          ...(resume?.executionResume != null ? { executionResume: resume.executionResume } : {}),
+    const { GoalItem } = getMindEntityStores();
+    const resolved = await resolveGoalItemForScheduledPursuit(task);
+    if (!resolved.item) {
+      return resolved.message || 'No open or dormant goal items — skipped.';
+    }
+    const item = resolved.item;
+
+    await GoalItem.update(item.id, { status: 'pursuing' });
+    notifyMindStorageChanged({ source: 'goals' });
+
+    try {
+      if (rt.goalPursuitUseGraphPipeline === true) {
+        const effResume = resume ?? getScheduledTaskCheckpointResume(task);
+        const gid = item.id;
+        upsertGoalPursuit(gid, {
+          running: true,
+          interruptedByReload: false,
+          cooperativePaused: false,
+          pursuitProgress: effResume ? 'Resuming…' : 'Starting…',
+          goalPipelineUi: initialGoalPipelineUi(),
+          goalStatement: String(item.goal_statement || '').trim() || undefined,
+          mindStorageProfile: normalizedProfile,
         });
-        if (isPipelinePauseOutcome(result)) {
-          cooperativeGraphPaused = true;
-          return {
-            pipelinePaused: true,
-            summary: result.summary,
-            sharedMemory: result.sharedMemory,
-            executionCursor: result.executionCursor,
-            pipelineRunId: result.pipelineRunId,
+        let cooperativeGraphPaused = false;
+        try {
+          const prompt = buildGoalPursuitGraphPrompt(item);
+          const rootId = item.root_goal_id || item.id;
+          const combinedOnSse = (evt) => {
+            try {
+              onSseEvent?.(evt);
+            } catch (e) {
+              console.warn('[runGoalPursuitScheduled] onSseEvent', e);
+            }
+            updateGoalPagePursuitPipelineUiForId(gid, (prev) => reduceCuriosityPipelineSse(prev, evt));
           };
-        }
-        if (!result.voiceDeferredToScheduledSupervisor) {
-          await finalizePursuedGoalAfterGraph(item.id, result.voiceText, result.pipelineRunId);
-        }
-        notifyMindStorageChanged({ source: 'goals' });
-        return result.summary || truncate(result.voiceText, 400) || 'Goal pursuit (graph) complete.';
-      } finally {
-        if (cooperativeGraphPaused) {
-          patchGoalPagePursuitEntry(gid, {
-            running: false,
-            interruptedByReload: false,
-            cooperativePaused: true,
-            pursuitProgress: 'Paused — cooperative checkpoint saved. Open Goals to continue.',
+          const result = await runGraphPipelineOneShot({
+            inputText: prompt,
+            task,
+            source: 'scheduled-goal-pursuit',
+            goalPursuitContext: {
+              parentGoalId: item.id,
+              rootGoalId: rootId,
+            },
+            acquireGlobalGate: false,
+            abortSignal,
+            onSseEvent: combinedOnSse,
+            mirrorCooperativePauseToGraphSession: false,
+            ...(effResume?.sharedMemory != null ? { initialFullSharedMemory: effResume.sharedMemory } : {}),
+            ...(effResume?.executionResume != null ? { executionResume: effResume.executionResume } : {}),
           });
-          flushGoalPursuitsPersistNow();
-        } else {
-          patchGoalPagePursuitEntry(gid, {
-            running: false,
-            pursuitProgress: null,
-            interruptedByReload: false,
-            cooperativePaused: false,
-          });
+          if (isPipelinePauseOutcome(result)) {
+            cooperativeGraphPaused = true;
+            return {
+              pipelinePaused: true,
+              summary: result.summary,
+              sharedMemory: result.sharedMemory,
+              executionCursor: result.executionCursor,
+              pipelineRunId: result.pipelineRunId,
+            };
+          }
+          setActiveMindEntityProfile(normalizedProfile);
+          if (!result.voiceDeferredToScheduledSupervisor) {
+            await finalizePursuedGoalAfterGraph(item.id, result.voiceText, result.pipelineRunId, {
+              rawOutputs: result.rawOutputs,
+              sharedMemory: result.sharedMemory,
+            });
+          }
+          notifyMindStorageChanged({ source: 'goals' });
+          return result.summary || truncate(result.voiceText, 400) || 'Goal pursuit (graph) complete.';
+        } finally {
+          if (cooperativeGraphPaused) {
+            patchGoalPagePursuitEntry(gid, {
+              running: false,
+              interruptedByReload: false,
+              cooperativePaused: true,
+              pursuitProgress: 'Paused — cooperative checkpoint saved. Open Goals to continue.',
+            });
+            flushGoalPursuitsPersistNow();
+          } else {
+            patchGoalPagePursuitEntry(gid, {
+              running: false,
+              pursuitProgress: null,
+              interruptedByReload: false,
+              cooperativePaused: false,
+            });
+          }
         }
       }
-    }
 
-    return runGoalPursuitLlmOnly(item);
-  } catch (err) {
-    try {
-      await GoalItem.update(item.id, { status: 'open' });
-      notifyMindStorageChanged({ source: 'goals' });
-    } catch {
-      /* ignore */
+      return runGoalPursuitLlmOnly(item, { mindStorageProfile: normalizedProfile });
+    } catch (err) {
+      try {
+        await GoalItem.update(item.id, { status: 'open' });
+        notifyMindStorageChanged({ source: 'goals' });
+      } catch {
+        /* ignore */
+      }
+      throw err;
     }
-    throw err;
+  } finally {
+    setActiveMindEntityProfile(previousMindProfile);
   }
 }
 
@@ -1040,103 +1299,117 @@ async function runCuriosityPursuitScheduled(task, abortSignal, onSseEvent, resum
     }
   }
 
-  const resolved = await resolveCuriosityItemForScheduledPursuit(task);
-  if (!resolved.item) {
-    return resolved.message || 'No open or dormant curiosity items — skipped.';
-  }
-  const item = resolved.item;
-
-  await CuriosityItem.update(item.id, { status: 'pursuing' });
-  notifyMindStorageChanged({ source: 'curiosity' });
-
+  const normalizedProfile = normalizeScheduledTaskMindStorageProfile(task?.mind_storage_profile);
+  const previousMindProfile = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(normalizedProfile);
   try {
-    if (rt.curiosityPursuitUseGraphPipeline === true) {
-      const cid = item.id;
-      upsertCuriosityPursuit(cid, {
-        running: true,
-        interruptedByReload: false,
-        cooperativePaused: false,
-        pursuitProgress: resume ? 'Resuming…' : 'Starting…',
-        curiosityPipelineUi: initialCuriosityPipelineUi(),
-        question: String(item.question || '').trim() || undefined,
-      });
-      let cooperativeGraphPaused = false;
-      try {
-        const prompt = buildCuriosityPursuitGraphPrompt(item);
-        const rootId = item.root_curiosity_id || item.id;
-        const combinedOnSse = (evt) => {
-          try {
-            onSseEvent?.(evt);
-          } catch (e) {
-            console.warn('[runCuriosityPursuitScheduled] onSseEvent', e);
-          }
-          updateCuriosityPursuitPipelineUiForId(cid, (prev) => reduceCuriosityPipelineSse(prev, evt));
-        };
-        const result = await runGraphPipelineOneShot({
-          inputText: prompt,
-          task,
-          source: 'scheduled-curiosity-pursuit',
-          curiosityPursuitContext: {
-            parentCuriosityId: item.id,
-            rootCuriosityId: rootId,
-          },
-          acquireGlobalGate: false,
-          abortSignal,
-          onSseEvent: combinedOnSse,
-          skipApiReachabilityProbe: true,
-          mirrorCooperativePauseToGraphSession: false,
-          ...(resume?.sharedMemory != null ? { initialFullSharedMemory: resume.sharedMemory } : {}),
-          ...(resume?.executionResume != null ? { executionResume: resume.executionResume } : {}),
+    const { CuriosityItem } = getMindEntityStores();
+    const resolved = await resolveCuriosityItemForScheduledPursuit(task);
+    if (!resolved.item) {
+      return resolved.message || 'No open or dormant curiosity items — skipped.';
+    }
+    const item = resolved.item;
+
+    await CuriosityItem.update(item.id, { status: 'pursuing' });
+    notifyMindStorageChanged({ source: 'curiosity' });
+
+    try {
+      if (rt.curiosityPursuitUseGraphPipeline === true) {
+        const effResume = resume ?? getScheduledTaskCheckpointResume(task);
+        const cid = item.id;
+        upsertCuriosityPursuit(cid, {
+          running: true,
+          interruptedByReload: false,
+          cooperativePaused: false,
+          pursuitProgress: effResume ? 'Resuming…' : 'Starting…',
+          curiosityPipelineUi: initialCuriosityPipelineUi(),
+          question: String(item.question || '').trim() || undefined,
+          mindStorageProfile: normalizedProfile,
         });
-        if (isPipelinePauseOutcome(result)) {
-          cooperativeGraphPaused = true;
-          return {
-            pipelinePaused: true,
-            summary: result.summary,
-            sharedMemory: result.sharedMemory,
-            executionCursor: result.executionCursor,
-            pipelineRunId: result.pipelineRunId,
+        let cooperativeGraphPaused = false;
+        try {
+          const prompt = buildCuriosityPursuitGraphPrompt(item);
+          const rootId = item.root_curiosity_id || item.id;
+          const combinedOnSse = (evt) => {
+            try {
+              onSseEvent?.(evt);
+            } catch (e) {
+              console.warn('[runCuriosityPursuitScheduled] onSseEvent', e);
+            }
+            updateCuriosityPursuitPipelineUiForId(cid, (prev) => reduceCuriosityPipelineSse(prev, evt));
           };
-        }
-        if (!result.voiceDeferredToScheduledSupervisor) {
-          await finalizePursuedCuriosityAfterGraph(item.id, result.voiceText, result.pipelineRunId);
-        }
-        notifyMindStorageChanged({ source: 'curiosity' });
-        return result.summary || truncate(result.voiceText, 400) || 'Curiosity pursuit (graph) complete.';
-      } finally {
-        if (cooperativeGraphPaused) {
-          patchCuriosityPursuitEntry(cid, {
-            running: false,
-            interruptedByReload: false,
-            cooperativePaused: true,
-            pursuitProgress: 'Paused — cooperative checkpoint saved. Open Curiosity to continue.',
+          const result = await runGraphPipelineOneShot({
+            inputText: prompt,
+            task,
+            source: 'scheduled-curiosity-pursuit',
+            curiosityPursuitContext: {
+              parentCuriosityId: item.id,
+              rootCuriosityId: rootId,
+            },
+            acquireGlobalGate: false,
+            abortSignal,
+            onSseEvent: combinedOnSse,
+            mirrorCooperativePauseToGraphSession: false,
+            ...(effResume?.sharedMemory != null ? { initialFullSharedMemory: effResume.sharedMemory } : {}),
+            ...(effResume?.executionResume != null ? { executionResume: effResume.executionResume } : {}),
           });
-          flushCuriosityPursuitsPersistNow();
-        } else {
-          patchCuriosityPursuitEntry(cid, {
-            running: false,
-            pursuitProgress: null,
-            interruptedByReload: false,
-            cooperativePaused: false,
-          });
+          if (isPipelinePauseOutcome(result)) {
+            cooperativeGraphPaused = true;
+            return {
+              pipelinePaused: true,
+              summary: result.summary,
+              sharedMemory: result.sharedMemory,
+              executionCursor: result.executionCursor,
+              pipelineRunId: result.pipelineRunId,
+            };
+          }
+          setActiveMindEntityProfile(normalizedProfile);
+          if (!result.voiceDeferredToScheduledSupervisor) {
+            await finalizePursuedCuriosityAfterGraph(item.id, result.voiceText, result.pipelineRunId, {
+              rawOutputs: result.rawOutputs,
+              sharedMemory: result.sharedMemory,
+            });
+          }
+          notifyMindStorageChanged({ source: 'curiosity' });
+          return result.summary || truncate(result.voiceText, 400) || 'Curiosity pursuit (graph) complete.';
+        } finally {
+          if (cooperativeGraphPaused) {
+            patchCuriosityPursuitEntry(cid, {
+              running: false,
+              interruptedByReload: false,
+              cooperativePaused: true,
+              pursuitProgress: 'Paused — cooperative checkpoint saved. Open Curiosity to continue.',
+            });
+            flushCuriosityPursuitsPersistNow();
+          } else {
+            patchCuriosityPursuitEntry(cid, {
+              running: false,
+              pursuitProgress: null,
+              interruptedByReload: false,
+              cooperativePaused: false,
+            });
+          }
         }
       }
-    }
 
-    return runCuriosityPursuitLlmOnly(item);
-  } catch (err) {
-    try {
-      await CuriosityItem.update(item.id, { status: 'open' });
-      notifyMindStorageChanged({ source: 'curiosity' });
-    } catch {
-      /* ignore */
+      return runCuriosityPursuitLlmOnly(item, { mindStorageProfile: normalizedProfile });
+    } catch (err) {
+      try {
+        await CuriosityItem.update(item.id, { status: 'open' });
+        notifyMindStorageChanged({ source: 'curiosity' });
+      } catch {
+        /* ignore */
+      }
+      throw err;
     }
-    throw err;
+  } finally {
+    setActiveMindEntityProfile(previousMindProfile);
   }
 }
 
 async function runCuriosityGenerationScheduled() {
-  const runs = excludeCheckpointPipelineRuns(await PipelineRun.list('-created_date', 4));
+  const stores = getMindEntityStores();
+  const runs = excludeCheckpointPipelineRuns(await stores.PipelineRun.list('-created_date', 4));
   if (runs.length === 0) return 'No pipeline runs — skipped curiosity generation.';
 
   const result = await invokeLLM({
@@ -1169,7 +1442,7 @@ async function runCuriosityGenerationScheduled() {
       typeof item.priority === 'number' && !Number.isNaN(item.priority)
         ? clampPriority(item.priority, DEFAULT_MANUAL_LIKE_PRIORITY)
         : DEFAULT_MANUAL_LIKE_PRIORITY;
-    const created = await CuriosityItem.create({
+    const created = await stores.CuriosityItem.create({
       question: q,
       pursuit_thread: String(item?.pursuit_thread || '').trim(),
       status: 'open',
@@ -1190,10 +1463,11 @@ async function runCuriosityGenerationScheduled() {
 }
 
 async function runBiographyScheduled() {
-  const prevBioList = await MindBiography.list('-created_date', 1);
+  const stores = getMindEntityStores();
+  const prevBioList = await stores.MindBiography.list('-created_date', 1);
   const prevBio = prevBioList[0];
 
-  const gen = await generateMindBiographyViaLlm(prevBio, {});
+  const gen = await generateMindBiographyViaLlm(prevBio, { stores });
 
   await persistMindBiographyVersion({
     sessionNumber: gen.sessionNumber,
@@ -1206,12 +1480,14 @@ async function runBiographyScheduled() {
     beliefCount: gen.beliefCount,
     sessionId: gen.runs[0]?.id || 'scheduled',
     source: 'scheduled-biography',
+    stores,
   });
 
   return truncate(gen.summary || gen.fullText, 400);
 }
 
 async function runDmnReflectionScheduled() {
+  const stores = getMindEntityStores();
   const { prompt, systemPrompt } = await composeDmnReflectionUserPrompt();
   const raw = assertLlmTextOk(
     await llmService.InvokeLLM({
@@ -1228,21 +1504,21 @@ async function runDmnReflectionScheduled() {
     ellipsis: true,
   });
 
-  await SelfLedgerRevision.create({
+  await stores.SelfLedgerRevision.create({
     reason: 'dmn_internal_narrative',
     summary: summaryLine,
     identity_excerpt: clipTextComplete(fullCombined, 8000, { ellipsis: true }),
     phase: 'drift',
   });
 
-  await LongTermMemory.create({
+  await stores.LongTermMemory.create({
     title: `DMN reflection ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`,
     content: fullCombined,
     memory_type: 'dmn',
     source: 'scheduled-dmn',
   });
 
-  await TemporalEvent.create({
+  await stores.TemporalEvent.create({
     title: 'dmn_reflection',
     details: clipTextComplete(
       [summaryLine, p.embodiedAnchor ? `Embodied: ${p.embodiedAnchor}` : ''].filter(Boolean).join('\n\n'),
@@ -1257,12 +1533,13 @@ async function runDmnReflectionScheduled() {
 }
 
 async function runWorldModelScheduled() {
+  const stores = getMindEntityStores();
   const [runsRaw, beliefs, memories, eventsRaw, items] = await Promise.all([
-    PipelineRun.list('-created_date', 6),
-    BeliefStore.list('-created_date', 20),
-    LongTermMemory.list('-created_date', 12),
-    TemporalEvent.list('-created_date', 20),
-    WorldModel.list('-updated_date', 100),
+    stores.PipelineRun.list('-created_date', 6),
+    stores.BeliefStore.list('-created_date', 20),
+    stores.LongTermMemory.list('-created_date', 12),
+    stores.TemporalEvent.list('-created_date', 20),
+    stores.WorldModel.list('-updated_date', 100),
   ]);
   const runs = excludeCheckpointPipelineRuns(runsRaw);
   const events = temporalEventsExcludingPauseNoise(eventsRaw);
@@ -1348,14 +1625,14 @@ ${events.map((e) => `- ${e.title}: ${truncate(e.details, 140)}`).join('\n').slic
         'scheduled-world-model',
         'Scheduled world-model refresh'
       );
-      const rec = await WorldModel.update(existing.id, patch);
+      const rec = await stores.WorldModel.update(existing.id, patch);
       if (rec) {
         const ix = current.findIndex((r) => r.id === existing.id);
         if (ix >= 0) current[ix] = rec;
       }
       updated += 1;
     } else {
-      const rec = await WorldModel.create(
+      const rec = await stores.WorldModel.create(
         buildWorldModelCreatePayload({
           category: canon,
           label: llmLabel,
@@ -1385,14 +1662,9 @@ ${events.map((e) => `- ${e.title}: ${truncate(e.details, 140)}`).join('\n').slic
 }
 
 async function performScheduledTask(task, { abortSignal } = {}) {
-  /** One probe for every scheduled path (LLM-only + graph): flaky mobile Wi‑Fi / LAN; avoids duplicate inner probes via skipApiReachabilityProbe. */
-  await ensureApiReachable({
-    timeoutMs: 15_000,
-    retries: 2,
-    retryDelayMs: 500,
-    signal: abortSignal,
-  });
-
+  const prevMindProfile = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(normalizeScheduledTaskMindStorageProfile(task?.mind_storage_profile));
+  try {
   const reason = task.reason || '';
   const input = task.input_text || '';
 
@@ -1496,9 +1768,29 @@ async function performScheduledTask(task, { abortSignal } = {}) {
         b.finish(outcome);
       }
     }
+    case 'autonomous_consolidation': {
+      const b = schedulerPipelineUiBridge(task);
+      let outcome;
+      try {
+        outcome = await runAutonomousConsolidationScheduled(task, abortSignal, b.onSse);
+        return outcome;
+      } finally {
+        b.finish(outcome);
+      }
+    }
+    case 'pending_inbox_digest': {
+      const b = schedulerPipelineUiBridge(task);
+      let outcome;
+      try {
+        outcome = await runPendingInboxDigestScheduled(task, abortSignal, b.onSse);
+        return outcome;
+      } finally {
+        b.finish(outcome);
+      }
+    }
     case 'multi_mind_debate':
       return (
-        'multi_mind_debate was removed — use Graph Pipeline or Playground. Delete or disable this scheduled task.'
+        'multi_mind_debate was removed — use Graph Pipeline or System Chat. Delete or disable this scheduled task.'
       );
     case 'consolidation_pass':
       return runConsolidationScheduled();
@@ -1522,8 +1814,59 @@ async function performScheduledTask(task, { abortSignal } = {}) {
       return runCognitiveHealthSnapshotScheduled();
     case 'emergence_detection':
       return runEmergenceDetectionScheduled();
+    case 'exploration_run': {
+      const prompt =
+        input.trim() ||
+        'Self-initiated exploration run. Follow your curiosity on a topic that interests you.';
+      const b = schedulerPipelineUiBridge(task);
+      let outcome;
+      try {
+        outcome = await runGraphPipelineForScheduler(prompt, { ...task, task_type: 'pipeline_run' }, abortSignal, b.onSse);
+        return outcome;
+      } finally {
+        b.finish(outcome);
+      }
+    }
+    case 'dual_dialogue': {
+      const topic = input.trim() || await suggestRandomPlaygroundTopic() || 'Reflect on what feels most alive in your thinking right now.';
+      const rt = getRuntimeSettings();
+      const turnsPerBlock = Math.max(1, Math.min(20, Math.floor(Number(rt.playgroundTurnsPerBlock) || PLAYGROUND_DUAL_TURNS_PER_BLOCK)));
+      const maxBlocks = Math.max(1, Math.min(100, Math.floor(Number(rt.playgroundAutoContinueMaxBlocks) || 10)));
+      const results = [];
+      beginPlaygroundDualOrchestration();
+      try {
+        let lineForA = topic;
+        for (let block = 0; block < maxBlocks; block++) {
+          if (isCooperativePauseAllExternalHoldActive()) {
+            results.push(`[block ${block + 1}] stopped: cooperative pause active`);
+            break;
+          }
+          if (abortSignal?.aborted) {
+            results.push(`[block ${block + 1}] stopped: aborted`);
+            break;
+          }
+          for (let turn = 0; turn < turnsPerBlock; turn++) {
+            if (isCooperativePauseAllExternalHoldActive() || abortSignal?.aborted) break;
+            const r = await runPlaygroundDualTurn(lineForA, turn > 0 ? { chain: { humanAnchor: topic, prevVoiceA: lineForA } } : undefined);
+            if (!r.ok) {
+              results.push(`[block ${block + 1} turn ${turn + 1}] ${r.reason || 'failed'}`);
+              break;
+            }
+            results.push(`[block ${block + 1} turn ${turn + 1}] A: ${(r.voiceTextA || '').slice(0, 80)}… B: ${(r.voiceTextB || '').slice(0, 80)}…`);
+            lineForA = r.voiceTextB || '';
+            if (!lineForA.trim()) break;
+          }
+        }
+      } finally {
+        endPlaygroundDualOrchestration();
+      }
+      return `dual_dialogue (${results.length} turns): ${results.slice(-3).join(' | ')}`;
+    }
     default:
       throw new Error(`Unknown task type: ${task.task_type}`);
+  }
+  } finally {
+    setActiveMindEntityProfile(prevMindProfile);
   }
 }
 
@@ -1545,15 +1888,19 @@ function isDuePendingTask(t) {
 
 export async function recoverStaleRunningScheduledTasks() {
   try {
+    const rt = getRuntimeSettings();
+    const staleMs = resolveStaleRunningScheduledTaskMs(rt);
+    const staleMin = Math.max(1, Math.round(staleMs / 60_000));
     const all = await listAllScheduledTasksForRunner();
     const now = Date.now();
     for (const t of all) {
       if (normalizedSchedulerStatus(t.status) !== 'running') continue;
-      const started = t.run_started_at ? new Date(t.run_started_at).getTime() : 0;
-      if (!Number.isFinite(started) || started <= 0) continue;
-      if (now - started < STALE_RUNNING_SCHEDULED_TASK_MS) continue;
-      const staleMsg =
-        'Run exceeded ~20 minutes without completion (or the tab closed before completion). Open Scheduler and use Run again if you still need this job.';
+      const live = scheduledTaskLivenessEpochMs(t);
+      if (!Number.isFinite(live) || live <= 0) continue;
+      if (now - live < staleMs) continue;
+      // Let the in-flight run tear down (finally decrements activeScheduledDueTaskRuns) instead of wedging concurrency.
+      requestAbortScheduledTaskRun(t.id);
+      const staleMsg = `Run exceeded ${staleMin} minutes since last start/heartbeat without completion (or the tab closed before completion). Increase Runtime Settings → “Stale running threshold” or keep the tab open. Open Scheduler and use Run again if you still need this job.`;
       const summarizedStale = tagScheduledTaskFailureSummary(staleMsg).slice(0, 2000);
       const requeued = await maybeRequeueFailedScheduledTask(t.id, summarizedStale, t);
       if (!requeued) {
@@ -1561,6 +1908,7 @@ export async function recoverStaleRunningScheduledTasks() {
           status: 'failed',
           result_summary: summarizedStale,
           completed_at: new Date().toISOString(),
+          scheduler_last_progress_at: null,
         });
       }
       scheduledWorkEnqueuedIds.delete(String(t.id));
@@ -1577,6 +1925,29 @@ export async function recoverStaleRunningScheduledTasks() {
   }
 }
 
+/**
+ * If IndexedDB has no `running` rows but the automatic due-task counter is still positive (e.g. stale
+ * recovery cleared {@link scheduledWorkEnqueuedIds} while an AbortController was still registered),
+ * later due tasks never start when max concurrent is 1.
+ */
+async function reconcileActiveScheduledDueTaskRunsWithStorage() {
+  if (activeScheduledDueTaskRuns <= 0) return;
+  if (scheduledWorkEnqueuedIds.size > 0) return;
+  try {
+    const all = await listAllScheduledTasksForRunner();
+    const anyRunning = all.some((t) => normalizedSchedulerStatus(t.status) === 'running');
+    if (!anyRunning) {
+      console.warn(
+        '[scheduler] reconciling activeScheduledDueTaskRuns — no running rows in storage (counter was',
+        activeScheduledDueTaskRuns + ')'
+      );
+      activeScheduledDueTaskRuns = 0;
+    }
+  } catch (e) {
+    console.warn('[scheduler] reconcile activeScheduledDueTaskRuns failed', e);
+  }
+}
+
 async function completeScheduledTaskIfStillValid(taskId, originalTask, summary) {
   const latest = await ScheduledTask.retrieve(taskId);
   if (!latest || normalizedSchedulerStatus(latest.status) === 'cancelled') {
@@ -1584,14 +1955,18 @@ async function completeScheduledTaskIfStillValid(taskId, originalTask, summary) 
     return;
   }
   if (isPipelinePauseOutcome(summary)) {
+    const rawSm = summary.sharedMemory;
+    const smPersist =
+      rawSm && typeof rawSm === 'object' ? slimSharedMemoryForGraphCheckpoint(rawSm) ?? rawSm : null;
     await ScheduledTask.update(taskId, {
       status: 'paused',
       result_summary: String(summary.summary || 'Pipeline paused cooperatively.').slice(0, 2000),
-      pipeline_checkpoint_shared_memory: summary.sharedMemory ?? null,
+      pipeline_checkpoint_shared_memory: smPersist,
       pipeline_checkpoint_execution_resume: summary.executionCursor ?? null,
       pipeline_checkpoint_pipeline_run_id: summary.pipelineRunId ?? null,
       completed_at: null,
       run_started_at: null,
+      scheduler_last_progress_at: null,
     });
     notifyMindStorageChanged({ source: 'scheduled-tasks' });
     await syncDashboardScheduledRunningFromDb();
@@ -1605,23 +1980,11 @@ async function completeScheduledTaskIfStillValid(taskId, originalTask, summary) 
     pipeline_checkpoint_shared_memory: null,
     pipeline_checkpoint_execution_resume: null,
     pipeline_checkpoint_pipeline_run_id: null,
+    scheduler_last_progress_at: null,
   });
   await enqueueRecurrence(originalTask);
   notifyMindStorageChanged({ source: 'scheduled-tasks' });
 }
-
-const RESUMABLE_PAUSED_GRAPH_TYPES = new Set([
-  'pipeline_run',
-  'pipeline_classic',
-  'consciousness_stream',
-  'supervisor_pipeline_rerun',
-  'metacognition_pipeline_rerun',
-  'metacognition_review',
-  'belief_tension_review',
-  'diagnostic',
-  'curiosity_pursuit',
-  'goal_pursuit',
-]);
 
 async function resumePausedScheduledTaskBody(task, sharedMemory, executionResume, abortSignal, onSseEvent) {
   const input = String(task.input_text || '').trim();
@@ -1666,6 +2029,10 @@ async function resumePausedScheduledTaskBody(task, sharedMemory, executionResume
       const prompt = `[Scheduled diagnostic] ${reason || 'Review recent cognitive state, internal consistency, and open curiosity. Note anomalies and suggest focus for the next session.'}`;
       return runGraphPipelineForScheduler(prompt, task, abortSignal, onSseEvent, resumeOpts);
     }
+    case 'autonomous_consolidation':
+      return runAutonomousConsolidationScheduled(task, abortSignal, onSseEvent);
+    case 'pending_inbox_digest':
+      return runPendingInboxDigestScheduled(task, abortSignal, onSseEvent);
     case 'curiosity_pursuit':
       return runCuriosityPursuitScheduled(task, abortSignal, onSseEvent, {
         sharedMemory,
@@ -1676,6 +2043,12 @@ async function resumePausedScheduledTaskBody(task, sharedMemory, executionResume
         sharedMemory,
         executionResume,
       });
+    case 'exploration_run': {
+      const prompt =
+        String(task.input_text || '').trim() ||
+        'Self-initiated exploration run. Follow your curiosity on a topic that interests you.';
+      return runGraphPipelineForScheduler(prompt, { ...task, task_type: 'pipeline_run' }, abortSignal, onSseEvent, resumeOpts);
+    }
     default:
       throw new Error(`Cannot resume paused task type: ${task.task_type}`);
   }
@@ -1724,21 +2097,27 @@ export async function resumePausedScheduledPipelineTask(taskId) {
   if (!RESUMABLE_PAUSED_GRAPH_TYPES.has(String(t.task_type || ''))) {
     throw new Error('This paused task type does not support graph resume.');
   }
-  const sm = t.pipeline_checkpoint_shared_memory;
+  const smRaw = t.pipeline_checkpoint_shared_memory;
   const er = t.pipeline_checkpoint_execution_resume;
-  if (!sm || typeof sm !== 'object' || !er || typeof er !== 'object') {
+  if (!smRaw || typeof smRaw !== 'object' || !er || typeof er !== 'object') {
     throw new Error('This task has no resumable checkpoint data.');
   }
+  const sm = slimSharedMemoryForGraphCheckpoint(smRaw) ?? smRaw;
 
   scheduledWorkEnqueuedIds.add(id);
   const ac = new AbortController();
   scheduledTaskRunAbortControllers.set(id, ac);
   beginBackgroundCognitiveWork();
   let persistedFlightTaskId = null;
+  let stopHeartbeat = () => {};
   try {
+    const runStartedAt = new Date().toISOString();
+    const rtResume = getRuntimeSettings();
+    stopHeartbeat = startScheduledTaskRunHeartbeat(id, resolveSchedulerHeartbeatIntervalMs(rtResume));
     await ScheduledTask.update(id, {
       status: 'running',
-      run_started_at: new Date().toISOString(),
+      run_started_at: runStartedAt,
+      scheduler_last_progress_at: runStartedAt,
     });
     persistedFlightTaskId = id;
     await syncDashboardScheduledRunningFromDb();
@@ -1756,13 +2135,19 @@ export async function resumePausedScheduledPipelineTask(taskId) {
     await persistScheduledTaskRunFailure(id, err, 'resume paused task failed');
     if (!isAbortError(err)) throw err;
   } finally {
+    try {
+      stopHeartbeat();
+    } catch {
+      /* ignore */
+    }
     if (scheduledTaskRunAbortControllers.get(id) === ac) {
       scheduledTaskRunAbortControllers.delete(id);
     }
     if (persistedFlightTaskId) clearPersistedSchedulerHeadlessFlightIfMatches(persistedFlightTaskId);
-    endBackgroundCognitiveWork();
+    try { endBackgroundCognitiveWork(); } catch (e) { console.warn('[scheduler] endBackgroundCognitiveWork threw (resume)', e); }
     scheduledWorkEnqueuedIds.delete(id);
     await syncDashboardScheduledRunningFromDb();
+    void flushSchedulerDueTasksNow();
   }
 }
 
@@ -1804,6 +2189,7 @@ async function maybeRequeueFailedScheduledTask(taskId, summarizedBase, latestRow
       scheduler_retry_attempt: nextAttempt,
       run_started_at: null,
       completed_at: null,
+      scheduler_last_progress_at: null,
       result_summary: summary.slice(0, 2000),
     });
   } catch (e2) {
@@ -1826,6 +2212,7 @@ async function persistScheduledTaskRunFailure(taskId, err, logLabel) {
           status: 'cancelled',
           result_summary: 'Stopped during run.',
           completed_at: new Date().toISOString(),
+          scheduler_last_progress_at: null,
         });
       }
     } catch (e2) {
@@ -1847,8 +2234,9 @@ async function persistScheduledTaskRunFailure(taskId, err, logLabel) {
   }
 
   const taskType = latestForFailure?.task_type != null ? String(latestForFailure.task_type) : '';
-  console.error(`[scheduler] ${logLabel}`, { taskId, taskType, err });
   const msg = err instanceof Error ? err.message : String(err);
+  const { bucket, tag } = classifyScheduledTaskFailureMessage(msg);
+  console.error(`[scheduler] ${logLabel}`, { taskId, taskType, bucket, tag, err });
   const summarized = tagScheduledTaskFailureSummary(appendRateLimitRecoveryHint(msg)).slice(0, 2000);
   const requeued = await maybeRequeueFailedScheduledTask(taskId, summarized, latestForFailure);
   if (!requeued) {
@@ -1857,6 +2245,7 @@ async function persistScheduledTaskRunFailure(taskId, err, logLabel) {
         status: 'failed',
         result_summary: summarized,
         completed_at: new Date().toISOString(),
+        scheduler_last_progress_at: null,
       });
     } catch (e2) {
       console.warn('[scheduler] failed to persist failure state', e2);
@@ -1872,12 +2261,17 @@ async function persistScheduledTaskRunFailure(taskId, err, logLabel) {
  * @returns {Promise<void>}
  */
 async function executeManualScheduledTaskRetryBody(taskId) {
+  const id = String(taskId ?? '').trim();
+  if (!id) {
+    throw new SchedulerRetrySkippedError('Invalid task id.');
+  }
   const ac = new AbortController();
-  scheduledTaskRunAbortControllers.set(taskId, ac);
+  scheduledTaskRunAbortControllers.set(id, ac);
   beginBackgroundCognitiveWork();
   let persistedFlightTaskId = null;
+  let stopHeartbeat = () => {};
   try {
-    const t = await ScheduledTask.retrieve(taskId);
+    const t = await ScheduledTask.retrieve(id);
     if (!t) {
       throw new SchedulerRetrySkippedError('This scheduled task no longer exists.');
     }
@@ -1892,33 +2286,49 @@ async function executeManualScheduledTaskRetryBody(taskId) {
       );
     }
 
-    console.info('[scheduler] manual rerun', taskId, t.task_type, t.status);
+    console.info('[scheduler] manual rerun', id, t.task_type, t.status);
     const runStartedAt = new Date().toISOString();
-    await ScheduledTask.update(taskId, {
+    const rtManual = getRuntimeSettings();
+    stopHeartbeat = startScheduledTaskRunHeartbeat(id, resolveSchedulerHeartbeatIntervalMs(rtManual));
+    await ScheduledTask.update(id, {
       status: 'running',
       run_started_at: runStartedAt,
       scheduler_retry_attempt: 0,
+      scheduler_last_progress_at: runStartedAt,
     });
     await syncDashboardScheduledRunningFromDb();
     notifyMindStorageChanged({ source: 'scheduled-tasks' });
-    persistedFlightTaskId = taskId;
-    const summary = await performScheduledTask(t, { abortSignal: ac.signal });
-    await completeScheduledTaskIfStillValid(taskId, t, summary);
+    persistedFlightTaskId = id;
+    let fresh;
+    try {
+      fresh = await ScheduledTask.retrieve(id);
+    } catch (e) {
+      console.warn('[scheduler] manual rerun: retrieve after running status failed', e);
+      fresh = t;
+    }
+    const summary = await performScheduledTask(fresh && fresh.id ? fresh : t, { abortSignal: ac.signal });
+    await completeScheduledTaskIfStillValid(id, t, summary);
   } catch (err) {
     if (err instanceof SchedulerRetrySkippedError) {
       notifyMindStorageChanged({ source: 'scheduled-tasks' });
       throw err;
     }
-    await persistScheduledTaskRunFailure(taskId, err, 'retry task failed');
+    await persistScheduledTaskRunFailure(id, err, 'retry task failed');
     if (!isAbortError(err)) throw err;
   } finally {
-    if (scheduledTaskRunAbortControllers.get(taskId) === ac) {
-      scheduledTaskRunAbortControllers.delete(taskId);
+    try {
+      stopHeartbeat();
+    } catch {
+      /* ignore */
+    }
+    if (scheduledTaskRunAbortControllers.get(id) === ac) {
+      scheduledTaskRunAbortControllers.delete(id);
     }
     if (persistedFlightTaskId) clearPersistedSchedulerHeadlessFlightIfMatches(persistedFlightTaskId);
-    endBackgroundCognitiveWork();
-    scheduledWorkEnqueuedIds.delete(taskId);
+    try { endBackgroundCognitiveWork(); } catch (e) { console.warn('[scheduler] endBackgroundCognitiveWork threw (retry)', e); }
+    scheduledWorkEnqueuedIds.delete(id);
     await syncDashboardScheduledRunningFromDb();
+    void flushSchedulerDueTasksNow();
   }
 }
 
@@ -1954,7 +2364,7 @@ export async function retryFailedScheduledTask(id) {
   }
   if (!probe || !isSchedulerTaskManuallyRerunnable(probe)) {
     throw new Error(
-      'Only failed, cancelled, or auto-retry pending tasks can be run again.'
+      'Only failed, cancelled, due/paused-schedule pending, or auto-retry pending tasks can be run from here.'
     );
   }
 
@@ -1980,22 +2390,47 @@ async function tick() {
   try {
     await pruneScheduledWorkEnqueuedIds();
     await recoverStaleRunningScheduledTasks();
+    await reconcileActiveScheduledDueTaskRunsWithStorage();
     await syncDashboardScheduledRunningFromDb();
 
     let dueList;
     try {
       const all = await listAllScheduledTasksForRunner();
-      dueList = all.filter(isDuePendingTask).sort((a, b) => new Date(a.scheduled_at) - new Date(b.scheduled_at));
+      dueList = all
+        .filter(isDuePendingTask)
+        .sort((a, b) => {
+          const ta = new Date(a.scheduled_at).getTime();
+          const tb = new Date(b.scheduled_at).getTime();
+          if (ta !== tb) return ta - tb;
+          return String(a.id || '').localeCompare(String(b.id || ''));
+        });
     } catch (e) {
       console.warn('[scheduler] list failed', e);
       return;
     }
 
     if (isCooperativePauseAllExternalHoldActive()) {
-      return;
+      if (scheduledWorkEnqueuedIds.size > 0 || scheduledTaskRunAbortControllers.size > 0) {
+        return;
+      }
+      try {
+        const allHold = await listAllScheduledTasksForRunner();
+        if (allHold.some((t) => normalizedSchedulerStatus(t.status) === 'running')) {
+          return;
+        }
+      } catch {
+        return;
+      }
+      console.warn('[scheduler] auto-clearing cooperative pause hold — no tasks are running');
+      setCooperativePauseAllExternalHold(false);
     }
 
-    for (const task of dueList) {
+    const rtTick = getRuntimeSettings();
+    const maxConcurrent = resolveSchedulerMaxConcurrentRunningTasks(rtTick);
+    const catchUpCap = Math.max(1, Math.floor(Number(rtTick.schedulerCatchUpMaxDuePerTick) || 6));
+    const dueSlice = dueList.length > catchUpCap ? dueList.slice(0, catchUpCap) : dueList;
+
+    for (const task of dueSlice) {
       let fresh;
       try {
         fresh = await ScheduledTask.retrieve(task.id);
@@ -2009,25 +2444,36 @@ async function tick() {
       const id = String(fresh.id ?? '').trim();
       if (!id) continue;
       if (scheduledWorkEnqueuedIds.has(id)) continue;
+      if (maxConcurrent > 0 && activeScheduledDueTaskRuns >= maxConcurrent) {
+        break;
+      }
       scheduledWorkEnqueuedIds.add(id);
+      activeScheduledDueTaskRuns += 1;
 
       void enqueueCognitiveWork(async () => {
         const ac = new AbortController();
         let persistedFlightTaskId = null;
         let heldGate = false;
+        let stopHeartbeat = () => {};
         try {
           const t = await ScheduledTask.retrieve(id);
           if (!t || normalizedSchedulerStatus(t.status) !== 'pending') return;
 
           scheduledTaskRunAbortControllers.set(id, ac);
+          await waitUntilScheduledSlotAvailable();
           beginBackgroundCognitiveWork();
           heldGate = true;
+
+          const rtInner = getRuntimeSettings();
+          const hbMs = resolveSchedulerHeartbeatIntervalMs(rtInner);
+          stopHeartbeat = startScheduledTaskRunHeartbeat(id, hbMs);
 
           console.info('[scheduler] running', id, t.task_type);
           const runStartedAt = new Date().toISOString();
           await ScheduledTask.update(id, {
             status: 'running',
             run_started_at: runStartedAt,
+            scheduler_last_progress_at: runStartedAt,
           });
           persistedFlightTaskId = id;
           await syncDashboardScheduledRunningFromDb();
@@ -2037,18 +2483,32 @@ async function tick() {
         } catch (err) {
           if (heldGate) await persistScheduledTaskRunFailure(id, err, 'task failed');
         } finally {
+          try {
+            stopHeartbeat();
+          } catch {
+            /* ignore */
+          }
           if (scheduledTaskRunAbortControllers.get(id) === ac) {
             scheduledTaskRunAbortControllers.delete(id);
           }
           if (persistedFlightTaskId) clearPersistedSchedulerHeadlessFlightIfMatches(persistedFlightTaskId);
-          if (heldGate) endBackgroundCognitiveWork();
+          try {
+            if (heldGate) endBackgroundCognitiveWork();
+          } catch (busyErr) {
+            console.warn('[scheduler] endBackgroundCognitiveWork threw', busyErr);
+          }
+          activeScheduledDueTaskRuns = Math.max(0, activeScheduledDueTaskRuns - 1);
           scheduledWorkEnqueuedIds.delete(id);
           await syncDashboardScheduledRunningFromDb();
+          // Don’t wait for the 5s poll: pick up the next due task / retry immediately when capacity allows.
+          void flushSchedulerDueTasksNow();
         }
       }).catch((err) => {
         console.error('[scheduler] cognitive queue error', id, err);
+        activeScheduledDueTaskRuns = Math.max(0, activeScheduledDueTaskRuns - 1);
         scheduledWorkEnqueuedIds.delete(id);
         void syncDashboardScheduledRunningFromDb();
+        void flushSchedulerDueTasksNow();
       });
     }
   } finally {
@@ -2072,6 +2532,7 @@ export function startScheduledTaskRunner() {
     await recoverStaleRunningScheduledTasks();
     await healLeakedBackgroundCognitiveGateIfNoRunningTask();
     await syncDashboardScheduledRunningFromDb();
+    await healStaleCooperativePauseHold();
     void tick();
   })();
   intervalId = window.setInterval(() => void tick(), POLL_MS);

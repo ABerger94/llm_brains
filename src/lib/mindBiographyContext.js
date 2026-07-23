@@ -1,23 +1,25 @@
 import { clipTextComplete } from '../../shared/textClip.mjs';
 import { temporalEventsExcludingPauseNoise } from '../../shared/temporalTimelinePauseFilter.mjs';
 import { MODULES } from '../../shared/pipelineModules.mjs';
-import {
-  BeliefStore,
-  BeliefTension,
-  ConversationMessage,
-  CuriosityItem,
-  EmergenceEvent,
-  LongTermMemory,
-  PipelineRun,
-  SelfLedgerRevision,
-  TemporalEvent,
-} from './data';
+import { getActiveMindEntityProfile, getMindEntityStores } from './mindEntityContext';
 import { openrouterRequestFields } from './llmClientOptions';
-import { getRuntimeSettings } from './runtimeSettings';
+import { getPipelineIdentityRuntimeSlice, getRuntimeSettings } from './runtimeSettings';
 import { loadStructuralSelfForPipeline, buildWorkingMemorySeed } from './mindPersistence';
 import { rowsToRecentDialogue } from './pipelineDialogueContext';
 import { readFetchErrorMessage } from './pipelineSse';
 import { pickLatestNonCheckpointPipelineRun } from './pipelineRunCheckpoint';
+
+const E = () => getMindEntityStores();
+
+/**
+ * Snapshot profile + stores once so concurrent `setActiveMindEntityProfile` calls
+ * from other async pipelines cannot corrupt a biography generation mid-flight.
+ */
+function captureProfileSnapshot() {
+  const profile = getActiveMindEntityProfile();
+  const stores = getMindEntityStores();
+  return { profile, stores };
+}
 
 const MEMORY_DIGEST_CAP = 28_000;
 
@@ -29,9 +31,10 @@ function safeClone(o) {
   }
 }
 
-function voiceSystemPromptFromSettings() {
+function voiceSystemPromptFromSettings(profileOverride) {
   const rt = getRuntimeSettings();
-  const ov = rt.modulePromptOverrides?.Voice;
+  const id = getPipelineIdentityRuntimeSlice(rt, profileOverride ?? getActiveMindEntityProfile());
+  const ov = id.modulePromptOverrides?.Voice;
   if (typeof ov === 'string' && ov.trim()) return ov.trim();
   const m = MODULES.find((x) => x.name === 'Voice');
   return m?.systemPrompt || '';
@@ -84,8 +87,10 @@ function buildLongTermStoreDigest({ memories, temporalEvents, emergenceRows, led
 
 /**
  * Loads persisted mind data and shapes a sharedMemory snapshot compatible with the server Voice context builder.
+ * @param {ReturnType<typeof getMindEntityStores>} [storesOverride] — captured stores to avoid reading the mutable global across `await` boundaries.
  */
-export async function buildMindBiographySharedMemoryDraft() {
+export async function buildMindBiographySharedMemoryDraft(storesOverride) {
+  const S = storesOverride || E();
   const [
     memories,
     beliefsActive,
@@ -97,15 +102,15 @@ export async function buildMindBiographySharedMemoryDraft() {
     runs,
     ledgerRows,
   ] = await Promise.all([
-    LongTermMemory.list('-created_date', 150),
-    BeliefStore.filter({ status: 'active' }, '-created_date', 200),
-    BeliefStore.list('-created_date', 200),
-    TemporalEvent.list('-created_date', 60),
-    CuriosityItem.list('-created_date', 40),
-    BeliefTension.list('-created_date', 40),
-    EmergenceEvent.list('-created_date', 20),
-    PipelineRun.list('-created_date', 4),
-    SelfLedgerRevision.list('-created_date', 10),
+    S.LongTermMemory.list('-created_date', 150),
+    S.BeliefStore.filter({ status: 'active' }, '-created_date', 200),
+    S.BeliefStore.list('-created_date', 200),
+    S.TemporalEvent.list('-created_date', 60),
+    S.CuriosityItem.list('-created_date', 40),
+    S.BeliefTension.list('-created_date', 40),
+    S.EmergenceEvent.list('-created_date', 20),
+    S.PipelineRun.list('-created_date', 4),
+    S.SelfLedgerRevision.list('-created_date', 10),
   ]);
 
   const beliefs = beliefsActive.length ? beliefsActive : beliefsFallback;
@@ -164,18 +169,24 @@ export async function buildMindBiographySharedMemoryDraft() {
   };
 }
 
-export async function buildPipelineOptionsForMindBiography() {
+/**
+ * @param {{ profile?: string, stores?: ReturnType<typeof getMindEntityStores> }} [snap] — captured snapshot to avoid global-profile races.
+ */
+export async function buildPipelineOptionsForMindBiography(snap) {
+  const profile = snap?.profile ?? getActiveMindEntityProfile();
+  const S = snap?.stores || E();
   const rt = getRuntimeSettings();
+  const id = getPipelineIdentityRuntimeSlice(rt, profile);
   const structuralSelf = await loadStructuralSelfForPipeline({ maxItems: 12 });
-  const wmSeed = buildWorkingMemorySeed('', rt.pinnedWorkingMemory || []);
-  const dialogueRows = await ConversationMessage.list('-created_date', 16);
+  const wmSeed = buildWorkingMemorySeed('', id.pinnedWorkingMemory || []);
+  const dialogueRows = await S.ConversationMessage.list('-created_date', 16);
   return {
     phase: rt.defaultMindPhase || 'focus',
     arousal: 0.5,
     intent: '',
-    constitution: rt.mindConstitution || '',
-    userModel: rt.userModel || {},
-    mindDisplayName: String(rt.mindDisplayName || '').trim(),
+    constitution: id.mindConstitution || '',
+    userModel: id.userModel || {},
+    mindDisplayName: String(id.mindDisplayName || '').trim(),
     structuralSelf,
     workingMemorySeed: wmSeed,
     recentDialogue: rowsToRecentDialogue(dialogueRows, 16),
@@ -234,9 +245,10 @@ function formatRecentVoiceSamplesForBiography(runs, maxChars = 7200) {
   ].join('\n\n');
 }
 
-async function loadMindBiographyVoiceBlocks(prevBio) {
-  const { draft, memoriesCount, beliefCount, runs } = await buildMindBiographySharedMemoryDraft();
-  const options = await buildPipelineOptionsForMindBiography();
+async function loadMindBiographyVoiceBlocks(prevBio, snap) {
+  const { profile, stores } = snap || captureProfileSnapshot();
+  const { draft, memoriesCount, beliefCount, runs } = await buildMindBiographySharedMemoryDraft(stores);
+  const options = await buildPipelineOptionsForMindBiography({ profile, stores });
 
   let policyBlock;
   let sharedMemoryJson;
@@ -247,9 +259,10 @@ async function loadMindBiographyVoiceBlocks(prevBio) {
   } catch (e) {
     console.warn('[biography] voice-context-blocks failed, using fallback:', e);
     const rt = getRuntimeSettings();
-    policyBlock = `\n\nCONTEXT_AND_POLICY:\nRHYTHM: phase=${options.phase} arousal=0.5.\nCONSTITUTION (binding on Identity/Voice):\n${clipTextComplete(String(rt.mindConstitution || ''), 6000, { ellipsis: true })}\n`;
-    if (rt.userModel && Object.keys(rt.userModel).length) {
-      policyBlock += `\nUSER_MODEL_JSON:\n${JSON.stringify(rt.userModel).slice(0, 8000)}\n`;
+    const id = getPipelineIdentityRuntimeSlice(rt, profile);
+    policyBlock = `\n\nCONTEXT_AND_POLICY:\nRHYTHM: phase=${options.phase} arousal=0.5.\nCORE VALUES (this mind's evolved norms and commitments):\n${clipTextComplete(String(id.mindConstitution || ''), 6000, { ellipsis: true })}\n`;
+    if (id.userModel && Object.keys(id.userModel).length) {
+      policyBlock += `\nUSER_MODEL_JSON:\n${JSON.stringify(id.userModel).slice(0, 8000)}\n`;
     }
     sharedMemoryJson = JSON.stringify(draft, null, 2).slice(0, 200_000);
   }
@@ -265,6 +278,7 @@ async function loadMindBiographyVoiceBlocks(prevBio) {
     policyBlock,
     sharedMemoryJson,
     prevBioSection,
+    profile,
   };
 }
 
@@ -301,11 +315,12 @@ NOTABLE_CHANGES:
  * Context blocks are followed by a postamble and OUTPUT CONTRACT so the model’s last tokens are the required format.
  */
 export async function composeMindBiographyUserPrompt(sessionNumber, prevBio, options = {}) {
+  const snap = options.snap || captureProfileSnapshot();
   const pipelineRunContextBlock = String(options.pipelineRunContextBlock || '').trim();
-  const { memoriesCount, beliefCount, runs, policyBlock, sharedMemoryJson, prevBioSection } =
-    await loadMindBiographyVoiceBlocks(prevBio);
+  const { memoriesCount, beliefCount, runs, policyBlock, sharedMemoryJson, prevBioSection, profile } =
+    await loadMindBiographyVoiceBlocks(prevBio, snap);
 
-  const voice = voiceSystemPromptFromSettings();
+  const voice = voiceSystemPromptFromSettings(profile);
   const systemPrompt = `${voice}\n\n${MIND_BIOGRAPHY_SYSTEM_ADDENDUM}${
     pipelineRunContextBlock ? `\n\n${MIND_BIOGRAPHY_PIPELINE_RUN_ADDENDUM}` : ''
   }`;
@@ -345,9 +360,10 @@ Your next output must follow the OUTPUT CONTRACT below exactly.`;
  * JSON-mode biography (fallback when tagged prose output fails). Uses the same context bundle as the text path.
  */
 async function composeMindBiographyJsonPrompt(sessionNumber, prevBio, options = {}) {
+  const snap = options.snap || captureProfileSnapshot();
   const pipelineRunContextBlock = String(options.pipelineRunContextBlock || '').trim();
-  const { memoriesCount, beliefCount, runs, policyBlock, sharedMemoryJson, prevBioSection } =
-    await loadMindBiographyVoiceBlocks(prevBio);
+  const { memoriesCount, beliefCount, runs, policyBlock, sharedMemoryJson, prevBioSection, profile } =
+    await loadMindBiographyVoiceBlocks(prevBio, snap);
 
   const jsonPipelineNote = pipelineRunContextBlock
     ? ` When THIS_PIPELINE_RUN appears in the user message, ground notable_changes and autobiography on that episode while staying consistent with CONTEXT_AND_POLICY and SHARED_MEMORY_JSON.`
@@ -358,7 +374,7 @@ Return ONE JSON object only (no markdown). Schema:
 {"autobiography":"<first-person prose — same user-directed register as pipeline Voice outputs (see RECENT VOICE LINES in the user message when present); not essay voice or third-person>","summary":"<one paragraph, same register>","identity_keywords":["w1","w2","w3","w4","w5"],"core_values":["v1","v2","v3"],"notable_changes":"<what changed since last version>"}
 No machinery names, JSON/protocol, or numeric confidence scores inside string fields. Ground only in CONTEXT_AND_POLICY and SHARED_MEMORY_JSON in the user message.${jsonPipelineNote} No web. Arrays must have string elements only.`;
 
-  const voice = voiceSystemPromptFromSettings();
+  const voice = voiceSystemPromptFromSettings(profile);
   const systemPrompt = `${voice}\n\n${jsonSystemAddendum}`;
 
   const voiceSamplesBlock = formatRecentVoiceSamplesForBiography(runs);
@@ -388,7 +404,7 @@ export async function completeMindBiographyViaJson(sessionNumber, prevBio, optio
   const { prompt, systemPrompt, memoriesCount, beliefCount, runs } = await composeMindBiographyJsonPrompt(
     sessionNumber,
     prevBio,
-    { pipelineRunContextBlock: options.pipelineRunContextBlock }
+    { pipelineRunContextBlock: options.pipelineRunContextBlock, snap: options.snap }
   );
   const temperature = typeof options.temperature === 'number' ? options.temperature : 0.35;
   const max_tokens = typeof options.max_tokens === 'number' ? options.max_tokens : 3200;

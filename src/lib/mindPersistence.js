@@ -1,3 +1,4 @@
+import { normalizeBeliefMapCategory } from '../../shared/beliefMapCategory.mjs';
 import { clipTextComplete } from '../../shared/textClip.mjs';
 import { isBeliefTensionReviewPrimaryTurn } from '../../shared/beliefRevisionsVoice.mjs';
 import {
@@ -8,21 +9,13 @@ import {
   mergeDedupedStrings,
 } from '../../shared/biographyIdentityExtract.mjs';
 import {
-  BeliefStore,
-  BeliefTension,
-  ConsolidationDigest,
-  ConversationMessage,
-  CuriosityItem,
-  GoalItem,
-  EmergenceEvent,
-  LongTermMemory,
-  MindBiography,
-  PipelineRun,
-  SelfLedgerRevision,
-  TemporalEvent,
-  UserModelSnapshot,
-  WorldModel,
-} from './data';
+  getMindEntityStores,
+  getMindEntityStoresForProfile,
+  getActiveMindEntityProfile,
+  setActiveMindEntityProfile,
+  normalizeScheduledTaskMindStorageProfile,
+  MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR,
+} from './mindEntityContext';
 import { isCheckpointPipelineRun } from './pipelineRunCheckpoint';
 import { openrouterRequestFields } from './llmClientOptions';
 import { getRuntimeSettings, saveRuntimeSettings } from './runtimeSettings';
@@ -36,7 +29,12 @@ import {
   normalizeWorldModelCategory,
   stableWorldModelKey,
 } from './worldModelSchema';
-import { isUnparsedBeliefModuleReport, parseBeliefModuleOutput } from './beliefReportParse';
+import {
+  beliefStatementsForDisplay,
+  isJunkBeliefStatement,
+  isUnparsedBeliefModuleReport,
+  parseBeliefModuleOutput,
+} from './beliefReportParse';
 import { PIPELINE_BIOGRAPHY_SNAPSHOT_EVERY_N_RUNS } from './cognitiveHealthDerived';
 import {
   formatPipelineRunContextForBiography,
@@ -45,7 +43,10 @@ import {
 } from './mindBiographyLlm.js';
 import { finalizeNewCuriosityRoot } from './curiosityLineage';
 import { finalizeNewGoalRoot } from './goalLineage';
-import { maybeQueueBeliefTensionReviewFromPipeline } from './mindFollowThroughQueue';
+import {
+  maybeQueueBeliefTensionReviewFromPipeline,
+  maybeQueueMetaFollowupsFromPipeline,
+} from './mindFollowThroughQueue';
 import { removeBeliefIdFromOthersContradicts } from './beliefStoreContradictionUtils';
 import { isValidIndexedDbRecordKey } from './browserStorage.js';
 import {
@@ -56,6 +57,15 @@ import {
   parseFollowupCuriositiesFromModuleOutput,
   parseGoalUrgencyFromOutput,
 } from './priorityUtils';
+
+const E = () => getMindEntityStores();
+
+function storesForPipelineLoad(opts = {}) {
+  if (opts.mindStorageProfile !== undefined) {
+    return getMindEntityStoresForProfile(normalizeScheduledTaskMindStorageProfile(opts.mindStorageProfile));
+  }
+  return getMindEntityStores();
+}
 
 export { clipTextComplete };
 
@@ -70,9 +80,9 @@ function truncate(s, n) {
   return clipTextComplete(s, n, { ellipsis: true });
 }
 
-/** Bounded payload for `options.structuralSelf` on pipeline POST (WorldModel rows, category self). */
-export async function loadStructuralSelfForPipeline({ maxItems = 12 } = {}) {
-  const all = await WorldModel.list('-updated_date', 120);
+/** Bounded payload for `options.structuralSelf` on pipeline POST (E().WorldModel rows, category self). */
+export async function loadStructuralSelfForPipeline({ maxItems = 12, mindStorageProfile } = {}) {
+  const all = await storesForPipelineLoad({ mindStorageProfile }).WorldModel.list('-updated_date', 120);
   const rows = all.filter((w) => {
     if (w.archived) return false;
     return normalizeWorldModelCategory(w.category) === 'self';
@@ -83,6 +93,58 @@ export async function loadStructuralSelfForPipeline({ maxItems = 12 } = {}) {
     description: clipTextComplete(String(w.description || w.value || ''), 1200, { ellipsis: false }),
     confidence: typeof w.confidence === 'number' && Number.isFinite(w.confidence) ? w.confidence : 0.65,
   }));
+}
+
+/** Non-self E().WorldModel rows for pipeline POST (environment, relationship, goal, belief, event). */
+export async function loadWorldModelEnvironmentForPipeline({ maxItems = 14, mindStorageProfile } = {}) {
+  const all = await storesForPipelineLoad({ mindStorageProfile }).WorldModel.list('-updated_date', 120);
+  const rows = all.filter((w) => {
+    if (w.archived) return false;
+    return normalizeWorldModelCategory(w.category) !== 'self';
+  });
+  return rows.slice(0, maxItems).map((w) => ({
+    category: normalizeWorldModelCategory(w.category),
+    key: itemKeyForRecord(w),
+    label: clipTextComplete(String(w.label || w.name || ''), 200, { ellipsis: false }),
+    description: clipTextComplete(String(w.description || w.value || ''), 900, { ellipsis: true }),
+    confidence: typeof w.confidence === 'number' && Number.isFinite(w.confidence) ? w.confidence : 0.65,
+  }));
+}
+
+/** Open / pursuing curiosity items for pipeline prep (bounded). */
+export async function loadCuriosityRowsForPipeline({ maxItems = 10, mindStorageProfile } = {}) {
+  const all = await storesForPipelineLoad({ mindStorageProfile }).CuriosityItem.list('-created_date', 50);
+  const open = all.filter((c) => {
+    const s = c.status || 'open';
+    return s === 'open' || s === 'pursuing';
+  });
+  return open
+    .slice(0, maxItems)
+    .map((c) => ({
+      question: clipTextComplete(String(c.question || '').trim(), 420, { ellipsis: true }),
+      status: String(c.status || 'open').slice(0, 20),
+      priority:
+        typeof c.priority === 'number' && Number.isFinite(c.priority) ? Math.min(1, Math.max(0, c.priority)) : null,
+    }))
+    .filter((x) => x.question);
+}
+
+/** Open / pursuing goal items for pipeline prep (bounded). */
+export async function loadGoalRowsForPipeline({ maxItems = 8, mindStorageProfile } = {}) {
+  const all = await storesForPipelineLoad({ mindStorageProfile }).GoalItem.list('-created_date', 80);
+  const open = all.filter((g) => {
+    const s = g.status || 'open';
+    return s === 'open' || s === 'pursuing';
+  });
+  return open
+    .slice(0, maxItems)
+    .map((g) => ({
+      statement: clipTextComplete(String(g.goal_statement || '').trim(), 520, { ellipsis: true }),
+      status: String(g.status || 'open').slice(0, 20),
+      priority:
+        typeof g.priority === 'number' && Number.isFinite(g.priority) ? Math.min(1, Math.max(0, g.priority)) : null,
+    }))
+    .filter((x) => x.statement);
 }
 
 /** Volatile working-memory slots: current user message + optional pinned lines from settings. */
@@ -202,13 +264,12 @@ export function parseSelfModelDelta(identityText) {
 const TRAIT_TRIGGERS = new Set(['user_tone', 'user_content', 'self_reflection', 'constitution_tension']);
 
 const PERSONALITY_FACET_TARGET_MODULES = new Set([
-  'Identity',
+  'SelfRelationTension',
   'Integration',
-  'Language',
+  'IntegrationFinalize',
   'Narrative',
   'Voice',
-  'Metacognition',
-  'Workspace Metacognition',
+  'ExecutiveGate',
 ]);
 
 function normalizeFacetModulesForClient(raw) {
@@ -332,6 +393,100 @@ export function applyConstitutionDelta(currentMindConstitution, delta) {
   return out;
 }
 
+const MODULE_PROMPT_DELTA_TEXT_CAP = 2000;
+const MODULE_PROMPT_DELTA_MAX_DELTAS = 2;
+
+const VALID_PIPELINE_MODULE_NAMES = new Set([
+  'SensorySalience',
+  'ContextMemory',
+  'Deliberation',
+  'Beliefs',
+  'SelfRelationTension',
+  'Integration',
+  'ExecutiveGate',
+  'IntegrationFinalize',
+  'Motivation',
+  'Narrative',
+  'Voice',
+]);
+
+export function parseModulePromptDelta(identityText) {
+  const raw = String(identityText || '');
+  const idx = raw.search(/MODULE_PROMPT_DELTA:/i);
+  if (idx === -1) return null;
+  const sub = raw.slice(idx).replace(/^MODULE_PROMPT_DELTA:\s*/i, '');
+  const brace = sub.indexOf('{');
+  if (brace === -1) return null;
+  let depth = 0;
+  let end = -1;
+  for (let i = brace; i < sub.length; i += 1) {
+    if (sub[i] === '{') depth += 1;
+    if (sub[i] === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end === -1) return null;
+  try {
+    const parsed = JSON.parse(sub.slice(brace, end + 1));
+    if (!parsed || typeof parsed !== 'object') return null;
+    const deltas = Array.isArray(parsed.deltas) ? parsed.deltas : [];
+    const valid = [];
+    for (const d of deltas.slice(0, MODULE_PROMPT_DELTA_MAX_DELTAS)) {
+      const mod = String(d.module || '').trim();
+      if (!mod || !VALID_PIPELINE_MODULE_NAMES.has(mod)) continue;
+      const action = String(d.action || '').toLowerCase();
+      if (!['append', 'replace', 'clear'].includes(action)) continue;
+      const text = action === 'clear' ? '' : String(d.text || '').trim();
+      if (action !== 'clear' && !text) continue;
+      valid.push({
+        module: mod,
+        action,
+        text: clipTextComplete(text, MODULE_PROMPT_DELTA_TEXT_CAP, { ellipsis: false }),
+        rationale: String(d.rationale || '').trim().slice(0, 500),
+      });
+    }
+    return valid.length ? valid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Apply parsed MODULE_PROMPT_DELTA entries into the existing modulePromptOverrides map.
+ * Returns a new overrides object if changes were made, or null if no change.
+ */
+export function applyModulePromptDeltas(currentOverrides, deltas) {
+  if (!Array.isArray(deltas) || !deltas.length) return null;
+  const overrides = { ...(currentOverrides && typeof currentOverrides === 'object' ? currentOverrides : {}) };
+  let changed = false;
+  for (const d of deltas) {
+    const { module: mod, action, text } = d;
+    if (action === 'clear') {
+      if (overrides[mod]) {
+        delete overrides[mod];
+        changed = true;
+      }
+    } else if (action === 'replace') {
+      if (text) {
+        overrides[mod] = text;
+        changed = true;
+      }
+    } else if (action === 'append') {
+      if (text) {
+        const cur = String(overrides[mod] || '').trim();
+        const merged = cur ? `${cur}\n\n${text}` : text;
+        overrides[mod] = clipTextComplete(merged, 32000, { ellipsis: false });
+        changed = true;
+      }
+    }
+  }
+  return changed ? overrides : null;
+}
+
 function stableFacetKey(id, label) {
   const i = String(id || '').trim().toLowerCase();
   if (i) return i;
@@ -424,7 +579,7 @@ export function applyTraitDeltaToProfile(profile, delta) {
   };
 }
 
-async function applySelfModelDeltaToWorldModel(delta) {
+export async function applySelfModelDeltaToWorldModel(delta) {
   if (!delta || typeof delta !== 'object') return;
   const items = Array.isArray(delta.items) ? delta.items : [];
   for (const it of items.slice(0, 16)) {
@@ -440,7 +595,7 @@ async function applySelfModelDeltaToWorldModel(delta) {
       it.key && String(it.key).trim()
         ? clipTextComplete(String(it.key).trim(), 160, { ellipsis: false })
         : stableWorldModelKey(canon, label);
-    const all = await WorldModel.list('-updated_date', 200);
+    const all = await E().WorldModel.list('-updated_date', 200);
     const existing = all.find((i) => itemKeyForRecord(i) === key);
     if (existing) {
       const patch = buildWorldModelUpdatePayload(
@@ -458,9 +613,9 @@ async function applySelfModelDeltaToWorldModel(delta) {
         'identity',
         'SELF_MODEL_DELTA'
       );
-      await WorldModel.update(existing.id, patch);
+      await E().WorldModel.update(existing.id, patch);
     } else {
-      await WorldModel.create(
+      await E().WorldModel.create(
         buildWorldModelCreatePayload({
           category: canon,
           label,
@@ -484,7 +639,7 @@ export async function applyWorldModelDecay({
   minConfidence = 0.12,
   archiveBelow = 0.1,
 } = {}) {
-  const all = await WorldModel.list('-updated_date', 500);
+  const all = await E().WorldModel.list('-updated_date', 500);
   const cutoff = Date.now() - staleDays * 86400000;
   let touched = 0;
   for (const rec of all) {
@@ -494,7 +649,7 @@ export async function applyWorldModelDecay({
     const c0 = typeof rec.confidence === 'number' ? rec.confidence : 0.65;
     const c1 = Math.max(minConfidence, c0 * factor);
     const archived = c1 <= archiveBelow;
-    await WorldModel.update(rec.id, {
+    await E().WorldModel.update(rec.id, {
       confidence: archived ? archiveBelow : c1,
       archived,
       last_updated_by: 'decay',
@@ -504,7 +659,7 @@ export async function applyWorldModelDecay({
   return touched;
 }
 
-function extractIntegrationJsonObject(text) {
+export function extractIntegrationJsonObject(text) {
   const raw = String(text || '');
   const idx = raw.search(/INTEGRATION_JSON:\s*/i);
   if (idx === -1) return null;
@@ -589,6 +744,9 @@ function normalizeGlobalWorkspaceFields(gw) {
         .filter(Boolean)
         .slice(0, 6)
     : [];
+  const suppressedOrPeripheral = Array.isArray(gw.suppressedOrPeripheral)
+    ? gw.suppressedOrPeripheral.map((s) => String(s).slice(0, 220)).filter(Boolean).slice(0, 6)
+    : [];
   return {
     salience: Array.isArray(gw.salience) ? gw.salience.map((s) => String(s).slice(0, 400)) : [],
     conflicts: Array.isArray(gw.conflicts) ? gw.conflicts.map((s) => String(s).slice(0, 500)) : [],
@@ -604,6 +762,7 @@ function normalizeGlobalWorkspaceFields(gw) {
     ...(iitProxy ? { iitProxy } : {}),
     epistemicThreads,
     ...(bindings.length ? { bindings } : {}),
+    ...(suppressedOrPeripheral.length ? { suppressedOrPeripheral } : {}),
     ...(hypotheses.length ? { hypotheses } : {}),
   };
 }
@@ -619,6 +778,7 @@ function getGlobalWorkspaceFromSharedMemory(sm) {
       Array.isArray(g.openQuestions) ||
       (typeof g.provisionalStance === 'string' && g.provisionalStance.trim()) ||
       Array.isArray(g.broadcastWinners) ||
+      Array.isArray(g.suppressedOrPeripheral) ||
       typeof g.phenomenalUnity === 'string' ||
       Array.isArray(g.hypotheses) ||
       Array.isArray(g.bindings));
@@ -656,12 +816,12 @@ function parseJsonAfterMarkerLocal(text, marker) {
   }
 }
 
-/** Apply one BELIEF_REVISIONS JSON object to persisted BeliefStore rows (fragile; same ref rules as server). */
-async function applyParsedBeliefRevisionsToPersistedStore(parsed) {
+/** Apply one BELIEF_REVISIONS JSON object to persisted E().BeliefStore rows (fragile; same ref rules as server). */
+export async function applyParsedBeliefRevisionsToPersistedStore(parsed) {
   if (!parsed || typeof parsed !== 'object') return false;
   const revs = parsed.revisions;
   if (!Array.isArray(revs) || !revs.length) return false;
-  const rows = await BeliefStore.list('-created_date', 400);
+  const rows = await E().BeliefStore.list('-created_date', 400);
   let touched = false;
   for (const r of revs.slice(0, 20)) {
     const ref = String(r?.ref || '').trim();
@@ -673,20 +833,20 @@ async function applyParsedBeliefRevisionsToPersistedStore(parsed) {
       if (!stmt.includes(ref) && ref.length > 3 && !stmt.slice(0, 400).includes(ref.slice(0, 80))) continue;
       if (action === 'downgrade' || action === 'weaken') {
         const c0 = typeof row.confidence === 'number' ? row.confidence : 0.5;
-        await BeliefStore.update(row.id, {
+        await E().BeliefStore.update(row.id, {
           confidence: Math.max(0.05, Number.isFinite(nc) ? nc : c0 * 0.75),
           times_challenged: (row.times_challenged || 0) + 1,
           status: row.status || 'active',
         });
       } else if (action === 'strengthen' || action === 'reinforce') {
         const c0 = typeof row.confidence === 'number' ? row.confidence : 0.5;
-        await BeliefStore.update(row.id, {
+        await E().BeliefStore.update(row.id, {
           confidence: Math.min(1, Number.isFinite(nc) ? nc : c0 + 0.12),
           times_reinforced: (row.times_reinforced || 0) + 1,
           status: 'active',
         });
       } else if (action === 'remove' || action === 'supersede') {
-        await BeliefStore.update(row.id, {
+        await E().BeliefStore.update(row.id, {
           confidence: Math.min(typeof row.confidence === 'number' ? row.confidence : 0.2, 0.08),
           times_challenged: (row.times_challenged || 0) + 1,
         });
@@ -695,7 +855,7 @@ async function applyParsedBeliefRevisionsToPersistedStore(parsed) {
         action === 'resolved' ||
         action === 'mark_resolved'
       ) {
-        await BeliefStore.update(row.id, {
+        await E().BeliefStore.update(row.id, {
           status: 'resolved',
           contradicts: [],
         });
@@ -713,7 +873,7 @@ async function applyParsedBeliefRevisionsToPersistedStore(parsed) {
 /** Apply BELIEF_REVISIONS from Belief Store, then from Voice when primary turn is scheduled tension review. */
 async function syncBeliefRevisionsToPersistedBeliefStore(sm) {
   let touched = false;
-  const beliefStoreText = sm.moduleOutputs?.['Belief Store'];
+  const beliefStoreText = sm.moduleOutputs?.Beliefs ?? sm.moduleOutputs?.['Belief Store'];
   if (beliefStoreText && typeof beliefStoreText === 'string') {
     const p = parseJsonAfterMarkerLocal(beliefStoreText, 'BELIEF_REVISIONS');
     if (await applyParsedBeliefRevisionsToPersistedStore(p)) touched = true;
@@ -762,7 +922,7 @@ async function upsertWorldModelEntry({
   const desc = clipTextComplete(String(description || '').trim(), 6000, { ellipsis: false });
   if (!lab || desc.length < 8) return 0;
   const key = stableWorldModelKey(cat, lab);
-  const all = await WorldModel.list('-updated_date', 200);
+  const all = await E().WorldModel.list('-updated_date', 200);
   const existing = all.find((i) => itemKeyForRecord(i) === key);
   const conf =
     typeof confidence === 'number' && Number.isFinite(confidence)
@@ -785,9 +945,9 @@ async function upsertWorldModelEntry({
       last_updated_by,
       String(evidence || '').slice(0, 200)
     );
-    await WorldModel.update(existing.id, patch);
+    await E().WorldModel.update(existing.id, patch);
   } else {
-    await WorldModel.create(
+    await E().WorldModel.create(
       buildWorldModelCreatePayload({
         category: cat,
         label: lab,
@@ -914,7 +1074,7 @@ async function syncGlobalWorkspaceToWorldModel(sm) {
 }
 
 async function syncGoalGenerationToWorldModel(sm) {
-  const text = sm.moduleOutputs?.['Goal Generation'];
+  const text = textForGoalGenerationWorldModel(sm);
   let n = 0;
   for (const seg of extractProseSegmentsForWorldModel(text, { maxItems: 6, minLen: 18 })) {
     const body = seg.trim();
@@ -980,6 +1140,38 @@ async function syncPipelineDerivedWorldModel(sm) {
   return touched;
 }
 
+/** Schema v2: Curiosity + Goal Generation + Somatic → `Motivation` (server) / `motivation` (UI-normalized map). */
+function rawCuriosityPipelineOutput(sm) {
+  const mo = sm?.moduleOutputs;
+  if (!mo || typeof mo !== 'object') return '';
+  const c = mo.Curiosity;
+  if (typeof c === 'string' && c.trim()) return c;
+  const merged = mo.Motivation ?? mo.motivation;
+  return typeof merged === 'string' ? merged : '';
+}
+
+function rawGoalGenerationPipelineOutput(sm) {
+  const mo = sm?.moduleOutputs;
+  if (!mo || typeof mo !== 'object') return '';
+  const gg = mo['Goal Generation'];
+  if (typeof gg === 'string' && gg.trim()) return gg;
+  const merged = mo.Motivation ?? mo.motivation;
+  return typeof merged === 'string' ? merged : '';
+}
+
+/** World-model sync: prefer legacy Goal Generation text; else goals portion of merged Motivation. */
+function textForGoalGenerationWorldModel(sm) {
+  const mo = sm?.moduleOutputs;
+  if (!mo || typeof mo !== 'object') return '';
+  const legacy = mo['Goal Generation'];
+  if (typeof legacy === 'string' && legacy.trim()) return legacy;
+  const merged = mo.Motivation ?? mo.motivation;
+  if (typeof merged !== 'string' || !merged.trim()) return '';
+  const idx = merged.search(/\*\*GOALS/i);
+  if (idx >= 0) return merged.slice(idx);
+  return merged;
+}
+
 function curiosityQuestionFromOutput(raw) {
   const t = String(raw || '').trim();
   if (t.length < 8) return '';
@@ -1021,7 +1213,7 @@ async function syncLinkedCuriosityFollowUps(sm, curiosityPursuitContext) {
   const rootId = curiosityPursuitContext?.rootCuriosityId;
   if (!parentId || !rootId) return;
 
-  const parent = await CuriosityItem.retrieve(parentId);
+  const parent = await E().CuriosityItem.retrieve(parentId);
   if (!parent) return;
   const parentHead = normalizeCuriosityQuestionHead(parent.question);
   const parentDepth = Number.isFinite(Number(parent.pursuit_depth)) ? Number(parent.pursuit_depth) : 0;
@@ -1031,7 +1223,7 @@ async function syncLinkedCuriosityFollowUps(sm, curiosityPursuitContext) {
   const fromGw = (gw?.openQuestions || [])
     .map((s) => String(s).trim())
     .filter((q) => q.length >= 8);
-  const fromModule = parseFollowupCuriositiesFromModuleOutput(sm.moduleOutputs?.Curiosity);
+  const fromModule = parseFollowupCuriositiesFromModuleOutput(rawCuriosityPipelineOutput(sm));
 
   const seen = new Set();
   /** @type {{ text: string, llmPriority?: number }[]} */
@@ -1056,7 +1248,7 @@ async function syncLinkedCuriosityFollowUps(sm, curiosityPursuitContext) {
   }
   if (!candidates.length) return;
 
-  const recent = await CuriosityItem.list('-created_date', 120);
+  const recent = await E().CuriosityItem.list('-created_date', 120);
   const existingHeads = new Set(recent.map((c) => normalizeCuriosityQuestionHead(c.question)));
 
   const parentPri = parent.priority;
@@ -1074,7 +1266,7 @@ async function syncLinkedCuriosityFollowUps(sm, curiosityPursuitContext) {
       candidateIndex: idx,
     });
     idx += 1;
-    await CuriosityItem.create({
+    await E().CuriosityItem.create({
       question: q,
       status: 'open',
       source: 'pursuit-followup',
@@ -1095,7 +1287,7 @@ async function syncLinkedGoalFollowUps(sm, goalPursuitContext) {
   const rootId = goalPursuitContext?.rootGoalId;
   if (!parentId || !rootId) return;
 
-  const parent = await GoalItem.retrieve(parentId);
+  const parent = await E().GoalItem.retrieve(parentId);
   if (!parent) return;
   const parentHead = normalizeGoalStatementHead(parent.goal_statement);
   const parentDepth = Number.isFinite(Number(parent.pursuit_depth)) ? Number(parent.pursuit_depth) : 0;
@@ -1117,7 +1309,7 @@ async function syncLinkedGoalFollowUps(sm, goalPursuitContext) {
   }
   if (!candidates.length) return;
 
-  const recent = await GoalItem.list('-created_date', 120);
+  const recent = await E().GoalItem.list('-created_date', 120);
   const existingHeads = new Set(recent.map((c) => normalizeGoalStatementHead(c.goal_statement)));
 
   const parentPri = parent.priority;
@@ -1134,7 +1326,7 @@ async function syncLinkedGoalFollowUps(sm, goalPursuitContext) {
       candidateIndex: idx,
     });
     idx += 1;
-    await GoalItem.create({
+    await E().GoalItem.create({
       goal_statement: stmt,
       status: 'open',
       source: 'pursuit-followup',
@@ -1179,15 +1371,15 @@ async function syncGoalItemFromSharedMemory(sm, goalPursuitContext = null) {
     return;
   }
 
-  const ggRaw = sm.moduleOutputs?.['Goal Generation'];
+  const ggRaw = rawGoalGenerationPipelineOutput(sm);
   const stmt = goalStatementFromGoalGenerationOutput(ggRaw);
   if (!stmt || stmt.length < 12) return;
-  const recent = await GoalItem.list('-created_date', 40);
+  const recent = await E().GoalItem.list('-created_date', 40);
   const head = normalizeGoalStatementHead(stmt);
   if (recent.some((g) => normalizeGoalStatementHead(g.goal_statement) === head)) return;
   const urgency = parseGoalUrgencyFromOutput(ggRaw);
   const priority = urgency != null ? urgency : DEFAULT_GOAL_PIPELINE_PRIORITY;
-  const created = await GoalItem.create({
+  const created = await E().GoalItem.create({
     goal_statement: stmt,
     status: 'open',
     source: 'pipeline',
@@ -1195,7 +1387,7 @@ async function syncGoalItemFromSharedMemory(sm, goalPursuitContext = null) {
     times_returned_to: 0,
   });
   try {
-    await finalizeNewGoalRoot(created);
+    await finalizeNewGoalRoot(created, E().GoalItem);
   } catch (e) {
     console.warn('finalizeNewGoalRoot', e);
   }
@@ -1208,7 +1400,7 @@ const PIPELINE_BELIEF_DIGEST_PREFIX = '[Pipeline belief digest] ';
  * beliefStore[] often contains full module reports (e.g. BELIEF_UPDATE_REPORT). Parse into atomic rows;
  * fall back to a single digest row only when parsing finds no structured claims.
  */
-async function syncBeliefStoreRowsFromSharedMemory(sm) {
+export async function syncBeliefStoreRowsFromSharedMemory(sm) {
   const rows = Array.isArray(sm.beliefStore) ? sm.beliefStore : [];
   const last = rows[rows.length - 1];
   if (!last) return;
@@ -1216,73 +1408,124 @@ async function syncBeliefStoreRowsFromSharedMemory(sm) {
   if (raw.length < 12) return;
 
   const parsed = parseBeliefModuleOutput(raw);
-  if (parsed.length > 0) {
-    let existing = await BeliefStore.list('-created_date', 400);
-    const digestRow = existing.find((b) => String(b.statement || '').startsWith(PIPELINE_BELIEF_DIGEST_PREFIX));
-    if (digestRow) {
-      if (isValidIndexedDbRecordKey(digestRow.id)) {
-        await BeliefStore.delete(digestRow.id);
-        existing = existing.filter((b) => b.id !== digestRow.id);
-      } else {
-        console.warn('[mindPersistence] pipeline belief digest row has no valid id; skipping delete', digestRow);
-      }
-    }
+  const fallbackConf =
+    typeof last.confidence === 'number' && Number.isFinite(last.confidence) ? last.confidence : 0.75;
 
-    const fallbackConf =
-      typeof last.confidence === 'number' && Number.isFinite(last.confidence) ? last.confidence : 0.75;
-
-    for (const item of parsed) {
-      const statement = clipTextComplete(item.statement.trim(), 900, { ellipsis: false });
-      if (statement.length < 8) continue;
-      const confidence =
-        typeof item.confidence === 'number' && Number.isFinite(item.confidence)
-          ? Math.min(1, Math.max(0.05, item.confidence))
-          : Math.min(1, Math.max(0.05, fallbackConf));
-      const head = statement.toLowerCase().slice(0, 48);
-      const row = existing.find((e) => (e.statement || '').toLowerCase().slice(0, 48) === head);
-      const reasoning = item.reasoning
-        ? clipTextComplete(item.reasoning, 1200, { ellipsis: false })
-        : undefined;
-
-      if (row) {
-        await BeliefStore.update(row.id, {
-          confidence,
-          status: 'active',
-          category: last.category || row.category || 'factual',
-          times_reinforced: (row.times_reinforced || 0) + 1,
-          ...(reasoning ? { reasoning } : {}),
-        });
-      } else {
-        const created = await BeliefStore.create({
+  /** @type {Array<{ statement: string, confidence?: number, reasoning?: string, category?: string }>} */
+  let items = parsed;
+  if (!items.length) {
+    const loose = beliefStatementsForDisplay(raw);
+    if (loose.length > 0) {
+      items = loose
+        .filter((s) => !isJunkBeliefStatement(s))
+        .map((statement) => ({
           statement,
-          confidence,
-          status: 'active',
-          category: last.category || 'factual',
-          times_reinforced: 0,
-          times_challenged: 0,
-          source: last.sourceModule || 'pipeline-belief-store',
-          ...(reasoning ? { reasoning } : {}),
-        });
-        existing.push(created);
-      }
+          confidence: fallbackConf,
+          reasoning: undefined,
+          category: last?.category,
+        }));
+    }
+  }
+
+  if (!items.length) {
+    const digestSource = clipTextComplete(String(raw).replace(/\s+/g, ' ').trim(), 900, { ellipsis: false });
+    if (digestSource.length < 12 || isJunkBeliefStatement(digestSource)) return;
+
+    let existingDigest = await E().BeliefStore.list('-created_date', 400);
+    const digestStatement = `${PIPELINE_BELIEF_DIGEST_PREFIX}${digestSource}`;
+    const head = digestStatement.toLowerCase().slice(0, 48);
+    const row = existingDigest.find((e) => (e.statement || '').toLowerCase().slice(0, 48) === head);
+
+    if (row) {
+      await E().BeliefStore.update(row.id, {
+        times_reinforced: (row.times_reinforced || 0) + 1,
+        confidence: Math.min(1, Math.max(0.05, fallbackConf)),
+        status: 'active',
+      });
+    } else {
+      await E().BeliefStore.create({
+        statement: digestStatement,
+        confidence: Math.min(1, Math.max(0.05, fallbackConf)),
+        status: 'active',
+        category: normalizeBeliefMapCategory(last?.category) ?? 'factual',
+        times_reinforced: 0,
+        times_challenged: 0,
+        source: last.sourceModule || 'pipeline-belief-store-digest',
+      });
     }
     notifyMindStorageChanged({ source: 'beliefs' });
     return;
   }
 
-  console.warn(
-    '[mindPersistence] beliefStore module output had no parseable atomic claims; not storing a report blob.'
-  );
+  let existing = await E().BeliefStore.list('-created_date', 400);
+  const digestRow = existing.find((b) => String(b.statement || '').startsWith(PIPELINE_BELIEF_DIGEST_PREFIX));
+  if (digestRow) {
+    if (isValidIndexedDbRecordKey(digestRow.id)) {
+      await E().BeliefStore.delete(digestRow.id);
+      existing = existing.filter((b) => b.id !== digestRow.id);
+    } else {
+      console.warn('[mindPersistence] pipeline belief digest row has no valid id; skipping delete', digestRow);
+    }
+  }
+
+  for (const item of items) {
+    const statement = clipTextComplete(String(item.statement || '').trim(), 900, { ellipsis: false });
+    if (statement.length < 8 || isJunkBeliefStatement(statement)) continue;
+    const confidence =
+      typeof item.confidence === 'number' && Number.isFinite(item.confidence)
+        ? Math.min(1, Math.max(0.05, item.confidence))
+        : Math.min(1, Math.max(0.05, fallbackConf));
+    const head = statement.toLowerCase().slice(0, 48);
+    const row = existing.find((e) => (e.statement || '').toLowerCase().slice(0, 48) === head);
+    const reasoning = item.reasoning
+      ? clipTextComplete(item.reasoning, 1200, { ellipsis: false })
+      : undefined;
+
+    const resolvedCategory =
+      normalizeBeliefMapCategory(item.category) ??
+      normalizeBeliefMapCategory(last?.category) ??
+      (row ? normalizeBeliefMapCategory(row.category) : null) ??
+      'factual';
+
+    if (row) {
+      await E().BeliefStore.update(row.id, {
+        confidence,
+        status: 'active',
+        category: resolvedCategory,
+        times_reinforced: (row.times_reinforced || 0) + 1,
+        ...(reasoning ? { reasoning } : {}),
+      });
+    } else {
+      const created = await E().BeliefStore.create({
+        statement,
+        confidence,
+        status: 'active',
+        category: resolvedCategory,
+        times_reinforced: 0,
+        times_challenged: 0,
+        source: last.sourceModule || 'pipeline-belief-store',
+        ...(reasoning ? { reasoning } : {}),
+      });
+      existing.push(created);
+    }
+  }
+  notifyMindStorageChanged({ source: 'beliefs' });
 }
 
 /**
  * One row per atomic belief: splits multi-claim reports already in the store and removes unreadable report blobs.
+ *
+ * @param {number} [userLimit]
+ * @param {{ list: (sort?: string, limit?: number) => Promise<object[]>, create: (data: object) => Promise<object>, delete: (id: string) => Promise<boolean> }} [beliefStore] - When omitted, uses the belief store for the current active mind profile (can be wrong after System B). Pass the same store you list in the UI (primary vs mirror).
+ * @param {{ deleteUnparsedModuleBlobs?: boolean }} [options] - If `deleteUnparsedModuleBlobs` is true (default), rows that look like raw Belief Store module dumps (e.g. contain `BELIEF_REVISIONS` but no parseable atomic claims) are removed. Set false for Belief Map / Dashboard loads: System B mirror rows often still contain those markers and must not be wiped on open.
  */
-export async function splitAggregateBeliefRowsInStore(userLimit = 400) {
+export async function splitAggregateBeliefRowsInStore(userLimit = 400, beliefStore = null, options = {}) {
+  const { deleteUnparsedModuleBlobs = true } = options;
+  const BS = beliefStore ?? E().BeliefStore;
   let changed = false;
 
   for (;;) {
-    const rows = await BeliefStore.list('-created_date', userLimit);
+    const rows = await BS.list('-created_date', userLimit);
     const multi = rows.find((r) => parseBeliefModuleOutput(r.statement).length > 1);
     if (!multi) break;
 
@@ -1302,7 +1545,7 @@ export async function splitAggregateBeliefRowsInStore(userLimit = 400) {
     const childRows = [];
     for (const item of parsed) {
       const statement = clipTextComplete(item.statement.trim(), 900, { ellipsis: false });
-      if (statement.length < 8) continue;
+      if (statement.length < 8 || isJunkBeliefStatement(statement)) continue;
       const head = statement.toLowerCase().slice(0, 48);
       if (otherHeads.has(head)) continue;
       otherHeads.add(head);
@@ -1319,7 +1562,10 @@ export async function splitAggregateBeliefRowsInStore(userLimit = 400) {
         statement,
         confidence,
         status: multi.status || 'active',
-        category: multi.category || 'factual',
+        category:
+          normalizeBeliefMapCategory(item.category) ??
+          normalizeBeliefMapCategory(multi.category) ??
+          'factual',
         times_reinforced: 0,
         times_challenged: 0,
         source: multi.source || 'belief-store-split',
@@ -1327,31 +1573,33 @@ export async function splitAggregateBeliefRowsInStore(userLimit = 400) {
       });
     }
     for (const row of childRows) {
-      await BeliefStore.create(row);
+      await BS.create(row);
     }
-    await BeliefStore.delete(multi.id);
+    await BS.delete(multi.id);
     changed = true;
   }
 
-  const tail = await BeliefStore.list('-created_date', userLimit);
-  for (const r of tail) {
-    if (!isUnparsedBeliefModuleReport(r.statement)) continue;
-    if (!isValidIndexedDbRecordKey(r.id)) {
-      console.warn('[mindPersistence] unparsed belief report row missing id; skipping delete', r);
-      continue;
+  if (deleteUnparsedModuleBlobs) {
+    const tail = await BS.list('-created_date', userLimit);
+    for (const r of tail) {
+      if (!isUnparsedBeliefModuleReport(r.statement)) continue;
+      if (!isValidIndexedDbRecordKey(r.id)) {
+        console.warn('[mindPersistence] unparsed belief report row missing id; skipping delete', r);
+        continue;
+      }
+      await BS.delete(r.id);
+      changed = true;
     }
-    await BeliefStore.delete(r.id);
-    changed = true;
   }
 
   if (changed) notifyMindStorageChanged({ source: 'beliefs' });
 }
 
-/** Persist atomic epistemic-tagged claims from pipeline shared memory into BeliefStore (lightweight). */
+/** Persist atomic epistemic-tagged claims from pipeline shared memory into E().BeliefStore (lightweight). */
 async function syncEpistemicClaimsToBeliefStore(sm) {
   const claims = Array.isArray(sm.epistemicClaims) ? sm.epistemicClaims : [];
   if (!claims.length) return;
-  const existing = await BeliefStore.list('-created_date', 200);
+  const existing = await E().BeliefStore.list('-created_date', 200);
   const prefix = '[Epistemic claim] ';
   for (const c of claims.slice(0, 8)) {
     const text = String(c?.text || '').trim();
@@ -1365,14 +1613,14 @@ async function syncEpistemicClaimsToBeliefStore(sm) {
     const head = statement.slice(0, 48).toLowerCase();
     const dup = existing.find((b) => String(b.statement || '').toLowerCase().slice(0, 48) === head);
     if (dup) {
-      await BeliefStore.update(dup.id, {
+      await E().BeliefStore.update(dup.id, {
         confidence: conf,
         epistemic_kind: kind,
         times_reinforced: (dup.times_reinforced || 0) + 1,
         status: 'active',
       });
     } else {
-      await BeliefStore.create({
+      await E().BeliefStore.create({
         statement,
         confidence: conf,
         status: 'active',
@@ -1396,15 +1644,15 @@ async function syncCuriosityItemFromSharedMemory(sm, curiosityPursuitContext = n
     return;
   }
 
-  const curRaw = sm.moduleOutputs?.Curiosity;
+  const curRaw = rawCuriosityPipelineOutput(sm);
   const q = curiosityQuestionFromOutput(curRaw);
   if (!q || q.length < 8) return;
-  const recent = await CuriosityItem.list('-created_date', 40);
+  const recent = await E().CuriosityItem.list('-created_date', 40);
   const head = q.slice(0, 80).toLowerCase();
   if (recent.some((c) => (c.question || '').slice(0, 80).toLowerCase() === head)) return;
   const urgency = parseCuriosityUrgencyFromOutput(curRaw);
   const priority = urgency != null ? urgency : DEFAULT_CURIOUS_PIPELINE_PRIORITY;
-  const created = await CuriosityItem.create({
+  const created = await E().CuriosityItem.create({
     question: q,
     status: 'open',
     source: 'pipeline',
@@ -1412,16 +1660,17 @@ async function syncCuriosityItemFromSharedMemory(sm, curiosityPursuitContext = n
     times_returned_to: 0,
   });
   try {
-    await finalizeNewCuriosityRoot(created);
+    await finalizeNewCuriosityRoot(created, E().CuriosityItem);
   } catch (e) {
     console.warn('finalizeNewCuriosityRoot', e);
   }
+  notifyMindStorageChanged({ source: 'curiosity' });
 }
 
 async function countNonCheckpointPipelineRunsAfter(isoDate) {
   const t0 = new Date(isoDate).getTime();
   if (Number.isNaN(t0)) return 0;
-  const runsRaw = await PipelineRun.list('-created_date', 250);
+  const runsRaw = await E().PipelineRun.listAll('-created_date');
   return runsRaw.filter((r) => {
     if (isCheckpointPipelineRun(r)) return false;
     const tr = new Date(r.created_date).getTime();
@@ -1489,7 +1738,7 @@ async function recordIdentityTrackingFromBiographyTouch({
     hasNotable ? `Change note: ${derived.notable_delta_line}` : '',
   ].filter(Boolean);
 
-  await EmergenceEvent.create({
+  await E().EmergenceEvent.create({
     title: 'Identity tracking (Mind Biography)',
     details: clipTextComplete(detailParts.join(' — '), 2000, { ellipsis: false }),
     severity: 'low',
@@ -1510,6 +1759,7 @@ async function touchMindBiographyAfterPipeline({
   curiosityPursuitContext,
   goalPursuitContext,
 }) {
+  const stores = getMindEntityStores();
   const narrative = clipTextComplete(String(narrativeText || ''), 16000, { ellipsis: false });
   const derived = derivePipelineBiographyIdentityFields({
     identityModuleText: sm?.moduleOutputs?.Identity,
@@ -1517,7 +1767,7 @@ async function touchMindBiographyAfterPipeline({
     dmnText: typeof sm?.dmnCarryover === 'string' ? sm.dmnCarryover : '',
   });
 
-  const list = await MindBiography.list('-created_date', 1);
+  const list = await stores.MindBiography.list('-created_date', 1);
   const latest = list[0];
   const prevKw = latest ? mergeDedupedStrings([], latest.identity_keywords, 40) : [];
   const prevCv = latest ? mergeDedupedStrings([], latest.core_values, 24) : [];
@@ -1561,12 +1811,12 @@ async function touchMindBiographyAfterPipeline({
     source,
     curiosityPursuitContext,
     goalPursuitContext,
+    stores,
   });
 
-  // Awaited LLM only on first biography or snapshot cadence; extends post-pipeline persistence latency on those ticks.
   let gen;
   try {
-    gen = await generateMindBiographyViaLlm(latest, { pipelineRunContextBlock });
+    gen = await generateMindBiographyViaLlm(latest, { pipelineRunContextBlock, stores });
   } catch (e) {
     console.warn('[biography] pipeline-triggered biography LLM failed', e);
     notifyMindStorageChanged({ source: 'biography' });
@@ -1585,6 +1835,7 @@ async function touchMindBiographyAfterPipeline({
       beliefCount: gen.beliefCount,
       sessionId: String(pipelineRunId || sm?.sessionId || 'pipeline'),
       source: 'pipeline-biography',
+      stores,
     });
   } catch (e) {
     console.warn('persistMindBiographyVersion (pipeline)', e);
@@ -1626,7 +1877,7 @@ async function recordEmergenceHeuristic({
   if (!markers.length) return;
 
   const severity = markers.length >= 5 ? 'high' : markers.length >= 3 ? 'medium' : 'low';
-  await EmergenceEvent.create({
+  await E().EmergenceEvent.create({
     title: 'Emergence markers (pipeline)',
     details: clipTextComplete(`Detected: ${markers.join(', ')}`, 2000, { ellipsis: false }),
     severity,
@@ -1640,13 +1891,13 @@ async function recordEmergenceHeuristic({
 
 async function recordCognitiveHealthMetricsEvent() {
   const [runs, beliefs, memories, curious, goals, tensions, bioList] = await Promise.all([
-    PipelineRun.list('-created_date', 80),
-    BeliefStore.list('-created_date', 80),
-    LongTermMemory.list('-created_date', 80),
-    CuriosityItem.list('-created_date', 80),
-    GoalItem.list('-created_date', 80),
-    BeliefTension.list('-created_date', 80),
-    MindBiography.list('-created_date', 1),
+    E().PipelineRun.listAll('-created_date'),
+    E().BeliefStore.listAll('-created_date'),
+    E().LongTermMemory.listAll('-created_date'),
+    E().CuriosityItem.listAll('-created_date'),
+    E().GoalItem.listAll('-created_date'),
+    E().BeliefTension.listAll('-created_date'),
+    E().MindBiography.list('-created_date', 1),
   ]);
   const openCuriosity = curious.filter((c) => (c.status || 'open') !== 'resolved').length;
   const openGoals = goals.filter((g) => {
@@ -1688,14 +1939,14 @@ async function recordCognitiveHealthMetricsEvent() {
     biography_identity_keyword_count: kwCount,
     biography_core_value_count: cvCount,
   };
-  await TemporalEvent.create({
+  await E().TemporalEvent.create({
     title: 'cognitive_health_metrics',
     details: clipTextComplete(JSON.stringify(payload, null, 2), 4000, { ellipsis: false }),
     source: 'pipeline',
   });
 }
 
-async function syncIntegrationStanceToWorldModel(sm) {
+export async function syncIntegrationStanceToWorldModel(sm) {
   const gw = extractIntegrationJsonObject(sm.moduleOutputs?.Integration);
   if (!gw) return;
   const stance = String(gw.provisionalStance || '').trim();
@@ -1704,7 +1955,7 @@ async function syncIntegrationStanceToWorldModel(sm) {
   const label = 'Provisional stance (integration)';
   const canon = normalizeWorldModelCategory('belief');
   const key = stableWorldModelKey(canon, label);
-  const all = await WorldModel.list('-updated_date', 200);
+  const all = await E().WorldModel.list('-updated_date', 200);
   const existing = all.find((i) => itemKeyForRecord(i) === key);
   if (existing) {
     const patch = buildWorldModelUpdatePayload(
@@ -1725,9 +1976,9 @@ async function syncIntegrationStanceToWorldModel(sm) {
       'integration',
       'INTEGRATION_JSON'
     );
-    await WorldModel.update(existing.id, patch);
+    await E().WorldModel.update(existing.id, patch);
   } else {
-    await WorldModel.create(
+    await E().WorldModel.create(
       buildWorldModelCreatePayload({
         category: canon,
         label,
@@ -1790,7 +2041,7 @@ async function recordPostPipelineArtifacts({
   }
   try {
     const digestBody = [narrativeText, voiceOutput].filter(Boolean).join('\n\n');
-    await ConsolidationDigest.create({
+    await E().ConsolidationDigest.create({
       digest_text: clipTextComplete(digestBody, 12000, { ellipsis: false }),
       digest_summary: clipTextComplete(
         voiceOutput || narrativeText || sm?.phenomenalNow?.line || '',
@@ -1801,10 +2052,10 @@ async function recordPostPipelineArtifacts({
       model_used: sm?.lastModelUsed || null,
     });
   } catch (e) {
-    console.warn('ConsolidationDigest pipeline snapshot', e);
+    console.warn('E().ConsolidationDigest pipeline snapshot', e);
   }
   try {
-    await TemporalEvent.create({
+    await E().TemporalEvent.create({
       title: 'pipeline_complete',
       details: clipTextComplete(
         sm?.phenomenalNow?.line || voiceOutput || 'Pipeline completed.',
@@ -1814,7 +2065,7 @@ async function recordPostPipelineArtifacts({
       source: source || 'pipeline',
     });
   } catch (e) {
-    console.warn('TemporalEvent pipeline_complete', e);
+    console.warn('E().TemporalEvent pipeline_complete', e);
   }
   try {
     await recordEmergenceHeuristic({
@@ -1851,13 +2102,18 @@ async function recordPostPipelineArtifacts({
 
 /**
  * Merge structured beliefs from the last few pipeline runs via LLM (same logic as scheduled belief_extraction).
+ *
+ * @param {{ beliefStore?: object, pipelineRun?: object }} [stores] - Defaults to the active mind profile. Pass
+ *   `BeliefStore` / `PipelineRun` from {@link useScopedEntities} on `/beliefs/mirror` so extraction targets System B.
  * @returns Status message for scheduler UI, or an early message if there are no runs.
  */
-export async function mergeBeliefsFromRecentPipelineRuns() {
-  await splitAggregateBeliefRowsInStore();
+export async function mergeBeliefsFromRecentPipelineRuns(stores = {}) {
+  const BS = stores.beliefStore ?? E().BeliefStore;
+  const PR = stores.pipelineRun ?? E().PipelineRun;
+  await splitAggregateBeliefRowsInStore(400, BS);
   const [runsRaw, existingBeliefs] = await Promise.all([
-    PipelineRun.list('-created_date', 5),
-    BeliefStore.list('-created_date', 100),
+    PR.list('-created_date', 5),
+    BS.list('-created_date', 100),
   ]);
   const runs = runsRaw.filter((r) => !isCheckpointPipelineRun(r));
   if (runs.length === 0) {
@@ -1875,6 +2131,8 @@ ${recentOutputs.slice(0, 3000)}
 
 EXISTING BELIEFS (do not duplicate): ${existingStatements}
 
+For each belief set category to exactly one of: factual, normative, self, causal, predictive (belief map taxonomy).
+
 Return JSON with up to 8 new or updated beliefs.`,
     response_json_schema: {
       type: 'object',
@@ -1886,7 +2144,10 @@ Return JSON with up to 8 new or updated beliefs.`,
             properties: {
               statement: { type: 'string' },
               confidence: { type: 'number' },
-              category: { type: 'string' },
+              category: {
+                type: 'string',
+                enum: ['factual', 'normative', 'self', 'causal', 'predictive'],
+              },
               reasoning: { type: 'string' },
               status: { type: 'string' },
             },
@@ -1899,21 +2160,39 @@ Return JSON with up to 8 new or updated beliefs.`,
   let n = 0;
   for (const b of result.beliefs || []) {
     const bStmt = String(b.statement || '').toLowerCase();
-    if (!bStmt.trim()) continue;
+    if (!bStmt.trim() || isJunkBeliefStatement(b.statement)) continue;
     const exists = existingBeliefs.find(
       (e) => String(e.statement || '').toLowerCase().slice(0, 40) === bStmt.slice(0, 40)
     );
+    const conf =
+      typeof b.confidence === 'number' && Number.isFinite(b.confidence)
+        ? Math.min(1, Math.max(0.05, b.confidence))
+        : 0.75;
+    const reasoning = b.reasoning ? clipTextComplete(String(b.reasoning), 1200, { ellipsis: false }) : undefined;
     if (exists) {
-      await BeliefStore.update(exists.id, {
-        confidence: b.confidence,
+      const catMerge = normalizeBeliefMapCategory(b.category) ?? normalizeBeliefMapCategory(exists.category) ?? 'factual';
+      await BS.update(exists.id, {
+        confidence: conf,
+        category: catMerge,
         times_reinforced: (exists.times_reinforced || 0) + 1,
+        ...(reasoning ? { reasoning } : {}),
       });
     } else {
-      await BeliefStore.create({ ...b, times_reinforced: 0, times_challenged: 0 });
+      const catNew = normalizeBeliefMapCategory(b.category) ?? 'factual';
+      await BS.create({
+        statement: clipTextComplete(String(b.statement || '').trim(), 900, { ellipsis: false }),
+        confidence: conf,
+        category: catNew,
+        status: String(b.status || 'active').slice(0, 24) || 'active',
+        times_reinforced: 0,
+        times_challenged: 0,
+        source: 'pipeline-merge',
+        ...(reasoning ? { reasoning } : {}),
+      });
       n += 1;
     }
   }
-  await splitAggregateBeliefRowsInStore();
+  await splitAggregateBeliefRowsInStore(400, BS);
   notifyMindStorageChanged({ source: 'beliefs' });
   return `Beliefs merged (${n} new, ${(result.beliefs || []).length} total processed).`;
 }
@@ -1928,13 +2207,25 @@ export async function persistMindAfterPipeline({
   runtimeSettings,
   source,
   pipelineRunId,
+  scheduledTaskId = null,
   curiosityPursuitContext = null,
   goalPursuitContext = null,
   /** When true, skip biography / phase memory / merge passes — cooperative pause checkpoint only. */
   pipelinePartialCheckpoint = false,
+  /**
+   * When non-empty, persist only listed channels (e.g. `beliefs`, `temporal`) — for mid-run cross-pipeline visibility.
+   * Mutually exclusive with `pipelinePartialCheckpoint` (partial checkpoint wins if both set).
+   */
+  narrowPersistChannels = null,
+  /** Primary vs mirror — defaults to current active entity profile. */
+  mindStorageProfile: mindStorageProfileOpt = undefined,
 }) {
+  void scheduledTaskId;
   const sm = sharedMemory || {};
   const rs = runtimeSettings || getRuntimeSettings();
+  const identityProfile = mindStorageProfileOpt ?? getActiveMindEntityProfile();
+  const isMirrorMind = identityProfile === MIND_STORAGE_PROFILE_PLAYGROUND_MIRROR;
+  setActiveMindEntityProfile(identityProfile);
 
   try {
   if (pipelinePartialCheckpoint) {
@@ -1943,11 +2234,11 @@ export async function persistMindAfterPipeline({
       if (rid) {
         const cid = curiosityPursuitContext?.parentCuriosityId;
         if (cid) {
-          await CuriosityItem.update(String(cid), { last_pursuit_pipeline_run_id: rid });
+          await E().CuriosityItem.update(String(cid), { last_pursuit_pipeline_run_id: rid });
         }
         const gid = goalPursuitContext?.parentGoalId;
         if (gid) {
-          await GoalItem.update(String(gid), { last_pursuit_pipeline_run_id: rid });
+          await E().GoalItem.update(String(gid), { last_pursuit_pipeline_run_id: rid });
         }
       }
     } catch (e) {
@@ -1957,12 +2248,61 @@ export async function persistMindAfterPipeline({
     return;
   }
 
+  const narrow =
+    Array.isArray(narrowPersistChannels) && narrowPersistChannels.length > 0
+      ? new Set(narrowPersistChannels.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean))
+      : null;
+  if (narrow && narrow.size > 0) {
+    try {
+      if (narrow.has('beliefs')) {
+        try {
+          await syncBeliefStoreRowsFromSharedMemory(sm);
+        } catch (e) {
+          console.warn('syncBeliefStoreRowsFromSharedMemory', e);
+        }
+        try {
+          await syncBeliefRevisionsToPersistedBeliefStore(sm);
+        } catch (e) {
+          console.warn('syncBeliefRevisionsToPersistedBeliefStore', e);
+        }
+        try {
+          await syncEpistemicClaimsToBeliefStore(sm);
+        } catch (e) {
+          console.warn('syncEpistemicClaimsToBeliefStore', e);
+        }
+        try {
+          await splitAggregateBeliefRowsInStore();
+        } catch (e) {
+          console.warn('splitAggregateBeliefRowsInStore', e);
+        }
+      }
+      if (narrow.has('temporal')) {
+        try {
+          await E().TemporalEvent.create({
+            title: 'pipeline_complete',
+            details: clipTextComplete(
+              sm?.phenomenalNow?.line || voiceOutput || 'Pipeline narrow persist (temporal).',
+              3500,
+              { ellipsis: false }
+            ),
+            source: source || 'pipeline',
+          });
+        } catch (e) {
+          console.warn('E().TemporalEvent narrow persist', e);
+        }
+      }
+    } finally {
+      notifyMindStorageChanged({ source, phase: sm.phase || 'focus' });
+    }
+    return;
+  }
+
   const promoteIds = Array.isArray(sm.workingMemoryPromoteIds) ? sm.workingMemoryPromoteIds : [];
   const wmItems = sm.workingMemory?.items || [];
   for (const pid of promoteIds.slice(0, 10)) {
     const it = wmItems.find((x) => x.id === pid);
     if (it?.text) {
-      await LongTermMemory.create({
+      await E().LongTermMemory.create({
         title: clipTextComplete(`Working memory ${String(pid)}`, 120, { ellipsis: false }),
         content: clipTextComplete(String(it.text), 8000, { ellipsis: false }),
         memory_type: 'episodic',
@@ -1983,9 +2323,18 @@ export async function persistMindAfterPipeline({
   const traitDelta = parseTraitDelta(sm.moduleOutputs?.Identity);
   if (traitDelta && typeof traitDelta === 'object') {
     try {
-      const cur = rs.personalityProfile || { version: 0, facets: [], relationalStance: null, systemTreatmentNotes: '' };
+      const cur = isMirrorMind
+        ? rs.personalityProfilePlaygroundMirror || {
+            version: 0,
+            facets: [],
+            relationalStance: null,
+            systemTreatmentNotes: '',
+          }
+        : rs.personalityProfile || { version: 0, facets: [], relationalStance: null, systemTreatmentNotes: '' };
       const nextProf = applyTraitDeltaToProfile(cur, traitDelta);
-      saveRuntimeSettings({ personalityProfile: nextProf });
+      saveRuntimeSettings(
+        isMirrorMind ? { personalityProfilePlaygroundMirror: nextProf } : { personalityProfile: nextProf }
+      );
     } catch (e) {
       console.warn('TRAIT_DELTA merge failed', e);
     }
@@ -1994,22 +2343,47 @@ export async function persistMindAfterPipeline({
   const constitutionDelta = parseConstitutionDelta(sm.moduleOutputs?.Identity);
   if (constitutionDelta) {
     try {
-      const nextConst = applyConstitutionDelta(rs.mindConstitution, constitutionDelta);
-      if (nextConst != null) saveRuntimeSettings({ mindConstitution: nextConst });
+      const baseConst = isMirrorMind ? rs.mindConstitutionPlaygroundMirror : rs.mindConstitution;
+      const nextConst = applyConstitutionDelta(baseConst, constitutionDelta);
+      if (nextConst != null) {
+        saveRuntimeSettings(
+          isMirrorMind ? { mindConstitutionPlaygroundMirror: nextConst } : { mindConstitution: nextConst }
+        );
+      }
     } catch (e) {
       console.warn('CONSTITUTION_DELTA merge failed', e);
     }
   }
 
+  const modulePromptDeltas = parseModulePromptDelta(sm.moduleOutputs?.Identity);
+  if (modulePromptDeltas) {
+    try {
+      const curOverrides = isMirrorMind
+        ? rs.modulePromptOverridesPlaygroundMirror
+        : rs.modulePromptOverrides;
+      const nextOverrides = applyModulePromptDeltas(curOverrides, modulePromptDeltas);
+      if (nextOverrides != null) {
+        saveRuntimeSettings(
+          isMirrorMind
+            ? { modulePromptOverridesPlaygroundMirror: nextOverrides }
+            : { modulePromptOverrides: nextOverrides }
+        );
+      }
+    } catch (e) {
+      console.warn('MODULE_PROMPT_DELTA merge failed', e);
+    }
+  }
+
   const delta = parseUserModelDelta(sm.moduleOutputs?.['Theory of Mind']);
   if (delta && typeof delta === 'object') {
-    const next = mergeUserModelDelta(rs.userModel, delta);
+    const umBase = isMirrorMind ? rs.userModelPlaygroundMirror : rs.userModel;
+    const next = mergeUserModelDelta(umBase, delta);
     if (next) {
-      saveRuntimeSettings({ userModel: next });
+      saveRuntimeSettings(isMirrorMind ? { userModelPlaygroundMirror: next } : { userModel: next });
       try {
-        await UserModelSnapshot.create({ version: next.version, model: next, source: 'theory-of-mind' });
+        await E().UserModelSnapshot.create({ version: next.version, model: next, source: 'theory-of-mind' });
       } catch (e) {
-        console.warn('UserModelSnapshot.create failed', e);
+        console.warn('E().UserModelSnapshot.create failed', e);
       }
     }
   }
@@ -2019,8 +2393,11 @@ export async function persistMindAfterPipeline({
     const label = clipTextComplete(String(mindLabelDelta.mindDisplayName ?? '').trim(), MIND_DISPLAY_NAME_MAX, {
       ellipsis: false,
     });
-    if (label && label !== String(rs.mindDisplayName ?? '').trim()) {
-      saveRuntimeSettings({ mindDisplayName: label });
+    const prevDisp = isMirrorMind ? rs.mindDisplayNamePlaygroundMirror : rs.mindDisplayName;
+    if (label && label !== String(prevDisp ?? '').trim()) {
+      saveRuntimeSettings(
+        isMirrorMind ? { mindDisplayNamePlaygroundMirror: label } : { mindDisplayName: label }
+      );
     }
   }
 
@@ -2028,7 +2405,7 @@ export async function persistMindAfterPipeline({
   const identityExcerpt = clipTextComplete(String(sm.moduleOutputs?.Identity || ''), 1600, { ellipsis: false });
   if (identityExcerpt.trim() || String(pn || '').trim()) {
     const lastMeta = (sm.metacognitionTimeline || []).slice(-1)[0] || null;
-    await SelfLedgerRevision.create({
+    await E().SelfLedgerRevision.create({
       reason: 'pipeline_identity',
       summary: truncate(pn, 500),
       identity_excerpt: identityExcerpt,
@@ -2039,7 +2416,7 @@ export async function persistMindAfterPipeline({
 
   for (const t of sm.beliefTensions || []) {
     if (!t?.description) continue;
-    await BeliefTension.create({
+    await E().BeliefTension.create({
       description: clipTextComplete(String(t.description), 3000, { ellipsis: false }),
       tension_state: t.state || 'active',
       revisit_after: t.revisit_after || null,
@@ -2067,6 +2444,12 @@ export async function persistMindAfterPipeline({
   }
 
   try {
+    await maybeQueueMetaFollowupsFromPipeline(sm);
+  } catch (e) {
+    console.warn('maybeQueueMetaFollowupsFromPipeline', e);
+  }
+
+  try {
     await maybeQueueBeliefTensionReviewFromPipeline(sm);
   } catch (e) {
     console.warn('maybeQueueBeliefTensionReviewFromPipeline', e);
@@ -2081,7 +2464,7 @@ async function applyPhaseMemoryPersistence({ sm, voiceOutput, narrativeText, run
   const auto = runtimeSettings.autoSaveMemories;
 
   if (phase === 'wake') {
-    await TemporalEvent.create({
+    await E().TemporalEvent.create({
       title: 'rhythm_wake',
       details: sm.phenomenalNow?.line || truncate(sm.originalInput, 500),
       source,
@@ -2092,7 +2475,7 @@ async function applyPhaseMemoryPersistence({ sm, voiceOutput, narrativeText, run
   if (!auto) return;
 
   if (phase === 'focus' && voiceOutput) {
-    await LongTermMemory.create({
+    await E().LongTermMemory.create({
       title: `Focus ${new Date().toLocaleString()}`,
       content: voiceOutput,
       memory_type: 'episodic',
@@ -2102,7 +2485,7 @@ async function applyPhaseMemoryPersistence({ sm, voiceOutput, narrativeText, run
   }
 
   if (phase === 'drift' && voiceOutput) {
-    await LongTermMemory.create({
+    await E().LongTermMemory.create({
       title: `Drift ${new Date().toLocaleString()}`,
       content: truncate(voiceOutput, 900),
       memory_type: 'episodic',
@@ -2114,7 +2497,7 @@ async function applyPhaseMemoryPersistence({ sm, voiceOutput, narrativeText, run
   if (phase === 'sleep') {
     const body = narrativeText || voiceOutput;
     if (body) {
-      await LongTermMemory.create({
+      await E().LongTermMemory.create({
         title: `Consolidation ${new Date().toLocaleString()}`,
         content: truncate(body, 14000),
         memory_type: 'semantic',
@@ -2135,11 +2518,11 @@ function sliceSection(text, label) {
  */
 export async function runConsolidationPass({ maxTokens = 900 } = {}) {
   const [runsRaw, msgs, mems, world, bios] = await Promise.all([
-    PipelineRun.list('-created_date', 10),
-    ConversationMessage.list('-created_date', 25),
-    LongTermMemory.list('-created_date', 25),
-    WorldModel.list('-updated_date', 15),
-    MindBiography.list('-created_date', 1),
+    E().PipelineRun.list('-created_date', 10),
+    E().ConversationMessage.list('-created_date', 25),
+    E().LongTermMemory.list('-created_date', 25),
+    E().WorldModel.list('-updated_date', 15),
+    E().MindBiography.list('-created_date', 1),
   ]);
   const runs = runsRaw.filter((r) => !isCheckpointPipelineRun(r));
 
@@ -2196,7 +2579,7 @@ QUESTIONS: (open threads worth revisiting)`;
   if (!res.ok) throw new Error(payload.error || 'Consolidation LLM failed');
 
   const text = String(payload.text || '');
-  await ConsolidationDigest.create({
+  await E().ConsolidationDigest.create({
     digest_text: text,
     digest_summary: truncate(sliceSection(text, 'DIGEST'), 1200),
     provider_used: payload.provider,
@@ -2224,7 +2607,7 @@ QUESTIONS: (open threads worth revisiting)`;
       if (name && description) {
         const canon = normalizeWorldModelCategory(category);
         const key = stableWorldModelKey(canon, name);
-        const all = await WorldModel.list('-updated_date', 200);
+        const all = await E().WorldModel.list('-updated_date', 200);
         const existing = all.find((i) => itemKeyForRecord(i) === key);
         if (existing) {
           const patch = buildWorldModelUpdatePayload(
@@ -2242,9 +2625,9 @@ QUESTIONS: (open threads worth revisiting)`;
             'consolidation',
             'Consolidation WORLD_HINTS'
           );
-          await WorldModel.update(existing.id, patch);
+          await E().WorldModel.update(existing.id, patch);
         } else {
-          await WorldModel.create(
+          await E().WorldModel.create(
             buildWorldModelCreatePayload({
               category: canon,
               label: name,
@@ -2261,7 +2644,7 @@ QUESTIONS: (open threads worth revisiting)`;
 
   const selfNote = sliceSection(text, 'SELF_NOTE');
   if (selfNote.length > 20) {
-    await SelfLedgerRevision.create({
+    await E().SelfLedgerRevision.create({
       reason: 'consolidation',
       summary: truncate(selfNote, 400),
       identity_excerpt: clipTextComplete(selfNote, 3000, { ellipsis: false }),

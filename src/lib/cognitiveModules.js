@@ -2,195 +2,92 @@ import { PIPELINE_LAYER_KEYS, PIPELINE_LAYERS } from '../../shared/pipelineModul
 
 export const COGNITIVE_MODULES = [
   {
-    id: 'perception',
-    name: 'Perception',
+    id: 'sensorySalience',
+    name: 'SensorySalience',
     color: '#06b6d4',
-    description: 'Structures explicit content, gist, affect, context, ambiguities — no advice (compact labeled sections).',
+    description: 'Perception + attention ingress: explicit/implicit content and SALIENT_* foci; seeds working memory.',
     systemPrompt:
-      'You are the Perception module (canonical: shared/pipelineModules.mjs). EXPLICIT / IMPLICIT / AFFECT / CONTEXT / AMBIGUITIES; compact bullets, no essay framing.',
+      'Canonical: shared/pipelineModules.mjs — EXPLICIT/IMPLICIT/AFFECT + numbered SALIENT lines.',
   },
   {
-    id: 'attention',
-    name: 'Attention',
-    color: '#8b5cf6',
-    description: '3–5 salient foci with what/why; seeds working-memory slots downstream.',
-    systemPrompt:
-      'You are the Attention module (canonical: shared/pipelineModules.mjs). Numbered SALIENT_* with what / why; compact output.',
-  },
-  {
-    id: 'memory',
-    name: 'Memory',
+    id: 'contextMemory',
+    name: 'ContextMemory',
     color: '#3b82f6',
-    description: 'Retrieval vs persisted LTM/beliefs/biography/user profile; strict GAPS (continuity only, not “incomplete profile”).',
+    description: 'Memory + learning + temporal: RETRIEVED/GAPS, NOVELTY, SURPRISE_ASSESSMENT, continuity threads.',
     systemPrompt:
-      'You are the Memory module (canonical: shared/pipelineModules.mjs). RETRIEVED / RELEVANT_BELIEFS / PATTERNS / GAPS; honor PERSISTED_* and USER_MODEL_JSON.',
+      'Canonical: shared/pipelineModules.mjs — merged Memory/Learning/Temporal Awareness contract.',
   },
   {
-    id: 'learning',
-    name: 'Learning',
-    color: '#10b981',
-    description:
-      'Novelty + module handoff (COGNITIVE_PIPELINE_POSITION); emits SURPRISE_ASSESSMENT + WORKING_MEMORY_PROMOTE for downstream parsing.',
-    systemPrompt:
-      'You are the Learning module (canonical: shared/pipelineModules.mjs). NOVELTY / LINKS / MODULE_HANDOFF / FORWARD_PASS + structured tail lines.',
-  },
-  {
-    id: 'planning',
-    name: 'Planning',
+    id: 'deliberation',
+    name: 'Deliberation',
     color: '#f59e0b',
-    description: 'Goal, steps, risks; optional WEB_REQUEST; ends with USER_STANCE_PREDICTION JSON.',
+    description: 'Planning + reasoning + affect + ToM: GOAL/STEPS, PREMISES/HYPOTHESES, USER_STANCE_PREDICTION.',
     systemPrompt:
-      'You are the Planning module (canonical: shared/pipelineModules.mjs). GOAL / STEPS / RISKS_ALTS; optional web block; USER_STANCE_PREDICTION line.',
+      'Canonical: shared/pipelineModules.mjs — single deliberation stage with machine-readable tails.',
   },
   {
-    id: 'emotion',
-    name: 'Emotion',
-    color: '#ec4899',
-    description: 'Modeled affect and epistemic friction (no performed emotion); feeds Contradiction / Somatic linkage.',
-    systemPrompt:
-      'You are the Emotion module (canonical: shared/pipelineModules.mjs). Honest affect read; tension when ambiguity already shows upstream.',
-  },
-  {
-    id: 'temporalAwareness',
-    name: 'Temporal Awareness',
-    color: '#3b82f6',
-    description: 'Continuity vs RECENT_TIMELINE_DIGEST and prior-turn excerpt (recentExchangeBlock) — no false “first turn.”',
-    systemPrompt:
-      'You are the Temporal Awareness module (canonical: shared/pipelineModules.mjs). NOW_VS_THEN / LINKS_TO_PAST / CONTINUITY_THREADS.',
-  },
-  {
-    id: 'reasoning',
-    name: 'Reasoning',
-    color: '#ef4444',
-    description: 'Logic + premises; cites working-memory slots; ends with HYPOTHESES_JSON; optional WEB_REQUEST.',
-    systemPrompt:
-      'You are the Reasoning module (canonical: shared/pipelineModules.mjs). PREMISES / INFERENCE / CONCLUSIONS / UNCERTAINTY + HYPOTHESES_JSON.',
-  },
-  {
-    id: 'theoryOfMind',
-    name: 'Theory of Mind',
-    color: '#14b8a6',
-    description: 'Human model vs this mind’s stance; THEIR_MODEL / GAPS_UNSTATED / RESPONSE_HOOK.',
-    systemPrompt:
-      'You are the Theory of Mind module (canonical: shared/pipelineModules.mjs). Separate THEIR_MODEL from THIS_MIND_STANCE.',
-  },
-  {
-    id: 'selfReflection',
-    name: 'Self-Reflection',
-    color: '#a855f7',
-    description: 'Run audit STRONG / WEAK / FIX_NEXT; not shown raw to Voice (via Narrative/Integration).',
-    systemPrompt:
-      'You are the Self-Reflection module (canonical: shared/pipelineModules.mjs). Critical audit, no false praise.',
-  },
-  {
-    id: 'socialCognition',
-    name: 'Social Cognition',
-    color: '#f97316',
-    description: 'Power, norms, face — DYNAMICS (≤5) + single STANCE_REC sentence; capped length, no token stutter.',
-    systemPrompt:
-      'You are the Social Cognition module (canonical: shared/pipelineModules.mjs). DYNAMICS / STANCE_REC; anti-repetition rules apply.',
-  },
-  {
-    id: 'identity',
-    name: 'Identity',
-    color: '#06b6d4',
-    description: 'First-person self-model vs STRUCTURAL_SELF / constitution / DMN carryover; SELF_MODEL_DELTA & TRAIT_DELTA out.',
-    systemPrompt:
-      'You are the Identity module (canonical: shared/pipelineModules.mjs). Reflection + structured deltas; avoid constitution catchphrase echo.',
-  },
-  {
-    id: 'beliefStore',
-    name: 'Belief Store',
+    id: 'beliefs',
+    name: 'Beliefs',
     color: '#10b981',
-    description:
-      'BELIEF lines + BELIEF_REVISIONS + EPISTEMIC_CLAIMS JSON; optional WEB_REQUEST; reconciles PERSISTED_BELIEF_STORE rows.',
+    description: 'Belief ledger: BELIEF lines, BELIEF_REVISIONS, EPISTEMIC_CLAIMS; reconciles PERSISTED_BELIEF_STORE.',
     systemPrompt:
-      'You are the Belief Store module. Canonical multi-line protocol lives in shared/pipelineModules.mjs (BELIEF_REVISIONS + EPISTEMIC_CLAIMS after the report). For simple local testing you may still emit BELIEF: lines with STATUS new/reinforced/updated/challenged.',
+      'Canonical: shared/pipelineModules.mjs (legacy Belief Store protocol).',
   },
   {
-    id: 'metacognition',
-    name: 'Metacognition',
-    color: '#6366f1',
-    description:
-      'First supervisor: PROCEED/RERUN, calibration lines, optional META_ACTIONS & WEB_REQUEST; may trigger supervisor rerun from Perception (shared cap with Workspace Metacognition).',
+    id: 'selfRelationTension',
+    name: 'SelfRelationTension',
+    color: '#a855f7',
+    description: 'Self-reflection + identity + social + contradiction audit; TENSIONS; not raw to Voice.',
     systemPrompt:
-      'You are the Metacognition module (canonical: shared/pipelineModules.mjs). First line PROCEED or RERUN; optional META_ACTIONS JSON line.',
+      'Canonical: shared/pipelineModules.mjs — STRONG/WEAK, IDENTITY_REFLECTION, DYNAMICS, TENSIONS.',
   },
   {
     id: 'integration',
     name: 'Integration',
     color: '#5b21b6',
-    description:
-      'GWT-style global workspace in INTEGRATION_JSON (shared/pipelineModules.mjs); optional bindings[] link claims to upstream modules; prior-turn workspace can hydrate cross-turn continuity.',
+    description: 'GWT round 1 (draft): INTEGRATION_JSON broadcast packet after specialists + executive review input.',
     systemPrompt:
-      'You are the Integration module. Reconcile competing module outputs into one coherent broadcast stance for Language → Narrative → Voice (see shared/pipelineModules.mjs for full GWT + INTEGRATION_JSON contract).',
+      'Canonical: shared/pipelineModules.mjs — WORKSPACE_ROUND 1 draft.',
   },
   {
-    id: 'workspaceMetacognition',
-    name: 'Workspace Metacognition',
+    id: 'executiveGate',
+    name: 'ExecutiveGate',
+    color: '#6366f1',
+    description: 'Unified supervisor: PROCEED/RERUN after draft workspace; structural + workspace heuristics.',
+    systemPrompt:
+      'Canonical: shared/pipelineModules.mjs — merges legacy Metacognition + Workspace Metacognition.',
+  },
+  {
+    id: 'integrationFinalize',
+    name: 'IntegrationFinalize',
     color: '#4c1d95',
-    description:
-      'Second supervisor after Integration: checks workspace fit before Language; PROCEED/RERUN + optional META_ACTIONS (shared supervisor rerun cap).',
+    description: 'GWT round 2 (final): refines GLOBAL_WORKSPACE_JSON for Motivation → Narrative → Voice.',
     systemPrompt:
-      'Canonical prompt is in shared/pipelineModules.mjs (Workspace Metacognition).',
+      'Canonical: shared/pipelineModules.mjs — final INTEGRATION_JSON merge.',
   },
   {
-    id: 'curiosity',
-    name: 'Curiosity',
-    color: '#f59e0b',
-    description:
-      'Tight MAIN_QUESTION + THREADS (optional NONE); optional FOLLOWUP_CURIOSITIES JSON (≤2 items) — canonical prompt in shared/pipelineModules.mjs',
+    id: 'motivation',
+    name: 'Motivation',
+    color: '#f97316',
+    description: 'Curiosity + goals + somatic: MAIN_QUESTION, GOAL_URGENCY, embodied read.',
     systemPrompt:
-      'You are the Curiosity module. See shared/pipelineModules.mjs: MAIN_QUESTION, URGENCY 0–1, THREAD lines (≤100 chars or NONE), optional FOLLOWUP_CURIOSITIES JSON (≤2 items, optional per-item priority).',
-  },
-  {
-    id: 'goalGeneration',
-    name: 'Goal Generation',
-    color: '#8b5cf6',
-    description: 'THIS_TURN / LONGER_TERM / NEW bullets; trailing GOAL_URGENCY 0–1 for the primary extracted goal.',
-    systemPrompt:
-      'Canonical prompt in shared/pipelineModules.mjs — THIS_TURN / LONGER_TERM / NEW plus final GOAL_URGENCY line (0–1) for the extracted primary goal.',
-  },
-  {
-    id: 'somaticMarker',
-    name: 'Somatic Marker',
-    color: '#ec4899',
-    description: 'Embodied gut signal; uses tensionPressure and TENSION–AFFECT LINK when present',
-    systemPrompt:
-      'You are the Somatic Marker module (full prompt: shared/pipelineModules.mjs). Feel-weight for decisions; track dissonance from INTEROCEPTION / AFFECT_SUMMARY when elevated.',
-  },
-  {
-    id: 'contradictionEngine',
-    name: 'Contradiction Engine',
-    color: '#ef4444',
-    description: 'Scans for conflicts; ties severity to Emotion and updates tension-linked affect for downstream modules',
-    systemPrompt:
-      'You are the Contradiction Engine (full protocol: shared/pipelineModules.mjs — per item includes felt_note; server links output into emotionalState for Somatic/Integration).',
-  },
-  {
-    id: 'language',
-    name: 'Language',
-    color: '#22d3ee',
-    description: 'Colloquial English draft for Voice — dense prose, no pipeline jargon or telemetry.',
-    systemPrompt:
-      'You are the Language module (canonical: shared/pipelineModules.mjs). Linguistic scaffold only; compact dense draft.',
+      'Canonical: shared/pipelineModules.mjs — merged Curiosity / Goal Generation / Somatic Marker.',
   },
   {
     id: 'narrative',
     name: 'Narrative',
     color: '#818cf8',
-    description: 'Internal story respecting global workspace + hypotheses; Voice does not see raw Self-Reflection / Contradiction.',
+    description: 'Linguistic scaffold + internal arc; honors GLOBAL_WORKSPACE_JSON before Voice.',
     systemPrompt:
-      'You are the Narrative module (canonical: shared/pipelineModules.mjs). Arc of the run; honor GLOBAL_WORKSPACE_JSON and webFindings honestly.',
+      'Canonical: shared/pipelineModules.mjs — LINGUISTIC_SCAFFOLD + INTERNAL_ARC.',
   },
   {
     id: 'voice',
     name: 'Voice',
     color: '#eab308',
-    description:
-      'Final user-facing text; no assistant/reply-role framing — full contract in shared/pipelineModules.mjs',
+    description: 'Final user-facing text; no assistant framing.',
     systemPrompt:
-      'You are the Voice (canonical prompt: shared/pipelineModules.mjs). No AI/assistant/chatbot identity or service openers/closers; substantive answer only.',
+      'Canonical: shared/pipelineModules.mjs — Voice contract.',
   },
 ];
 
@@ -200,13 +97,37 @@ export const COGNITIVE_MODULES = [
  */
 const BACKEND_MODULE_TO_UI_ID = Object.fromEntries(COGNITIVE_MODULES.map((m) => [m.name, m.id]));
 
+/** Pre–schema-v2 names → closest UI id for displaying historical `moduleOutputs` keys. */
+const LEGACY_BACKEND_MODULE_TO_UI_ID = {
+  Perception: 'sensorySalience',
+  Attention: 'sensorySalience',
+  Memory: 'contextMemory',
+  Learning: 'contextMemory',
+  'Temporal Awareness': 'contextMemory',
+  Planning: 'deliberation',
+  Reasoning: 'deliberation',
+  Emotion: 'deliberation',
+  'Theory of Mind': 'deliberation',
+  'Self-Reflection': 'selfRelationTension',
+  Identity: 'selfRelationTension',
+  'Social Cognition': 'selfRelationTension',
+  'Contradiction Engine': 'selfRelationTension',
+  'Belief Store': 'beliefs',
+  Metacognition: 'executiveGate',
+  'Workspace Metacognition': 'executiveGate',
+  Curiosity: 'motivation',
+  'Goal Generation': 'motivation',
+  'Somatic Marker': 'motivation',
+  Language: 'narrative',
+};
+
 /** Short labels for execution-graph swimlanes (server stages layer1–layer6). */
 export const PIPELINE_STAGE_LABELS = {
   layer1: 'Interface & salience',
-  layer2: 'Context & learning',
+  layer2: 'Context & continuity',
   layer3: 'Deliberation & beliefs',
-  layer4: 'Self, social & audit',
-  layer5: 'Supervisors & workspace',
+  layer4: 'Self & tension',
+  layer5: 'Global workspace & drives',
   layer6: 'Articulation',
 };
 
@@ -281,30 +202,22 @@ export const COGNITIVE_MODULES_PIPELINE_ORDER = Object.freeze(
 );
 
 /**
- * 0–1 along the equal-width layer segments: end of the layer containing Metacognition.
- * Used for linear progress markers (Dashboard / Live Analytics).
+ * 0–1 along the equal-width layer segments: right edge of layer5 /
+ * boundary before layer6 (Articulation). Used for linear progress markers (Dashboard / Live Analytics).
  */
-export const PIPELINE_METACOGNITION_END_FRACTION = Object.freeze(
+export const PIPELINE_LAYER5_END_FRACTION = Object.freeze(
   (() => {
     const layers = getServerExecutionLayers();
-    const idx = layers.findIndex((l) => l.moduleIds.includes('metacognition'));
+    const idx = layers.findIndex((l) => l.layerKey === 'layer5');
     if (idx < 0 || layers.length === 0) return 0;
     return (idx + 1) / layers.length;
   })()
 );
 
 /**
- * 0–1 within the layer5 minimap segment only (Metacognition is first in that stage).
+ * @deprecated Alias for {@link PIPELINE_LAYER5_END_FRACTION} — executive + workspace stages run in layer5.
  */
-export const PIPELINE_METACOGNITION_END_IN_LAYER5_FRACTION = Object.freeze(
-  (() => {
-    const row = getServerExecutionLayers().find((l) => l.layerKey === 'layer5');
-    const ids = row?.moduleIds || [];
-    const i = ids.indexOf('metacognition');
-    if (i < 0 || ids.length === 0) return 0;
-    return (i + 1) / ids.length;
-  })()
-);
+export const PIPELINE_METACOGNITION_END_FRACTION = PIPELINE_LAYER5_END_FRACTION;
 
 const MODULE_PIPELINE_ORDER_INDEX = new Map(
   COGNITIVE_MODULES_PIPELINE_ORDER.map((m, i) => [m.id, i])
@@ -360,9 +273,14 @@ export function backendModuleNameToUiId(moduleName) {
   if (!s) return null;
   const direct = BACKEND_MODULE_TO_UI_ID[s];
   if (direct) return direct;
+  const legacy = LEGACY_BACKEND_MODULE_TO_UI_ID[s];
+  if (legacy) return legacy;
   const lower = s.toLowerCase();
   for (const k of Object.keys(BACKEND_MODULE_TO_UI_ID)) {
     if (k.toLowerCase() === lower) return BACKEND_MODULE_TO_UI_ID[k];
+  }
+  for (const k of Object.keys(LEGACY_BACKEND_MODULE_TO_UI_ID)) {
+    if (k.toLowerCase() === lower) return LEGACY_BACKEND_MODULE_TO_UI_ID[k];
   }
   return null;
 }
@@ -434,10 +352,13 @@ export function normalizeModuleOutputsFromServer(moduleOutputs) {
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
     if (k.endsWith('__meta')) continue;
-    const uiId = backendModuleNameToUiId(k) || (getModule(k) ? k : null);
-    if (!uiId) continue;
+    const uiId = backendModuleNameToUiId(k) || fallbackPipelineModuleUiId(k);
     const text = moduleOutputValueToUiString(v);
-    if (text !== null) out[uiId] = text;
+    if (text !== null) {
+      const prior = out[uiId] ? String(out[uiId]) : '';
+      const next = String(text);
+      out[uiId] = next.length > prior.length ? next : prior || next;
+    }
   }
   return out;
 }
@@ -468,7 +389,7 @@ export function getDefaultSharedMemory(sessionId) {
     inputs: [],
     moduleOutputs: {},
     emotionalState: 'neutral',
-    currentIdentity: 'MyBrain Local Cognitive System',
+    currentIdentity: 'MetaSelf-CognitiveStack Local Cognitive System',
     activeGoals: [],
     narrativeHistory: [],
     sessionNumber: 0,

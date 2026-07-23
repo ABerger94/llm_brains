@@ -41,7 +41,7 @@ export function ToastViewport() {
   const { toasts } = useToast();
   return (
     <div
-      className="pointer-events-none fixed bottom-0 right-0 z-[200] flex w-full max-w-md flex-col gap-2 p-4 sm:p-6"
+      className="pointer-events-none fixed bottom-0 right-0 z-[200] flex w-max max-w-[min(28rem,calc(100vw-2rem))] flex-col items-end gap-2 p-4 sm:p-6"
       aria-live="polite"
     >
       {toasts.map((t) => (

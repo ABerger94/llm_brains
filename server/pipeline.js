@@ -1,6 +1,6 @@
 import { clipTextComplete } from '../shared/textClip.mjs';
 import { isBeliefTensionReviewPrimaryTurn } from '../shared/beliefRevisionsVoice.mjs';
-import { MODULES, LAYERS, getModuleByName } from './prompts.js';
+import { MODULES, LAYERS, getModuleByName, PIPELINE_SCHEMA_VERSION } from './prompts.js';
 import { normalizeExecutionResume } from '../shared/pipelineExecutionResume.mjs';
 import { getIncrementalCheckpointCursorAfter } from '../shared/pipelineModuleCheckpoint.mjs';
 import { consumePipelinePauseIfRequested, pipelinePausePending } from './pipelinePauseRegistry.js';
@@ -36,6 +36,12 @@ import {
   deriveArousalAfterVoice,
   deriveProvisionalArousal,
 } from './mindPolicy.js';
+import {
+  applyCrossChannelDigestHints,
+  applyWorkspaceDigestAdmissionHints,
+  logContextDigestSizes,
+} from './contextMerge.js';
+import { computeWorkspaceDelta } from './workspaceDelta.js';
 import { computeWorkspaceIgnition } from './workspaceIgnition.js';
 import { applyEpistemicFusionToSharedMemory, slimEpistemicFusion } from '../shared/epistemicFusion.mjs';
 import { querySimilarities } from './embeddingService.js';
@@ -74,8 +80,51 @@ import {
 } from './llmContextBudget.js';
 import { maybeFulfillWebRequests } from './webEnrichment.js';
 import { extractRecentExchangeFromComposedInput } from './pipelineInputCompose.js';
+import {
+  EARLY_BUNDLE_MODULE_ORDER,
+  buildEarlyBundleSystemPrompt,
+  splitEarlyBundleToModuleOutputs,
+} from '../shared/earlyBundle.mjs';
 
 export { normalizeExecutionResume };
+
+const GATING_SKIP_SELF_RELATION_PLACEHOLDER =
+  '[Gating] This pass was skipped (low-stakes / very short user turn). TENSIONS: NONE.';
+
+export function resolvePipelineProfile(options = {}) {
+  const envP = String(process.env.PIPELINE_PROFILE || '').trim().toLowerCase();
+  if (envP === 'classic') return 'classic';
+  if (envP === 'unified') return 'unified';
+  const o = String(options?.pipelineProfile || 'unified').trim().toLowerCase();
+  return o === 'classic' ? 'classic' : 'unified';
+}
+
+function layerKeyForModuleName(name) {
+  const m = MODULES.find((x) => x.name === name);
+  return m?.layer || 'layer1';
+}
+
+function resolvePipelineGating(_sharedMemory, input, options = {}) {
+  if (options?.pipelineGating === false) {
+    return { mode: 'off', skipSelfRelation: false, reason: 'opt_off' };
+  }
+  const fromOpts = String(options?.pipelineGating || '').trim().toLowerCase();
+  const fromEnv = String(process.env.PIPELINE_GATING || '').trim().toLowerCase();
+  const mode = (fromOpts && fromOpts !== 'default' ? fromOpts : null) || fromEnv || 'default';
+  if (mode === 'off') {
+    return { mode: 'off', skipSelfRelation: false, reason: 'off' };
+  }
+  if (mode !== 'aggressive') {
+    return { mode: 'default', skipSelfRelation: false, reason: 'default' };
+  }
+  const t = String(input || '').trim();
+  const hasAttach = t.length > 4000 || /\b(attachment|base64|GLM-?OCR|data:image|ocr)\b/i.test(t);
+  const veryShort = t.length > 0 && t.length < 24 && !t.includes('?');
+  if (veryShort && !hasAttach) {
+    return { mode: 'aggressive', skipSelfRelation: true, reason: 'very_short_no_attach' };
+  }
+  return { mode: 'aggressive', skipSelfRelation: false, reason: 'no_skip' };
+}
 
 /** Modules that must exist before Metacognition (layers 1–4 only; Narrative/Voice run later). */
 const MODULES_BEFORE_METACOGNITION = [
@@ -87,7 +136,7 @@ const MODULES_BEFORE_METACOGNITION = [
 
 const VALID_PIPELINE_MODULE_NAMES = new Set(MODULES.map((m) => m.name));
 
-const DEFAULT_MAX_METACOG_RERUNS = 1;
+const DEFAULT_MAX_METACOG_RERUNS = 2;
 
 function layerKeyToResumePhase(layerKey) {
   if (layerKey === 'layer5') return 'layer5';
@@ -96,7 +145,7 @@ function layerKeyToResumePhase(layerKey) {
 }
 
 /** Modules whose SSE text feeds the Graph Pipeline transcript / voice path — keep uncut for TTS/narrative parity (still cap at voice-path max for pathological sizes). */
-const SSE_FULL_PROSE_MODULE_NAMES = new Set(['Language', 'Narrative', 'Voice']);
+const SSE_FULL_PROSE_MODULE_NAMES = new Set(['Narrative', 'Voice']);
 
 /** Cap each `module_complete` SSE payload for non–Voice-path modules (Planning, etc.). Default high so execution.log "Show output" can show full text; override with SSE_MODULE_COMPLETE_MAX_CHARS. */
 function getSseModuleCompleteMaxChars() {
@@ -312,7 +361,7 @@ function integrationProseBeforeJsonMarker(text) {
 function buildFallbackGlobalWorkspace(integrationRaw, sharedMemory) {
   const mo = sharedMemory.moduleOutputs && typeof sharedMemory.moduleOutputs === 'object' ? sharedMemory.moduleOutputs : {};
   const prose = integrationProseBeforeJsonMarker(integrationRaw).replace(/\s+/g, ' ').trim().slice(0, 1200);
-  const reason = String(mo.Reasoning || '').trim().slice(0, 500);
+  const reason = String(mo.Deliberation || '').trim().slice(0, 500);
   const nar = String(mo.Narrative || '').trim().slice(0, 400);
   const stance =
     prose ||
@@ -338,21 +387,21 @@ function buildFallbackGlobalWorkspace(integrationRaw, sharedMemory) {
 
   // Open questions from Reasoning HYPOTHESES_JSON or Curiosity MAIN_QUESTION
   const openQuestions = [];
-  const reasoningHypo = parseJsonAfterMarker(String(mo.Reasoning || ''), 'HYPOTHESES_JSON');
+  const reasoningHypo = parseJsonAfterMarker(String(mo.Deliberation || ''), 'HYPOTHESES_JSON');
   if (reasoningHypo && Array.isArray(reasoningHypo.hypotheses)) {
     for (const h of reasoningHypo.hypotheses.slice(0, 4)) {
       const q = String(h?.would_flip_if || h?.label || '').trim();
       if (q.length > 8) openQuestions.push(q.slice(0, 400));
     }
   }
-  const curiosityMain = String(mo.Curiosity || '').match(/MAIN_QUESTION:\s*(.+)/i);
+  const curiosityMain = String(mo.Motivation || '').match(/MAIN_QUESTION:\s*(.+)/i);
   if (curiosityMain) {
     const q = curiosityMain[1].trim();
     if (q.length > 8) openQuestions.push(q.slice(0, 400));
   }
 
   // Broadcast winners: modules with the most substantive outputs
-  const candidateModules = ['Reasoning', 'Emotion', 'Contradiction Engine', 'Self-Reflection', 'Identity'];
+  const candidateModules = ['Deliberation', 'Beliefs', 'SelfRelationTension', 'ContextMemory'];
   const broadcastWinners = candidateModules
     .map((name) => ({ name, len: String(mo[name] || '').trim().length }))
     .filter((m) => m.len > 50)
@@ -374,6 +423,24 @@ function buildFallbackGlobalWorkspace(integrationRaw, sharedMemory) {
 
   const hpRaw = sharedMemory.hypothesisPortfolio?.hypotheses;
   const hypothesesFb = Array.isArray(hpRaw) && hpRaw.length ? normalizeHypothesisList(hpRaw) : [];
+
+  const peripheralPool = [
+    'SensorySalience',
+    'ContextMemory',
+    'Deliberation',
+    'Beliefs',
+    'SelfRelationTension',
+    'Integration',
+    'ExecutiveGate',
+    'IntegrationFinalize',
+    'Motivation',
+    'Narrative',
+  ];
+  const suppressedOrPeripheral = peripheralPool
+    .filter((name) => !broadcastWinners.includes(name) && String(mo[name] || '').trim().length > 40)
+    .slice(0, 6)
+    .map((name) => `${name} (peripheral vs broadcast winners — fallback workspace)`);
+
   return {
     salience,
     conflicts,
@@ -385,6 +452,7 @@ function buildFallbackGlobalWorkspace(integrationRaw, sharedMemory) {
     unityRationale:
       'No valid INTEGRATION_JSON line was parsed; stance came from Integration prose or upstream modules. Unity set to partial (fallback).',
     epistemicThreads,
+    ...(suppressedOrPeripheral.length ? { suppressedOrPeripheral } : {}),
     ...(hypothesesFb.length ? { hypotheses: hypothesesFb } : {}),
   };
 }
@@ -428,7 +496,7 @@ function normalizeHypothesisList(raw) {
 
 /** Seed hypothesisPortfolio for this run: prior workspace (decayed) before Reasoning; keep mid-run state if Reasoning already ran. */
 function initialHypothesisPortfolioForRun(base) {
-  const reasoningDone = String(base.moduleOutputs?.Reasoning || '').trim().length > 0;
+  const reasoningDone = String(base.moduleOutputs?.Deliberation || '').trim().length > 0;
   if (reasoningDone) {
     const hp = base.hypothesisPortfolio?.hypotheses?.length
       ? normalizeHypothesisList(base.hypothesisPortfolio.hypotheses)
@@ -540,7 +608,7 @@ export function createSharedMemory({ existingSharedMemory, input }) {
     priorTurnPredictionAudit: base.priorTurnPredictionAudit ?? null,
     followupHints:
       base.followupHints && typeof base.followupHints === 'object' ? { ...base.followupHints } : {},
-    /** Count of supervisor-triggered reruns consumed in this pipeline POST; continuation legs reset at run start (see runPipeline). */
+    /** Count of supervisor-triggered reruns consumed in this logical user run (carried across continuation POSTs; new turns strip to 0). */
     metacognitionRerunsUsed: Number.isFinite(Number(base.metacognitionRerunsUsed))
       ? Math.max(0, Math.floor(Number(base.metacognitionRerunsUsed)))
       : 0,
@@ -561,6 +629,13 @@ export function createSharedMemory({ existingSharedMemory, input }) {
     clientAffectDigest: Array.isArray(base.clientAffectDigest) ? deepClone(base.clientAffectDigest).slice(0, 12) : [],
     clientBiographyExcerpt:
       typeof base.clientBiographyExcerpt === 'string' ? base.clientBiographyExcerpt : '',
+    clientWorldEnvironmentDigest: Array.isArray(base.clientWorldEnvironmentDigest)
+      ? deepClone(base.clientWorldEnvironmentDigest).slice(0, 16)
+      : [],
+    clientCuriosityDigest: Array.isArray(base.clientCuriosityDigest)
+      ? deepClone(base.clientCuriosityDigest).slice(0, 14)
+      : [],
+    clientGoalDigest: Array.isArray(base.clientGoalDigest) ? deepClone(base.clientGoalDigest).slice(0, 12) : [],
     /** Prior-turn dialogue block for this composed input; set each run in runPipeline after strip */
     recentExchangeBlock: null,
     hypothesisPortfolio: initialHypothesisPortfolioForRun(base),
@@ -570,6 +645,13 @@ export function createSharedMemory({ existingSharedMemory, input }) {
       base.workspaceIgnition && typeof base.workspaceIgnition === 'object'
         ? deepClone(base.workspaceIgnition)
         : null,
+    /** Deterministic prior vs current workspace summary; set after Integration. */
+    workspaceDelta:
+      base.workspaceDelta && typeof base.workspaceDelta === 'object' ? deepClone(base.workspaceDelta) : null,
+    /** True when Integration output had no parseable INTEGRATION_JSON and fallback workspace was used. */
+    globalWorkspaceFallback: base.globalWorkspaceFallback === true,
+    /** Snapshots of globalWorkspace across draft/final integration passes (this turn). */
+    workspaceHistory: Array.isArray(base.workspaceHistory) ? deepClone(base.workspaceHistory).slice(-8) : [],
   };
 
   if (!Array.isArray(sharedMemory.workingMemory.items)) sharedMemory.workingMemory.items = [];
@@ -634,23 +716,20 @@ function workspaceMetacognitionHeuristicChecks(sharedMemory) {
 }
 
 /** Modules whose raw outputs Voice must not see (critic / tension machinery — use Integration + Narrative only). */
-const VOICE_REDACTED_MODULE_OUTPUTS = ['Self-Reflection', 'Contradiction Engine'];
+const VOICE_REDACTED_MODULE_OUTPUTS = ['SelfRelationTension'];
 
 const STRICT_GLOBAL_WORKSPACE_SYSTEM_APPEND = `
 
 STRICT_GLOBAL_WORKSPACE_BROADCAST is enabled: treat GLOBAL_WORKSPACE_JSON in CONTEXT_AND_POLICY as the primary conscious packet for this turn. Do not invent substantive claims from modules omitted from SHARED_MEMORY_JSON.moduleOutputs unless they are implied by the retained summaries or the workspace text.`;
 
 const STRICT_BROADCAST_ALWAYS = new Set([
-  'Attention',
-  'Contradiction Engine',
-  'Reasoning',
+  'SensorySalience',
+  'SelfRelationTension',
+  'Deliberation',
   'Integration',
-  'Metacognition',
-  'Workspace Metacognition',
-  'Emotion',
-  'Curiosity',
-  'Goal Generation',
-  'Somatic Marker',
+  'IntegrationFinalize',
+  'ExecutiveGate',
+  'Motivation',
 ]);
 
 function buildStrictBroadcastHay(sm) {
@@ -671,6 +750,7 @@ function buildStrictBroadcastHay(sm) {
       for (const m of ensureArray(b.sourceModules)) chunks.push(String(m));
       chunks.push(String(b.claim || ''));
     }
+    for (const s of ensureArray(gw.suppressedOrPeripheral)) chunks.push(String(s));
   }
   return chunks.join('\n').toLowerCase();
 }
@@ -680,6 +760,22 @@ function moduleReferencedInStrictHay(name, hay) {
   if (hay.includes(n)) return true;
   const compact = n.replace(/\s+/g, '');
   return hay.includes(compact);
+}
+
+/** Optional: when Integration left salience empty, lift WORKING_MEMORY item text (env gated). */
+function maybeBackfillSalienceFromWorkingMemory(sharedMemory) {
+  if (String(process.env.WORKSPACE_SALIENCE_BACKFILL || '').trim() !== '1') return;
+  const gw = sharedMemory.globalWorkspace;
+  if (!gw || typeof gw !== 'object') return;
+  if (Array.isArray(gw.salience) && gw.salience.length > 0) return;
+  const items = sharedMemory.workingMemory?.items;
+  if (!Array.isArray(items) || !items.length) return;
+  const sal = [];
+  for (const it of items.slice(0, 6)) {
+    const t = String(it?.text || '').trim();
+    if (t) sal.push(t.slice(0, 400));
+  }
+  if (sal.length) sharedMemory.globalWorkspace = { ...gw, salience: sal };
 }
 
 /** Tier moduleOutputs for Language / Narrative / Voice when strictGlobalWorkspaceBroadcast is on. */
@@ -693,15 +789,12 @@ function sanitizeModuleOutputsForStrictBroadcast(sharedMemory, moIn, recipientMo
   };
 
   for (const name of STRICT_BROADCAST_ALWAYS) {
-    const cap = name === 'Emotion' ? 3600 : 5200;
+    const cap = name === 'Deliberation' ? 3600 : 5200;
     add(name, cap);
   }
 
-  if (recipientModule === 'Narrative' || recipientModule === 'Voice') {
-    add('Language', 8000);
-  }
   if (recipientModule === 'Voice') {
-    add('Narrative', 12_000);
+    add('Narrative', 14_000);
   }
 
   for (const m of MODULES) {
@@ -764,13 +857,11 @@ function sanitizeModuleOutputsForVoice(moIn) {
   if (typeof moduleOutputs.Integration === 'string') {
     moduleOutputs.Integration = stripIntegrationJsonTailForVoice(moduleOutputs.Integration);
   }
-  if (typeof moduleOutputs.Metacognition === 'string') {
-    moduleOutputs.Metacognition = trimMetacognitionOutputForVoice(moduleOutputs.Metacognition);
+  if (typeof moduleOutputs.IntegrationFinalize === 'string') {
+    moduleOutputs.IntegrationFinalize = stripIntegrationJsonTailForVoice(moduleOutputs.IntegrationFinalize);
   }
-  if (typeof moduleOutputs['Workspace Metacognition'] === 'string') {
-    moduleOutputs['Workspace Metacognition'] = trimMetacognitionOutputForVoice(
-      moduleOutputs['Workspace Metacognition']
-    );
+  if (typeof moduleOutputs.ExecutiveGate === 'string') {
+    moduleOutputs.ExecutiveGate = trimMetacognitionOutputForVoice(moduleOutputs.ExecutiveGate);
   }
   return moduleOutputs;
 }
@@ -783,9 +874,7 @@ export function formatSharedMemoryForModule(sharedMemory, recipientModule = null
   }
   const strictBroadcast =
     sharedMemory.strictGlobalWorkspaceBroadcast === true &&
-    (recipientModule === 'Language' ||
-      recipientModule === 'Narrative' ||
-      recipientModule === 'Voice');
+    (recipientModule === 'Narrative' || recipientModule === 'Voice' || recipientModule === 'Motivation');
   if (strictBroadcast) {
     moduleOutputs = sanitizeModuleOutputsForStrictBroadcast(sharedMemory, moduleOutputs, recipientModule);
   }
@@ -819,6 +908,8 @@ export function formatSharedMemoryForModule(sharedMemory, recipientModule = null
     webFetchSuppressReason: String(sharedMemory.webFetchSuppressReason || '').slice(0, 500),
     structuralSelfModel: (sharedMemory.structuralSelfModel || []).slice(0, 20),
     globalWorkspace: sharedMemory.globalWorkspace,
+    workspaceDelta: sharedMemory.workspaceDelta ?? null,
+    globalWorkspaceFallback: sharedMemory.globalWorkspaceFallback === true,
     workspaceIgnition: sharedMemory.workspaceIgnition ?? null,
     epistemicFusion: slimEpistemicFusion(sharedMemory.epistemicFusion),
     interoception: sharedMemory.interoception,
@@ -846,6 +937,9 @@ export function formatSharedMemoryForModule(sharedMemory, recipientModule = null
     clientBeliefDigest: (sharedMemory.clientBeliefDigest || []).slice(0, 14),
     clientAffectDigest: (sharedMemory.clientAffectDigest || []).slice(0, 6),
     clientBiographyExcerpt: String(sharedMemory.clientBiographyExcerpt || '').slice(0, 2400),
+    clientWorldEnvironmentDigest: (sharedMemory.clientWorldEnvironmentDigest || []).slice(0, 10),
+    clientCuriosityDigest: (sharedMemory.clientCuriosityDigest || []).slice(0, 8),
+    clientGoalDigest: (sharedMemory.clientGoalDigest || []).slice(0, 8),
     recentExchangeBlock:
       typeof sharedMemory.recentExchangeBlock === 'string' && sharedMemory.recentExchangeBlock.trim()
         ? clipTextComplete(sharedMemory.recentExchangeBlock.trim(), 14_000, { ellipsis: false })
@@ -855,9 +949,52 @@ export function formatSharedMemoryForModule(sharedMemory, recipientModule = null
   if (recipientModule === 'Voice') {
     delete snapshot.interoception;
     delete snapshot.recentExchangeBlock;
+    // Raw SelfRelationTension / legacy critic text — same redaction contract as moduleOutputs.
+    delete snapshot.identityNarrative;
+    if (Array.isArray(snapshot.beliefTensions) && snapshot.beliefTensions.length) {
+      snapshot.beliefTensions = [{ redacted: true, count: snapshot.beliefTensions.length }];
+    }
+    if (snapshot.phenomenalNow && typeof snapshot.phenomenalNow === 'object') {
+      const line = String(snapshot.phenomenalNow.line || '');
+      const parts = line.split(/\s*·\s*/).filter((p) => !/^Identity:\s/i.test(p));
+      snapshot.phenomenalNow = {
+        ...snapshot.phenomenalNow,
+        line: parts.join(' · ').trim() || 'Pipeline pass in progress.',
+      };
+    }
   }
 
   return JSON.stringify(snapshot, null, 2);
+}
+
+function slimWorkspaceSnapshotForSse(snap) {
+  if (!snap || typeof snap !== 'object') return null;
+  return {
+    provisionalStance: String(snap.provisionalStance || '').slice(0, 800),
+    phenomenalUnity: String(snap.phenomenalUnity || '').slice(0, 16),
+    integrationConfidence:
+      typeof snap.integrationConfidence === 'number' && Number.isFinite(snap.integrationConfidence)
+        ? snap.integrationConfidence
+        : undefined,
+    saliencePreview: Array.isArray(snap.salience)
+      ? snap.salience.map((s) => String(s).slice(0, 160)).slice(0, 4)
+      : [],
+  };
+}
+
+function slimWorkspaceHistoryForSse(raw) {
+  if (!Array.isArray(raw) || !raw.length) return [];
+  return raw
+    .slice(-6)
+    .map((e) => {
+      if (!e || typeof e !== 'object') return null;
+      return {
+        at: String(e.at || '').slice(0, 44),
+        label: String(e.label || '').slice(0, 48),
+        snapshot: slimWorkspaceSnapshotForSse(e.snapshot),
+      };
+    })
+    .filter(Boolean);
 }
 
 /** Smaller sharedMemory on the wire for SSE `complete` / `pipeline_continuation` (single `data:` line limits / proxies). */
@@ -908,6 +1045,19 @@ export function slimSharedMemoryForSse(sm) {
     webFetchSuppressReason: String(sm.webFetchSuppressReason || '').slice(0, 500),
     structuralSelfModel: (sm.structuralSelfModel || []).slice(0, 14),
     globalWorkspace: sm.globalWorkspace,
+    workspaceDelta:
+      sm.workspaceDelta && typeof sm.workspaceDelta === 'object'
+        ? {
+            stanceOverlapApprox: sm.workspaceDelta.stanceOverlapApprox,
+            unityChange: sm.workspaceDelta.unityChange,
+            note: typeof sm.workspaceDelta.note === 'string' ? sm.workspaceDelta.note.slice(0, 120) : undefined,
+            bullets: Array.isArray(sm.workspaceDelta.bullets)
+              ? sm.workspaceDelta.bullets.map((b) => String(b).slice(0, 420)).slice(0, 6)
+              : [],
+          }
+        : null,
+    globalWorkspaceFallback: sm.globalWorkspaceFallback === true,
+    workspaceHistory: slimWorkspaceHistoryForSse(sm.workspaceHistory),
     workspaceIgnition:
       sm.workspaceIgnition && typeof sm.workspaceIgnition === 'object'
         ? {
@@ -985,6 +1135,23 @@ export function slimSharedMemoryForSse(sm) {
       created_date: String(r.created_date || '').slice(0, 44),
     })),
     clientBiographyExcerpt: String(sm.clientBiographyExcerpt || '').slice(0, 1800),
+    clientWorldEnvironmentDigest: (sm.clientWorldEnvironmentDigest || []).slice(0, 6).map((r) => ({
+      category: String(r.category || '').slice(0, 36),
+      key: String(r.key || '').slice(0, 120),
+      label: String(r.label || '').slice(0, 200),
+      description: String(r.description || '').slice(0, 400),
+      confidence: r.confidence,
+    })),
+    clientCuriosityDigest: (sm.clientCuriosityDigest || []).slice(0, 8).map((r) => ({
+      question: String(r.question || '').slice(0, 360),
+      status: String(r.status || '').slice(0, 20),
+      priority: r.priority,
+    })),
+    clientGoalDigest: (sm.clientGoalDigest || []).slice(0, 6).map((r) => ({
+      statement: String(r.statement || '').slice(0, 400),
+      status: String(r.status || '').slice(0, 20),
+      priority: r.priority,
+    })),
     recentExchangeBlock:
       typeof sm.recentExchangeBlock === 'string' && sm.recentExchangeBlock.trim()
         ? String(sm.recentExchangeBlock).slice(0, 12_000)
@@ -1029,7 +1196,10 @@ export function stripPriorPipelineTraceForNewTurn(sharedMemory) {
   sharedMemory.metaCognitionFlags = [];
   sharedMemory.metacognitionDeferredReruns = [];
   sharedMemory.globalWorkspace = null;
+  sharedMemory.workspaceDelta = null;
+  sharedMemory.globalWorkspaceFallback = false;
   sharedMemory.workspaceIgnition = null;
+  sharedMemory.workspaceHistory = [];
   sharedMemory.epistemicFusion = null;
   sharedMemory.userStancePrediction = null;
   sharedMemory.surpriseAssessment = null;
@@ -1045,13 +1215,17 @@ function maybeStripContinuationTrace(sharedMemory, options) {
   stripPriorPipelineTraceForNewTurn(sharedMemory);
 }
 
-/** Recency cue: tail of composed input after pipeline `---` separator (current user turn + attachments). */
+/**
+ * Recency cue: tail of composed input after pipeline `---` separator (current user turn + attachments).
+ * When there is no `---` (no RECENT_EXCHANGE prefix), the whole composed input is the primary turn — otherwise
+ * Perception would see an empty PRIMARY_TURN and miss the user message and ATTACHMENTS / GLM-OCR block.
+ */
 export function buildPrimaryTurnBlock(originalInput) {
   const sep = '\n---\n\n';
-  const s = String(originalInput || '');
+  const s = String(originalInput || '').trim();
+  if (!s) return '';
   const idx = s.lastIndexOf(sep);
-  if (idx === -1) return '';
-  const tail = s.slice(idx + sep.length).trim();
+  const tail = idx === -1 ? s : s.slice(idx + sep.length).trim();
   if (!tail) return '';
   const clipped = tail.length > 12000 ? `${tail.slice(0, 12000)}\n[…]` : tail;
   return `PRIMARY_TURN (highest priority — address this first; RECENT_EXCHANGE and older memories in SHARED_MEMORY_JSON are supporting context only unless the user ties them to this turn):\n\n${clipped}`;
@@ -1108,12 +1282,12 @@ function reduceStepFitsContext(systemPrompt, reduceUser, options) {
   );
 }
 
-const REASONING_MULTI_SAMPLE_MERGE_SYSTEM = `You merge two Reasoning-module drafts from the same pipeline step (identical upstream context). Output a single Reasoning-shaped reply that:
-- Uses headings PREMISES / INFERENCE / CONCLUSIONS / UNCERTAINTY as the Reasoning module does (omit empty sections).
+const REASONING_MULTI_SAMPLE_MERGE_SYSTEM = `You merge two Deliberation-module drafts from the same pipeline step (identical upstream context). Output a single Deliberation-shaped reply that:
+- Uses headings GOAL / STEPS / RISKS_ALTS, PREMISES / INFERENCE / CONCLUSIONS / UNCERTAINTY, AFFECT_READ, THEIR_MODEL / GAPS_UNSTATED / RESPONSE_HOOK as appropriate (omit empty sections).
 - Keeps the strongest evidence; if the drafts disagree, say so under UNCERTAINTY without naming "draft A/B".
-- Ends with exactly one line: HYPOTHESES_JSON: {"hypotheses":[...]} combining both drafts’ hypotheses (max 6), deduplicating near-duplicate labels, reweighting relative plausibility 0–1 (need not sum to 1).
+- Preserves USER_STANCE_PREDICTION and ends with exactly one line: HYPOTHESES_JSON: {"hypotheses":[...]} combining both drafts’ hypotheses (max 6), deduplicating near-duplicate labels, reweighting relative plausibility 0–1 (need not sum to 1).
 - If a draft ended with WEB_REQUEST per pipeline rules, you may include at most one WEB_REQUEST block at the very end of your output; otherwise omit it.
-- Write as the sole Reasoning output — no meta about merging.`;
+- Write as the sole Deliberation output — no meta about merging.`;
 
 function reasoningBodyWithoutHypothesesMarker(text) {
   const s = String(text || '');
@@ -1262,7 +1436,7 @@ async function runModuleMultiSample(moduleName, callLLM, systemPrompt, userConte
 
   const mode = multiSampleMergeMode();
 
-  if (moduleName === 'Integration') {
+  if (moduleName === 'Integration' || moduleName === 'IntegrationFinalize') {
     if (mode === 'mechanical') {
       return { text: mergeIntegrationSamplesMechanical(r1.text, r2.text), provider: r1.provider, model: r1.model, partialDueToSoftTimeout: false };
     }
@@ -1273,7 +1447,7 @@ async function runModuleMultiSample(moduleName, callLLM, systemPrompt, userConte
     return rM;
   }
 
-  if (moduleName === 'Contradiction Engine') {
+  if (moduleName === 'SelfRelationTension') {
     return { text: mergeContradictionSamplesMechanical(r1.text, r2.text), provider: r1.provider, model: r1.model, partialDueToSoftTimeout: false };
   }
 
@@ -1346,6 +1520,11 @@ export async function runModule({ moduleName, sharedMemory, callLLM, options, on
   const mod = getModuleByName(moduleName);
   if (!mod) throw new Error(`Unknown module: ${moduleName}`);
 
+  const callOptsBase = { ...(options && typeof options === 'object' ? options : {}) };
+  delete callOptsBase.llmRoute;
+  delete callOptsBase.onlyProviderId;
+  delete callOptsBase.onlyModel;
+
   const latestRerun = sharedMemory.metaCognitionFlags?.slice?.(-1)?.[0];
   const primaryTurnBlock = buildPrimaryTurnBlock(sharedMemory.originalInput);
   const policyBlock = buildMindContextForModule(moduleName, sharedMemory);
@@ -1370,7 +1549,7 @@ export async function runModule({ moduleName, sharedMemory, callLLM, options, on
 
   if (
     sharedMemory.strictGlobalWorkspaceBroadcast === true &&
-    (moduleName === 'Language' || moduleName === 'Narrative' || moduleName === 'Voice')
+    (moduleName === 'Narrative' || moduleName === 'Voice' || moduleName === 'Motivation')
   ) {
     systemPrompt += STRICT_GLOBAL_WORKSPACE_SYSTEM_APPEND;
   }
@@ -1384,9 +1563,27 @@ export async function runModule({ moduleName, sharedMemory, callLLM, options, on
   let outputPartialBySoftTimeout = false;
 
   if (!useChunked) {
-    let callOpts = moduleName === 'Integration' ? { ...options, disableSoftTimeout: true } : { ...options };
+    let callOpts =
+      moduleName === 'Integration' || moduleName === 'IntegrationFinalize'
+        ? { ...callOptsBase, disableSoftTimeout: true }
+        : { ...callOptsBase };
     if (shouldAdaptTemperature(moduleName, callOpts)) {
-      callOpts.temperature = resolveAdaptiveTemperature(sharedMemory, callOpts);
+      const strictMaxRaw = String(process.env.STRICT_WORKSPACE_ADAPTIVE_MAX_TEMP || '').trim();
+      if (
+        sharedMemory.strictGlobalWorkspaceBroadcast === true &&
+        (moduleName === 'Narrative' || moduleName === 'Voice' || moduleName === 'Motivation') &&
+        strictMaxRaw
+      ) {
+        const strictCap = parseFloat(strictMaxRaw);
+        if (Number.isFinite(strictCap)) {
+          callOpts.maxAdaptiveTemp =
+            typeof callOpts.maxAdaptiveTemp === 'number' && Number.isFinite(callOpts.maxAdaptiveTemp)
+              ? Math.min(callOpts.maxAdaptiveTemp, strictCap)
+              : strictCap;
+        }
+      }
+      callOpts.temperature = resolveAdaptiveTemperature(sharedMemory, callOpts, moduleName);
+      sharedMemory._adaptiveTemperature = callOpts.temperature;
     }
     const r = await callLLM(systemPrompt, userContentSingle, callOpts);
     text = r.text;
@@ -1394,7 +1591,7 @@ export async function runModule({ moduleName, sharedMemory, callLLM, options, on
     model = r.model;
     outputPartialBySoftTimeout = Boolean(r.partialDueToSoftTimeout);
 
-    if (moduleName === 'Reasoning' && reasoningMultiSampleEnabled()) {
+    if (moduleName === 'Deliberation' && reasoningMultiSampleEnabled()) {
       const t2 = reasoningMultiSampleSecondTemperature();
       try {
         const r2 = await callLLM(systemPrompt, userContentSingle, {
@@ -1413,12 +1610,12 @@ export async function runModule({ moduleName, sharedMemory, callLLM, options, on
           outputPartialBySoftTimeout = outputPartialBySoftTimeout || Boolean(rM.partialDueToSoftTimeout);
         }
       } catch (e) {
-        console.warn('[runModule] Reasoning multi-sample merge failed; using first sample.', e?.message || e);
+        console.warn('[runModule] Deliberation multi-sample merge failed; using first sample.', e?.message || e);
         text = r.text;
       }
     }
 
-    if (moduleName === 'Integration' && integrationMultiSampleEnabled()) {
+    if ((moduleName === 'Integration' || moduleName === 'IntegrationFinalize') && integrationMultiSampleEnabled()) {
       try {
         const msResult = await runModuleMultiSample('Integration', callLLM, systemPrompt, userContentSingle, callOpts);
         text = msResult.text;
@@ -1429,9 +1626,15 @@ export async function runModule({ moduleName, sharedMemory, callLLM, options, on
       }
     }
 
-    if (moduleName === 'Contradiction Engine' && contradictionMultiSampleEnabled()) {
+    if (moduleName === 'SelfRelationTension' && contradictionMultiSampleEnabled()) {
       try {
-        const msResult = await runModuleMultiSample('Contradiction Engine', callLLM, systemPrompt, userContentSingle, callOpts);
+        const msResult = await runModuleMultiSample(
+          'SelfRelationTension',
+          callLLM,
+          systemPrompt,
+          userContentSingle,
+          callOpts
+        );
         text = msResult.text;
         provider = msResult.provider || provider;
         model = msResult.model || model;
@@ -1453,7 +1656,7 @@ export async function runModule({ moduleName, sharedMemory, callLLM, options, on
       const mapUserRaw = mapIngestUserPrompt(i, chunks.length, chunks[i]);
       const mapUser = truncateUserContentToContext(mapSys, mapUserRaw, mapMaxTokens, mapMaxTokens);
       const r = await callLlmForMapIngestChunk(callLLM, mapSys, mapUser, {
-        ...options,
+        ...callOptsBase,
         max_tokens: mapMaxTokens,
         temperature: 0.2,
         disableSoftTimeout: true,
@@ -1499,14 +1702,14 @@ export async function runModule({ moduleName, sharedMemory, callLLM, options, on
       mergedBullets = await coalesceBulletsForBudget({
         bullets: mergedBullets,
         callLLM,
-        options: { ...options, disableStallWatchdog: true },
+        options: { ...callOptsBase, disableStallWatchdog: true },
         targetBodyChars: targetChars,
         maxRounds: 4,
       });
       ingestBody = JSON.stringify({ fragmentCount: chunks.length, bullets: mergedBullets }, null, 2);
       if (ingestBody.length > targetChars * 1.5) {
         mergedBullets = await ingestJsonStringViaMapChunks(ingestBody, callLLM, {
-          ...options,
+          ...callOptsBase,
           disableStallWatchdog: true,
         });
         ingestBody = JSON.stringify({ fragmentCount: chunks.length, bullets: mergedBullets }, null, 2);
@@ -1600,17 +1803,17 @@ export async function runModule({ moduleName, sharedMemory, callLLM, options, on
     }
 
     onChunkedProgress?.({ phase: 'reduce' });
-    const r = await callLLM(systemPrompt, reduceUser, { ...options, disableStallWatchdog: true });
+    const r = await callLLM(systemPrompt, reduceUser, { ...callOptsBase, disableStallWatchdog: true });
     text = r.text;
     provider = r.provider;
     model = r.model;
     outputPartialBySoftTimeout = Boolean(r.partialDueToSoftTimeout);
 
-    if (moduleName === 'Reasoning' && reasoningMultiSampleEnabled()) {
+    if (moduleName === 'Deliberation' && reasoningMultiSampleEnabled()) {
       const t2 = reasoningMultiSampleSecondTemperature();
       try {
         const r2 = await callLLM(systemPrompt, reduceUser, {
-          ...options,
+          ...callOptsBase,
           temperature: t2,
           disableStallWatchdog: true,
         });
@@ -1619,14 +1822,14 @@ export async function runModule({ moduleName, sharedMemory, callLLM, options, on
         if (mode === 'mechanical') {
           text = mergeReasoningSamplesMechanical(r.text, r2.text);
         } else {
-          const rM = await mergeTwoReasoningSamplesWithLlm(r.text, r2.text, callLLM, options);
+          const rM = await mergeTwoReasoningSamplesWithLlm(r.text, r2.text, callLLM, callOptsBase);
           text = rM.text;
           provider = rM.provider;
           model = rM.model;
           outputPartialBySoftTimeout = outputPartialBySoftTimeout || Boolean(rM.partialDueToSoftTimeout);
         }
       } catch (e) {
-        console.warn('[runModule] Reasoning multi-sample (chunked) merge failed; using first sample.', e?.message || e);
+        console.warn('[runModule] Deliberation multi-sample (chunked) merge failed; using first sample.', e?.message || e);
         text = r.text;
       }
     }
@@ -1685,7 +1888,7 @@ function updateDerivedFields(sharedMemory, moduleName) {
   const out = sharedMemory.moduleOutputs[moduleName];
   if (!out) return;
 
-  if (moduleName === 'Attention') {
+  if (moduleName === 'SensorySalience') {
     if (!sharedMemory.workingMemory) sharedMemory.workingMemory = { items: [] };
     const lines = String(out)
       .split('\n')
@@ -1698,7 +1901,7 @@ function updateDerivedFields(sharedMemory, moduleName) {
       existing.push({
         id: `wm_att_${n++}_${Date.now()}`,
         text: line,
-        source: 'attention',
+        source: 'sensory_salience',
         createdAt: nowIso(),
       });
     }
@@ -1706,24 +1909,7 @@ function updateDerivedFields(sharedMemory, moduleName) {
     refreshInteroceptionAndPolicy(sharedMemory);
   }
 
-  if (moduleName === 'Planning') {
-    const pred = parseJsonAfterMarker(out, 'USER_STANCE_PREDICTION');
-    if (pred && typeof pred === 'object') {
-      sharedMemory.userStancePrediction = {
-        expectUserWants: String(pred.expectUserWants || pred.summary || '').slice(0, 1200),
-        confidence: clamp01(pred.confidence, 0.5),
-      };
-    }
-  }
-
-  if (moduleName === 'Reasoning') {
-    const hpJson = parseJsonAfterMarker(out, 'HYPOTHESES_JSON');
-    const hyps =
-      hpJson && typeof hpJson === 'object' ? normalizeHypothesisList(hpJson.hypotheses) : [];
-    sharedMemory.hypothesisPortfolio = { hypotheses: hyps, at: nowIso() };
-  }
-
-  if (moduleName === 'Learning') {
+  if (moduleName === 'ContextMemory') {
     const sur = parseJsonAfterMarker(out, 'SURPRISE_ASSESSMENT');
     if (sur && typeof sur === 'object') {
       sharedMemory.surpriseAssessment = {
@@ -1738,33 +1924,29 @@ function updateDerivedFields(sharedMemory, moduleName) {
     refreshInteroceptionAndPolicy(sharedMemory);
   }
 
-  if (moduleName === 'Emotion') {
-    sharedMemory.emotionalState = { primary: 'modeled', intensity: 0.6, nuance: String(out).slice(0, 400) };
-  }
-  if (moduleName === 'Identity') {
-    sharedMemory.identityNarrative = String(out);
-  }
-  if (moduleName === 'Curiosity') {
-    sharedMemory.curiosityQueue = [...ensureArray(sharedMemory.curiosityQueue), String(out)].slice(-25);
-  }
-  if (moduleName === 'Goal Generation') {
-    const longTerm = [...ensureArray(sharedMemory.activeGoals?.longTerm), String(out)].slice(-25);
-    sharedMemory.activeGoals = { ...(sharedMemory.activeGoals || {}), longTerm };
-  }
-  if (moduleName === 'Somatic Marker') {
-    sharedMemory.somaticReading = String(out);
-  }
-  if (moduleName === 'Contradiction Engine') {
-    sharedMemory.contradictions = ensureArray(sharedMemory.contradictions);
-    const extracted = extractBeliefTensionsFromContradiction(out);
-    if (extracted.length) {
-      sharedMemory.followupHints = { ...(sharedMemory.followupHints || {}), beliefTensionReview: true };
+  if (moduleName === 'Deliberation') {
+    const pred = parseJsonAfterMarker(out, 'USER_STANCE_PREDICTION');
+    if (pred && typeof pred === 'object') {
+      sharedMemory.userStancePrediction = {
+        expectUserWants: String(pred.expectUserWants || pred.summary || '').slice(0, 1200),
+        confidence: clamp01(pred.confidence, 0.5),
+      };
     }
-    sharedMemory.beliefTensions = mergeBeliefTensionLists(sharedMemory.beliefTensions, extracted, 24);
-    applyContradictionToEmotionalState(sharedMemory, out, extracted);
-    refreshInteroceptionAndPolicy(sharedMemory);
+    const hpJson = parseJsonAfterMarker(out, 'HYPOTHESES_JSON');
+    const hyps =
+      hpJson && typeof hpJson === 'object' ? normalizeHypothesisList(hpJson.hypotheses) : [];
+    sharedMemory.hypothesisPortfolio = { hypotheses: hyps, at: nowIso() };
+    const affectIdx = String(out).search(/\n\*\*AFFECT_READ\*\*|\nAFFECT_READ\b/i);
+    const affectSlice =
+      affectIdx >= 0 ? String(out).slice(affectIdx, affectIdx + 1200) : String(out).slice(0, 500);
+    sharedMemory.emotionalState = {
+      primary: 'modeled',
+      intensity: 0.6,
+      nuance: affectSlice.replace(/\s+/g, ' ').trim().slice(0, 400),
+    };
   }
-  if (moduleName === 'Belief Store') {
+
+  if (moduleName === 'Beliefs') {
     const ep = parseJsonAfterMarker(out, 'EPISTEMIC_CLAIMS');
     const epNorm = normalizeEpistemicClaims(ep);
     if (epNorm.length) sharedMemory.epistemicClaims = epNorm;
@@ -1778,12 +1960,39 @@ function updateDerivedFields(sharedMemory, moduleName) {
     });
     sharedMemory.beliefStore = sharedMemory.beliefStore.slice(-200);
   }
-  if (moduleName === 'Integration') {
+
+  if (moduleName === 'SelfRelationTension') {
+    sharedMemory.identityNarrative = String(out);
+    sharedMemory.contradictions = ensureArray(sharedMemory.contradictions);
+    const extracted = extractBeliefTensionsFromContradiction(out);
+    if (extracted.length) {
+      sharedMemory.followupHints = { ...(sharedMemory.followupHints || {}), beliefTensionReview: true };
+    }
+    sharedMemory.beliefTensions = mergeBeliefTensionLists(sharedMemory.beliefTensions, extracted, 24);
+    applyContradictionToEmotionalState(sharedMemory, out, extracted);
+    refreshInteroceptionAndPolicy(sharedMemory);
+    sharedMemory.phenomenalNow = synthesizePhenomenalNow(sharedMemory);
+  }
+
+  if (moduleName === 'Integration' || moduleName === 'IntegrationFinalize') {
     let gw = parseJsonAfterMarker(out, 'INTEGRATION_JSON');
     if (!gw || typeof gw !== 'object') {
       gw = parseIntegrationJsonLoose(out);
     }
     if (gw && typeof gw === 'object') {
+      if (
+        moduleName === 'IntegrationFinalize' &&
+        sharedMemory.globalWorkspace &&
+        typeof sharedMemory.globalWorkspace === 'object'
+      ) {
+        if (!Array.isArray(sharedMemory.workspaceHistory)) sharedMemory.workspaceHistory = [];
+        sharedMemory.workspaceHistory.push({
+          at: nowIso(),
+          label: 'draft_before_finalize',
+          snapshot: deepClone(sharedMemory.globalWorkspace),
+        });
+        sharedMemory.workspaceHistory = sharedMemory.workspaceHistory.slice(-8);
+      }
       const epistemicThreads = Array.isArray(gw.epistemicThreads)
         ? gw.epistemicThreads
             .map((t) => {
@@ -1829,7 +2038,14 @@ function updateDerivedFields(sharedMemory, moduleName) {
       } else if (sharedMemory.hypothesisPortfolio?.hypotheses?.length) {
         hypothesesNorm = normalizeHypothesisList(sharedMemory.hypothesisPortfolio.hypotheses);
       }
+      const suppressedOrPeripheral = Array.isArray(gw.suppressedOrPeripheral)
+        ? gw.suppressedOrPeripheral
+            .map((s) => String(s).slice(0, 220))
+            .filter(Boolean)
+            .slice(0, 6)
+        : [];
       sharedMemory.globalWorkspace = {
+        workspaceRound: moduleName === 'IntegrationFinalize' ? 2 : 1,
         salience: Array.isArray(gw.salience) ? gw.salience.map((s) => String(s).slice(0, 400)).slice(0, 12) : [],
         conflicts: Array.isArray(gw.conflicts) ? gw.conflicts.map((s) => String(s).slice(0, 500)).slice(0, 8) : [],
         openQuestions: Array.isArray(gw.openQuestions)
@@ -1843,14 +2059,46 @@ function updateDerivedFields(sharedMemory, moduleName) {
         ...(iitProxy ? { iitProxy } : {}),
         epistemicThreads,
         ...(bindings.length ? { bindings } : {}),
+        ...(suppressedOrPeripheral.length ? { suppressedOrPeripheral } : {}),
         ...(hypothesesNorm.length ? { hypotheses: hypothesesNorm } : {}),
       };
+      sharedMemory.globalWorkspaceFallback = false;
     } else {
-      console.warn('[pipeline] Integration module did not produce parseable INTEGRATION_JSON — using fallback globalWorkspace. Output length:', String(out || '').length);
+      console.warn(
+        '[pipeline] Integration module did not produce parseable INTEGRATION_JSON — using fallback globalWorkspace. Output length:',
+        String(out || '').length
+      );
       sharedMemory.globalWorkspace = buildFallbackGlobalWorkspace(out, sharedMemory);
+      sharedMemory.globalWorkspaceFallback = true;
+    }
+    maybeBackfillSalienceFromWorkingMemory(sharedMemory);
+    if (moduleName === 'IntegrationFinalize') {
+      sharedMemory.workspaceDelta = computeWorkspaceDelta(
+        sharedMemory.priorTurnGlobalWorkspace,
+        sharedMemory.globalWorkspace
+      );
+      applyWorkspaceDigestAdmissionHints(sharedMemory);
     }
     refreshInteroceptionAndPolicy(sharedMemory);
   }
+
+  if (moduleName === 'Motivation') {
+    sharedMemory.curiosityQueue = [...ensureArray(sharedMemory.curiosityQueue), String(out)].slice(-25);
+    const goalUrg = String(out).match(/GOAL_URGENCY:\s*([0-9]*\.?[0-9]+)/i);
+    if (goalUrg) {
+      const u = parseFloat(goalUrg[1]);
+      if (Number.isFinite(u)) sharedMemory._goalUrgencyScratch = clamp01(u, 0.5);
+    }
+    const longTerm = [...ensureArray(sharedMemory.activeGoals?.longTerm), String(out)].slice(-25);
+    sharedMemory.activeGoals = { ...(sharedMemory.activeGoals || {}), longTerm };
+    const somaticIdx = String(out).search(/\n\*\*SOMATIC_MARKER\*\*|\nSOMATIC_MARKER\b/i);
+    sharedMemory.somaticReading =
+      somaticIdx >= 0
+        ? String(out).slice(somaticIdx).trim().slice(0, 4000)
+        : String(out).slice(-800).trim();
+    refreshPolicyAfterAffect(sharedMemory);
+  }
+
   if (moduleName === 'Narrative') {
     sharedMemory.narrativeHistory = ensureArray(sharedMemory.narrativeHistory);
     sharedMemory.narrativeHistory.push(String(out));
@@ -1858,12 +2106,6 @@ function updateDerivedFields(sharedMemory, moduleName) {
   }
   if (moduleName === 'Voice' && isBeliefTensionReviewPrimaryTurn(sharedMemory.originalInput)) {
     applyBeliefRevisionsFromOutput(sharedMemory, String(out));
-  }
-  if (moduleName === 'Identity') {
-    sharedMemory.phenomenalNow = synthesizePhenomenalNow(sharedMemory);
-  }
-  if (moduleName === 'Emotion' || moduleName === 'Somatic Marker' || moduleName === 'Curiosity') {
-    refreshPolicyAfterAffect(sharedMemory);
   }
 }
 
@@ -1976,8 +2218,8 @@ function recordDeferredMetacognitionRerun(sharedMemory, emit, { supervisor, reas
 
 /**
  * Full graph pipeline. When Metacognition / Workspace Metacognition requests RERUN:
- * - Under cap (`metacognitionRerunsUsed < maxMetacognitionReruns` and max > 0), **per HTTP leg**: increment rerun count, emit `rerun`, then either inline 1–4, deferred partial complete, or `continuationRequired`. Continuation POSTs (`pipelineMetacognitionContinuation`) reset `metacognitionRerunsUsed` so the cap applies per leg, not cumulatively across chained legs.
- * - Explicit model RERUN when cap is 0 or exhausted in this leg: emit `rerun` with `capExceeded`, **do not** defer/continue/inline — proceed in this leg to Integration → … → Voice.
+ * - Under cap (`metacognitionRerunsUsed < maxMetacognitionReruns` and max > 0), **cumulative per user message/run**: increment rerun count, emit `rerun`, then either inline 1–4, deferred partial complete, or `continuationRequired`. Continuation POSTs (`pipelineMetacognitionContinuation`) **preserve** `metacognitionRerunsUsed` from slim shared memory so `maxMetacognitionReruns` applies across all chained legs and scheduled continuations.
+ * - Explicit model RERUN when cap is 0 or exhausted: emit `rerun` with `capExceeded`, **do not** defer/continue/inline — proceed in this leg to Integration → … → Voice.
  * - Metacognition: only explicit RERUN or structural missing layer 1–4 outputs triggers rerun; subjective heuristics removed.
  * - Workspace Metacognition: explicit RERUN or structural Integration/globalWorkspace checks (unchanged).
  * - Structural/heuristic rerun when over cap (not explicit RERUN): `would_rerun` log only, then pipeline continues.
@@ -2005,11 +2247,19 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
   } catch (e) {
     console.warn('[pipeline] probabilistic memory retrieval failed, using recency fallback:', e?.message || e);
   }
-  maybeStripContinuationTrace(sharedMemory, options);
-  if (options.pipelineMetacognitionContinuation === true) {
-    sharedMemory.metacognitionRerunsUsed = 0;
+  applyCrossChannelDigestHints(sharedMemory);
+  if (process.env.NODE_ENV === 'development' || process.env.MYBRAIN_DEBUG_CONTEXT === '1') {
+    logContextDigestSizes(sharedMemory);
   }
+  maybeStripContinuationTrace(sharedMemory, options);
   sharedMemory.recentExchangeBlock = extractRecentExchangeFromComposedInput(input);
+
+  const profile = resolvePipelineProfile(options);
+  const gating = resolvePipelineGating(sharedMemory, input, options);
+  sharedMemory.gatingDecision = gating;
+  if (gating?.skipSelfRelation) {
+    options._gatingSkipSelfRelation = true;
+  }
 
   const rawMaxReruns = options.maxMetacognitionReruns;
   const parsedMaxReruns = rawMaxReruns != null ? Number(rawMaxReruns) : NaN;
@@ -2091,7 +2341,7 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
     if (!pauseToken) return null;
     if (!pipelinePausePending(pauseToken)) return null;
     const phase = layerKeyToResumePhase(layerKey);
-    const executionCursor = { v: 1, phase, nextModuleName };
+    const executionCursor = { v: PIPELINE_SCHEMA_VERSION, phase, nextModuleName };
     emit({
       type: 'paused',
       nextModuleName,
@@ -2133,18 +2383,14 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
     sharedMemory.moduleOutputs[moduleName] = String(output || '');
     sharedMemory.lastProviderUsed = provider;
     sharedMemory.lastModelUsed = model;
-    if (moduleName === 'Metacognition') {
+    if (moduleName === 'ExecutiveGate') {
       recordMetacognitionCalibration(sharedMemory, output);
       applyMetacognitionControl(sharedMemory);
-      sharedMemory.moduleOutputs[moduleName] = stripMetaActionsLineFromMetacognition(String(output || ''));
-    }
-    if (moduleName === 'Workspace Metacognition') {
-      recordMetacognitionCalibration(sharedMemory, output);
       applyMetaActionsFromSupervisorText(sharedMemory, String(output || ''));
       sharedMemory.moduleOutputs[moduleName] = stripMetaActionsLineFromMetacognition(String(output || ''));
     }
     updateDerivedFields(sharedMemory, moduleName);
-    if (moduleName === 'Integration') {
+    if (moduleName === 'IntegrationFinalize') {
       applyIntegrationFollowupHints(sharedMemory);
       try {
         const fusionOpts = { priorHypothesisDecay: priorHypothesisDecayFactor() };
@@ -2154,24 +2400,38 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
           const labels = hyps.map((h) => String(h?.label || ''));
           const stance = sharedMemory.userStancePrediction;
           const stanceText = stance && typeof stance === 'object' ? String(stance.expectUserWants || '') : '';
-          if (stanceText) {
-            try {
-              const sims = await querySimilarities(stanceText, labels);
-              if (sims) fusionOpts.stanceSimilarities = sims;
-            } catch { /* Jaccard fallback */ }
-          }
           const beliefDigest = Array.isArray(sharedMemory.clientBeliefDigest) ? sharedMemory.clientBeliefDigest : [];
           const snippets = beliefDigest.filter(Boolean).map((b) => String(b.statement || '')).filter(Boolean).slice(0, 15);
-          if (snippets.length > 0 && labels.length > 0) {
-            try {
-              const belSims = [];
-              for (const label of labels) {
-                const row = await querySimilarities(label, snippets);
-                belSims.push(row);
+          const useForkJoin = options?.forkJoinWave === true;
+          try {
+            if (useForkJoin) {
+              const pStance = stanceText ? querySimilarities(stanceText, labels) : Promise.resolve(null);
+              const pBel =
+                snippets.length > 0 && labels.length > 0
+                  ? Promise.all(labels.map((label) => querySimilarities(label, snippets)))
+                  : Promise.resolve(null);
+              const [sims, belMatrix] = await Promise.all([pStance, pBel]);
+              if (sims) fusionOpts.stanceSimilarities = sims;
+              if (belMatrix && belMatrix.every(Boolean)) fusionOpts.beliefSimilarities = belMatrix;
+            } else {
+              if (stanceText) {
+                try {
+                  const sims = await querySimilarities(stanceText, labels);
+                  if (sims) fusionOpts.stanceSimilarities = sims;
+                } catch { /* Jaccard fallback */ }
               }
-              if (belSims.every(Boolean)) fusionOpts.beliefSimilarities = belSims;
-            } catch { /* Jaccard fallback */ }
-          }
+              if (snippets.length > 0 && labels.length > 0) {
+                try {
+                  const belSims = [];
+                  for (const label of labels) {
+                    const row = await querySimilarities(label, snippets);
+                    belSims.push(row);
+                  }
+                  if (belSims.every(Boolean)) fusionOpts.beliefSimilarities = belSims;
+                } catch { /* Jaccard fallback */ }
+              }
+            }
+          } catch { /* Jaccard fallback */ }
         }
         applyEpistemicFusionToSharedMemory(sharedMemory, fusionOpts);
       } catch (e) {
@@ -2193,9 +2453,7 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
       console.error('[pipeline] web hook unexpected', moduleName, webErr);
     }
     const outForSse =
-      moduleName === 'Metacognition' || moduleName === 'Workspace Metacognition'
-        ? stripMetaActionsLineFromMetacognition(String(output || ''))
-        : output;
+      moduleName === 'ExecutiveGate' ? stripMetaActionsLineFromMetacognition(String(output || '')) : output;
     const sseClip = clipModuleOutputForSse(outForSse, moduleName);
     const arousalLive =
       moduleName === 'Voice'
@@ -2231,6 +2489,19 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
   };
 
   const runOne = async (moduleName, layerKey) => {
+    if (moduleName === 'SelfRelationTension' && options._gatingSkipSelfRelation) {
+      emit({ type: 'module_start', moduleName, layer: layerKey });
+      await applyCompletedModule(
+        moduleName,
+        layerKey,
+        GATING_SKIP_SELF_RELATION_PLACEHOLDER,
+        'gating',
+        'skipped',
+        false,
+        {}
+      );
+      return { provider: 'gating', model: 'skipped', output: GATING_SKIP_SELF_RELATION_PLACEHOLDER };
+    }
     emit({ type: 'module_start', moduleName, layer: layerKey });
     const { provider, model, output, outputPartialBySoftTimeout } = await runModule({
       moduleName,
@@ -2270,6 +2541,82 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
   let layer14ResumeDone = false;
 
   const runLayers1to4 = async () => {
+    const tryUnifiedCore = async () => {
+      let resumeU = resumeExec && resumeExec.phase === 'layer14' && !layer14ResumeDone;
+      const nextU = resumeU ? resumeExec.nextModuleName : null;
+      if (resumeU && nextU && nextU !== 'SensorySalience') {
+        return { usedUnified: false };
+      }
+      for (const name of EARLY_BUNDLE_MODULE_ORDER) {
+        const lk0 = layerKeyForModuleName(name);
+        const paused0 = tryCooperativePause(name, lk0);
+        if (paused0) return paused0;
+      }
+      const latestRerun0 = sharedMemory.metaCognitionFlags?.slice?.(-1)?.[0];
+      const policyBlock0 = buildMindContextForModule('SelfRelationTension', sharedMemory);
+      const smJson0 = formatSharedMemoryForModule(sharedMemory, 'SelfRelationTension');
+      const userContent0 = buildRunModuleUserLines(
+        buildPrimaryTurnBlock(sharedMemory.originalInput),
+        policyBlock0,
+        latestRerun0,
+        'SHARED_MEMORY_JSON:',
+        smJson0
+      );
+      const systemPrompt0 = buildEarlyBundleSystemPrompt(
+        gating?.skipSelfRelation ? 'SelfRelationTension may be short; the host can replace gating when needed.' : ''
+      );
+      let r0;
+      try {
+        r0 = await callLLM(systemPrompt0, userContent0, { ...options, llmRoute: 'fast' });
+      } catch (e) {
+        console.warn('[pipeline] unified early bundle LLM failed:', e?.message || e);
+        options._unifiedLayer14Degraded = true;
+        return { usedUnified: false };
+      }
+      const partial0 = Boolean(r0?.partialDueToSoftTimeout);
+      let parts0 = splitEarlyBundleToModuleOutputs(r0.text);
+      if (!parts0) {
+        console.warn('[pipeline] unified early bundle parse failed; using classic layers 1–4');
+        options._unifiedLayer14Degraded = true;
+        return { usedUnified: false };
+      }
+      if (gating?.skipSelfRelation) {
+        parts0 = { ...parts0, SelfRelationTension: GATING_SKIP_SELF_RELATION_PLACEHOLDER };
+      }
+      for (const name of EARLY_BUNDLE_MODULE_ORDER) {
+        if (!String(parts0[name] || '').trim()) {
+          console.warn(`[pipeline] unified bundle empty for ${name}; using classic layers 1–4`);
+          options._unifiedLayer14Degraded = true;
+          return { usedUnified: false };
+        }
+      }
+      for (const name of EARLY_BUNDLE_MODULE_ORDER) {
+        const lk = layerKeyForModuleName(name);
+        emit({ type: 'module_start', moduleName: name, layer: lk });
+        await applyCompletedModule(name, lk, parts0[name], r0.provider, r0.model, partial0, {});
+      }
+      return { usedUnified: true };
+    };
+
+    if (profile === 'unified' && !options._unifiedLayer14Degraded) {
+      let skipUnified = false;
+      const resumePre = resumeExec && resumeExec.phase === 'layer14' && !layer14ResumeDone;
+      const nextPre = resumePre ? resumeExec.nextModuleName : null;
+      if (resumePre && nextPre && nextPre !== 'SensorySalience') {
+        skipUnified = true;
+      }
+      if (!skipUnified) {
+        const u = await tryUnifiedCore();
+        if (u && u.pipelinePaused) return u;
+        if (u?.usedUnified) {
+          if (resumePre && nextPre === 'SensorySalience') {
+            layer14ResumeDone = true;
+          }
+          return null;
+        }
+      }
+    }
+
     let resume14 = resumeExec && resumeExec.phase === 'layer14' && !layer14ResumeDone;
     const target = resume14 ? resumeExec.nextModuleName : null;
 
@@ -2321,7 +2668,7 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
     if (early) return early;
   }
 
-  // Layer 5: Metacognition → Integration → Workspace Metacognition → … (supervisors can trigger layers 1–4 rerun)
+  // Layer 5: Integration (draft) → ExecutiveGate → IntegrationFinalize → Motivation (+ optional Narrative if ever moved)
   let layer5ResumeDone = false;
   for (;;) {
     let restartedLayer5 = false;
@@ -2348,26 +2695,41 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
         output = r.output;
       }
 
-      if (moduleName === 'Metacognition') {
+      if (moduleName === 'ExecutiveGate') {
+        const stored = sharedMemory.moduleOutputs.ExecutiveGate || String(output || '');
         const structuralIssues = metacognitionStructuralMissingIssues(sharedMemory);
-        const decision = metacognitionDecision(output);
+        const workspaceIssues = workspaceMetacognitionHeuristicChecks(sharedMemory);
+        const decision = metacognitionDecision(stored);
         const rerunsRemaining = maxReruns - sharedMemory.metacognitionRerunsUsed;
         const rerunThreshold = resolveRerunThreshold(sharedMemory, rerunsRemaining);
         const modelWantsRerun = decision.decision === 'RERUN' && decision.confidence >= rerunThreshold;
         const structuralWantsRerun = decision.decision !== 'RERUN' && structuralIssues.length > 0;
-        const wantsRerun = modelWantsRerun || structuralWantsRerun;
-        const reason =
-          modelWantsRerun
-            ? `${decision.reason || 'RERUN requested'} (confidence ${decision.confidence}, threshold ${rerunThreshold})`
-            : decision.decision === 'RERUN' && decision.confidence < rerunThreshold
-              ? ''
-              : structuralWantsRerun
-                ? `Structural RERUN: ${structuralIssues.join(' | ')}`
+        const workspaceHeuristicWantsRerun = decision.decision !== 'RERUN' && workspaceIssues.length > 0;
+        const wantsRerun = modelWantsRerun || structuralWantsRerun || workspaceHeuristicWantsRerun;
+        const reason = modelWantsRerun
+          ? `${decision.reason || 'RERUN requested'} (confidence ${decision.confidence}, threshold ${rerunThreshold})`
+          : structuralWantsRerun
+            ? `Structural RERUN: ${structuralIssues.join(' | ')}`
+            : workspaceHeuristicWantsRerun
+              ? `Executive workspace heuristic RERUN: ${workspaceIssues.join(' | ')}`
+              : decision.decision === 'RERUN' && decision.confidence < rerunThreshold
+                ? ''
                 : '';
         const kind = decision.decision === 'RERUN' ? 'model' : 'heuristic';
         const underRerunCap = maxReruns > 0 && sharedMemory.metacognitionRerunsUsed < maxReruns;
-        if (decision.decision === 'RERUN' && decision.confidence < rerunThreshold && !structuralWantsRerun) {
-          emit({ type: 'metacognition_below_threshold', confidence: decision.confidence, threshold: rerunThreshold, reason: decision.reason });
+        if (
+          decision.decision === 'RERUN' &&
+          decision.confidence < rerunThreshold &&
+          !structuralWantsRerun &&
+          !workspaceHeuristicWantsRerun
+        ) {
+          emit({
+            type: 'metacognition_below_threshold',
+            supervisor: 'ExecutiveGate',
+            confidence: decision.confidence,
+            threshold: rerunThreshold,
+            reason: decision.reason,
+          });
         }
 
         if (wantsRerun && underRerunCap) {
@@ -2378,7 +2740,7 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
             at: nowIso(),
             reason,
             rerunIndex: sharedMemory.metacognitionRerunsUsed,
-            supervisor: 'Metacognition',
+            supervisor: 'ExecutiveGate',
           });
           emit({ type: 'rerun', rerunsUsed: sharedMemory.metacognitionRerunsUsed, reason });
           if (inlineMetacognitionRerun) {
@@ -2391,24 +2753,24 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
             return finishRun({
               voiceOutput: '',
               partial: true,
-              metacognitionRerunPending: { supervisor: 'Metacognition', reason },
+              metacognitionRerunPending: { supervisor: 'ExecutiveGate', reason },
             });
           }
-          return buildContinuationReturn({ supervisor: 'Metacognition', reason });
+          return buildContinuationReturn({ supervisor: 'ExecutiveGate', reason });
         }
         if (wantsRerun && maxReruns === 0 && deferMetacognitionRerun) {
           sharedMemory.metaCognitionFlags.push({
             at: nowIso(),
             reason,
             rerunIndex: sharedMemory.metacognitionRerunsUsed,
-            supervisor: 'Metacognition',
+            supervisor: 'ExecutiveGate',
             deferred: true,
           });
           emit({ type: 'rerun', rerunsUsed: sharedMemory.metacognitionRerunsUsed, reason, deferred: true });
           return finishRun({
             voiceOutput: '',
             partial: true,
-            metacognitionRerunPending: { supervisor: 'Metacognition', reason },
+            metacognitionRerunPending: { supervisor: 'ExecutiveGate', reason },
           });
         }
         if (decision.decision === 'RERUN') {
@@ -2418,7 +2780,7 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
             at: nowIso(),
             reason,
             rerunIndex: sharedMemory.metacognitionRerunsUsed,
-            supervisor: 'Metacognition',
+            supervisor: 'ExecutiveGate',
             capExceeded: true,
             forcedProceed: true,
           });
@@ -2428,101 +2790,9 @@ export async function runPipeline({ input, existingSharedMemory, callLLM, option
             reason,
             capExceeded: true,
           });
-          // Cap exhausted: no defer/continuation/inline — continue layer5 toward Voice.
         } else if (wantsRerun) {
           recordDeferredMetacognitionRerun(sharedMemory, emit, {
-            supervisor: 'Metacognition',
-            reason,
-            kind,
-          });
-        }
-      }
-
-      if (moduleName === 'Workspace Metacognition') {
-        const stored = sharedMemory.moduleOutputs['Workspace Metacognition'] || String(output || '');
-        const heuristicIssues = workspaceMetacognitionHeuristicChecks(sharedMemory);
-        const decision = metacognitionDecision(stored);
-        const wsRerunsRemaining = maxReruns - sharedMemory.metacognitionRerunsUsed;
-        const wsRerunThreshold = resolveRerunThreshold(sharedMemory, wsRerunsRemaining);
-        const wsModelWantsRerun = decision.decision === 'RERUN' && decision.confidence >= wsRerunThreshold;
-        const heuristicWantsRerun = decision.decision !== 'RERUN' && heuristicIssues.length > 0;
-        const wantsRerun = wsModelWantsRerun || heuristicWantsRerun;
-        const reason =
-          wsModelWantsRerun
-            ? `${decision.reason || 'Workspace Metacognition RERUN'} (confidence ${decision.confidence}, threshold ${wsRerunThreshold})`
-            : decision.decision === 'RERUN' && decision.confidence < wsRerunThreshold
-              ? ''
-              : heuristicWantsRerun
-                ? `Workspace Metacognition heuristic RERUN: ${heuristicIssues.join(' | ')}`
-                : '';
-        const kind = decision.decision === 'RERUN' ? 'model' : 'heuristic';
-        const underWorkspaceRerunCap = maxReruns > 0 && sharedMemory.metacognitionRerunsUsed < maxReruns;
-        if (decision.decision === 'RERUN' && decision.confidence < wsRerunThreshold && !heuristicWantsRerun) {
-          emit({ type: 'metacognition_below_threshold', supervisor: 'Workspace Metacognition', confidence: decision.confidence, threshold: wsRerunThreshold, reason: decision.reason });
-        }
-
-        if (wantsRerun && underWorkspaceRerunCap) {
-          sharedMemory.metacognitionRerunsUsed += 1;
-          sharedMemory.iterationCount += 1;
-          sharedMemory.rerunGuidance = reason;
-          sharedMemory.metaCognitionFlags.push({
-            at: nowIso(),
-            reason,
-            rerunIndex: sharedMemory.metacognitionRerunsUsed,
-            supervisor: 'Workspace Metacognition',
-          });
-          emit({ type: 'rerun', rerunsUsed: sharedMemory.metacognitionRerunsUsed, reason });
-          if (inlineMetacognitionRerun) {
-            const rL = await runLayers1to4();
-            if (rL?.pipelinePaused) return rL;
-            restartedLayer5 = true;
-            break;
-          }
-          if (deferMetacognitionRerun) {
-            return finishRun({
-              voiceOutput: '',
-              partial: true,
-              metacognitionRerunPending: { supervisor: 'Workspace Metacognition', reason },
-            });
-          }
-          return buildContinuationReturn({ supervisor: 'Workspace Metacognition', reason });
-        }
-        if (wantsRerun && maxReruns === 0 && deferMetacognitionRerun) {
-          sharedMemory.metaCognitionFlags.push({
-            at: nowIso(),
-            reason,
-            rerunIndex: sharedMemory.metacognitionRerunsUsed,
-            supervisor: 'Workspace Metacognition',
-            deferred: true,
-          });
-          emit({ type: 'rerun', rerunsUsed: sharedMemory.metacognitionRerunsUsed, reason, deferred: true });
-          return finishRun({
-            voiceOutput: '',
-            partial: true,
-            metacognitionRerunPending: { supervisor: 'Workspace Metacognition', reason },
-          });
-        }
-        if (decision.decision === 'RERUN') {
-          sharedMemory.iterationCount += 1;
-          sharedMemory.rerunGuidance = reason;
-          sharedMemory.metaCognitionFlags.push({
-            at: nowIso(),
-            reason,
-            rerunIndex: sharedMemory.metacognitionRerunsUsed,
-            supervisor: 'Workspace Metacognition',
-            capExceeded: true,
-            forcedProceed: true,
-          });
-          emit({
-            type: 'rerun',
-            rerunsUsed: sharedMemory.metacognitionRerunsUsed,
-            reason,
-            capExceeded: true,
-          });
-          // Cap exhausted: no defer/continuation/inline — continue layer5 toward Voice.
-        } else if (wantsRerun) {
-          recordDeferredMetacognitionRerun(sharedMemory, emit, {
-            supervisor: 'Workspace Metacognition',
+            supervisor: 'ExecutiveGate',
             reason,
             kind,
           });

@@ -14,6 +14,7 @@ import {
   removeGraphPipelineSession,
 } from '../../lib/graphPipelineSessionRegistry';
 import { DEFAULT_GRAPH_SESSION_ID } from '../../lib/graphPipelineSessionScope';
+import { graphPipelineWorkspaceHref } from '../../lib/graphSessionMindProfile';
 
 /** Defer UI that must survive blur/reorder from inline session renames (trash → confirm). */
 function scheduleAfterReactFlush(fn) {
@@ -52,13 +53,13 @@ function ExecutionGraphPanel() {
   const { moduleStatuses, moduleOutputs } = snap;
 
   return (
-    <div className="max-h-[min(360px,40vh)] min-h-[10rem] overflow-y-auto overflow-x-hidden rounded-lg border border-border/80 bg-card/30 p-3">
+    <div className="max-h-[min(360px,50svh)] min-h-[10rem] overflow-y-auto overflow-x-hidden rounded-lg border border-border/80 bg-card/30 p-3">
       <GraphCanvas moduleStatuses={moduleStatuses} moduleOutputs={moduleOutputs} compact />
     </div>
   );
 }
 
-function RunContextPanel() {
+function RunContextPanel({ mirrorWorkspace = false }) {
   const snap = useSyncExternalStore(
     subscribeGraphPipeline,
     () => graphPipelineStore.getState(),
@@ -75,11 +76,20 @@ function RunContextPanel() {
     typeof gw === 'object' &&
     (gw.provisionalStance ||
       (Array.isArray(gw.broadcastWinners) && gw.broadcastWinners.length > 0) ||
+      (Array.isArray(gw.suppressedOrPeripheral) && gw.suppressedOrPeripheral.length > 0) ||
       hasBindings);
   const hasPolicy = Boolean(sm?.cognitivePolicy);
   const hasAudit = Boolean(sm?.boundaryAudit?.length);
+  const hasWsDelta =
+    sm?.workspaceDelta &&
+    typeof sm.workspaceDelta === 'object' &&
+    Array.isArray(sm.workspaceDelta.bullets) &&
+    sm.workspaceDelta.bullets.length > 0;
+  const autonomyLog = Array.isArray(sm?.autonomyLog) ? sm.autonomyLog : [];
+  const hasAutonomyLog = autonomyLog.length > 0;
+  const autonomyTel = sm?.autonomyTelemetry && typeof sm.autonomyTelemetry === 'object';
 
-  if (!sm || (!hasPn && !hasGw && !hasPolicy && !hasAudit)) {
+  if (!sm || (!hasPn && !hasGw && !hasPolicy && !hasAudit && !hasWsDelta && !hasAutonomyLog && !autonomyTel)) {
     return (
       <p className="px-1 py-4 text-center text-[11px] text-muted-foreground">
         No workspace snapshot for this run yet — it appears after modules write shared memory.
@@ -89,9 +99,39 @@ function RunContextPanel() {
 
   return (
     <div className="space-y-3">
+      {hasAutonomyLog ? (
+        <div className="rounded-xl border border-violet-500/30 bg-violet-500/5 p-3">
+          <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-violet-300">Autonomy log</h3>
+          <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words text-[10px] leading-snug text-muted-foreground">
+            {JSON.stringify(autonomyLog.slice(-16), null, 2)}
+          </pre>
+        </div>
+      ) : null}
+      {autonomyTel ? (
+        <div className="rounded-xl border border-violet-500/20 bg-violet-500/[0.07] p-3">
+          <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-violet-300/90">Autonomy telemetry</h3>
+          <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words text-[10px] leading-snug text-muted-foreground">
+            {JSON.stringify(sm.autonomyTelemetry, null, 2)}
+          </pre>
+        </div>
+      ) : null}
       {hasPn ? (
-        <div className="rounded-xl border border-sky-500/25 bg-sky-500/5 p-3">
-          <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-sky-400">Phenomenal now</h3>
+        <div
+          className={cn(
+            'rounded-xl border p-3',
+            mirrorWorkspace
+              ? 'border-red-500/40 bg-red-500/[0.06] dark:bg-red-950/20'
+              : 'border-sky-500/25 bg-sky-500/5'
+          )}
+        >
+          <h3
+            className={cn(
+              'mb-1 text-[11px] font-semibold uppercase tracking-wide',
+              mirrorWorkspace ? 'text-red-400' : 'text-sky-400'
+            )}
+          >
+            Phenomenal now
+          </h3>
           <p className="text-xs leading-relaxed text-foreground">{sm.phenomenalNow.line}</p>
           {sm.phenomenalNow.rationale ? (
             <p className="mt-1 text-[11px] text-muted-foreground">{sm.phenomenalNow.rationale}</p>
@@ -100,8 +140,13 @@ function RunContextPanel() {
       ) : null}
       {hasGw ? (
         <div className="rounded-xl border border-violet-500/25 bg-violet-500/5 p-3">
-          <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-violet-400">
-            Global workspace (this run)
+          <h3 className="mb-1 flex flex-wrap items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-violet-400">
+            <span>Global workspace (this run)</span>
+            {sm.globalWorkspaceFallback === true ? (
+              <span className="rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 font-normal normal-case text-amber-200/90">
+                Fallback workspace
+              </span>
+            ) : null}
           </h3>
           {gw.phenomenalUnity ? (
             <p className="text-[11px] text-muted-foreground">
@@ -115,6 +160,16 @@ function RunContextPanel() {
                 <li key={i}>{String(w)}</li>
               ))}
             </ul>
+          ) : null}
+          {Array.isArray(gw.suppressedOrPeripheral) && gw.suppressedOrPeripheral.length > 0 ? (
+            <div className="mt-2">
+              <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Peripheral / non-broadcast</p>
+              <ul className="mt-0.5 list-inside list-disc text-[11px] text-muted-foreground">
+                {gw.suppressedOrPeripheral.slice(0, 6).map((w, i) => (
+                  <li key={i}>{String(w)}</li>
+                ))}
+              </ul>
+            </div>
           ) : null}
           {gw.unityRationale ? (
             <p className="mt-1 text-[11px] text-muted-foreground">
@@ -151,6 +206,21 @@ function RunContextPanel() {
               </ul>
             </div>
           ) : null}
+        </div>
+      ) : null}
+      {sm?.workspaceDelta && typeof sm.workspaceDelta === 'object' && Array.isArray(sm.workspaceDelta.bullets) && sm.workspaceDelta.bullets.length > 0 ? (
+        <div className="rounded-xl border border-cyan-500/25 bg-cyan-500/5 p-3">
+          <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-cyan-400/90">Workspace delta (vs prior turn)</h3>
+          {typeof sm.workspaceDelta.stanceOverlapApprox === 'number' ? (
+            <p className="text-[11px] text-muted-foreground">
+              Stance token overlap ≈ {sm.workspaceDelta.stanceOverlapApprox}
+            </p>
+          ) : null}
+          <ul className="mt-1 list-inside list-disc text-[11px] text-foreground/85">
+            {sm.workspaceDelta.bullets.slice(0, 6).map((b, i) => (
+              <li key={i}>{String(b)}</li>
+            ))}
+          </ul>
         </div>
       ) : null}
       {hasPolicy ? (
@@ -220,7 +290,7 @@ function SessionsListPanel({ currentSessionId }) {
       </p>
       <div className="space-y-2">
         {sessions.map((s) => {
-          const href = `/graph-pipeline/${encodeURIComponent(s.id)}`;
+          const href = graphPipelineWorkspaceHref(s.id);
           const title = graphSessionDisplayTitle(s.id, s.label, s.threadRootLabel);
           const active = s.id === currentSessionId;
           const canRemoveFromList = s.id !== DEFAULT_GRAPH_SESSION_ID;
@@ -366,9 +436,17 @@ function SessionsListPanel({ currentSessionId }) {
  *   currentSessionId?: string
  *   executionLogSlot?: import('react').ReactNode
  *   className?: string
+ *   mirrorWorkspace?: boolean
  * }} props
  */
-export default function GraphPipelineInspector({ tab, onTabChange, currentSessionId, executionLogSlot, className }) {
+export default function GraphPipelineInspector({
+  tab,
+  onTabChange,
+  currentSessionId,
+  executionLogSlot,
+  className,
+  mirrorWorkspace = false,
+}) {
   const tabs = executionLogSlot ? [...BASE_TABS, EXECUTION_LOG_TAB] : BASE_TABS;
 
   return (
@@ -428,7 +506,7 @@ export default function GraphPipelineInspector({ tab, onTabChange, currentSessio
         className="min-h-[8rem] rounded-lg border border-border/60 bg-muted/5 px-2 py-3 sm:px-3"
         hidden={tab !== 'context'}
       >
-        {tab === 'context' ? <RunContextPanel /> : null}
+        {tab === 'context' ? <RunContextPanel mirrorWorkspace={mirrorWorkspace} /> : null}
       </div>
       <div
         role="tabpanel"

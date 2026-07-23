@@ -13,6 +13,28 @@ const LEGACY_GRAPH_V1 = 'mybrain_graph_pipeline_ui_v1';
 /** @type {string | null} */
 let currentSessionId = null;
 
+/** Subscribers for {@link getGraphPipelineSessionId} (e.g. Playground dual-graph A/B tint). */
+const graphPipelineSessionListeners = new Set();
+
+function notifyGraphPipelineSessionId() {
+  graphPipelineSessionListeners.forEach((fn) => {
+    try {
+      fn();
+    } catch {
+      /* ignore */
+    }
+  });
+}
+
+/**
+ * @param {() => void} onStoreChange
+ * @returns {() => void}
+ */
+export function subscribeGraphPipelineSessionId(onStoreChange) {
+  graphPipelineSessionListeners.add(onStoreChange);
+  return () => graphPipelineSessionListeners.delete(onStoreChange);
+}
+
 export function getGraphPipelineSessionId() {
   return currentSessionId;
 }
@@ -22,7 +44,9 @@ export function getGraphPipelineSessionId() {
  */
 export function setGraphPipelineSessionId(id) {
   const s = id != null && String(id).trim() ? String(id).trim() : null;
+  if (s === currentSessionId) return;
   currentSessionId = s;
+  notifyGraphPipelineSessionId();
 }
 
 export function isDefaultGraphSessionId(sessionId) {

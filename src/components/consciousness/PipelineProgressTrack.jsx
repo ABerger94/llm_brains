@@ -2,13 +2,13 @@ import { useMemo } from 'react';
 import {
   getServerExecutionLayers,
   PIPELINE_LAYER_COLORS,
-  PIPELINE_METACOGNITION_END_FRACTION,
+  PIPELINE_LAYER5_END_FRACTION,
   PIPELINE_STAGE_LABELS,
 } from '../../lib/cognitiveModules';
 import { cn } from '../../lib/utils';
 
 const METACOG_MARKER_TITLE =
-  'End of Supervisors & workspace layer — Articulation follows';
+  'End of layer 5 (Supervisors & workspace) — Articulation follows';
 
 const TRACK_BG =
   'relative h-1.5 w-full overflow-hidden rounded-full bg-white/70 shadow-inner ring-1 ring-white/40 dark:bg-white/20 dark:ring-white/15';
@@ -129,7 +129,7 @@ function LayerSegmentedFill({ moduleStatuses, progressAmber }) {
 export function PipelineProgressTrack({ indeterminate, progressPercent, progressAmber, moduleStatuses, className }) {
   if (!indeterminate && progressPercent == null) return null;
 
-  const markerLeftPct = PIPELINE_METACOGNITION_END_FRACTION * 100;
+  const markerLeftPct = PIPELINE_LAYER5_END_FRACTION * 100;
   const hasModuleStatuses = moduleStatuses && typeof moduleStatuses === 'object' && Object.keys(moduleStatuses).length > 0;
 
   return (

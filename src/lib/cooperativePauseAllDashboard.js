@@ -24,6 +24,26 @@ export function pauseAllDispatchReachedBackendOrBroadcast(request) {
 }
 
 /**
+ * Whether to show Dashboard settlement (amber → green) after Pause: requires visible active rows and a
+ * successful dispatch path. When this tab had no pause hooks (`tokenCount === 0`), settlement still
+ * applies if rows were present — other tabs receive the broadcast and POST their tokens (see
+ * {@link installCooperativePauseBroadcastListener}).
+ *
+ * @param {{ tokenCount?: number, okCount?: number, failCount?: number, connectionLimited?: boolean } | null | undefined} request
+ * @param {boolean} hadActiveRowsAtClick — {@link getDashboardActiveWorkSnapshot} had rows when Pause was clicked
+ */
+export function pauseAllDashboardSettlementEligible(request, hadActiveRowsAtClick) {
+  if (!hadActiveRowsAtClick) return false;
+  if (!pauseAllDispatchReachedBackendOrBroadcast(request)) return false;
+  const r = request || { tokenCount: 0, okCount: 0, failCount: 0, connectionLimited: false };
+  if (r.connectionLimited) return true;
+  const tokenCount = Number(r.tokenCount) || 0;
+  const okCount = Number(r.okCount) || 0;
+  if (tokenCount > 0) return okCount > 0;
+  return true;
+}
+
+/**
  * Same-origin broadcast + POST /api/pipeline/pause-request for every pause token registered in this tab.
  * When any pause-request succeeds, appends cooperative-pause lines to in-tab pipeline logs and sets the dashboard pause ack.
  *
@@ -83,7 +103,10 @@ export function notifyCooperativePauseRequestOutcome(request) {
   if (r.tokenCount === 0) {
     toast({
       title: 'Pause sent to other tabs',
-      description: `No pipeline hooks are registered in this tab; other windows were notified. ${NEXT_MODULE_HINT} If nothing stops, open the tab running the graph or use Stop.`,
+      description:
+        `No pipeline pause hooks are registered in this tab; other open windows were notified and will POST ` +
+        `their hooks (same origin). ${NEXT_MODULE_HINT} If nothing stops, focus the tab running the pipeline, ` +
+        `or use Stop. ${DEV_BOTH_HINT}`,
     });
     return;
   }

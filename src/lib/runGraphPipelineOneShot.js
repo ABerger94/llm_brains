@@ -1,30 +1,31 @@
-import { ensureApiReachable, describeNetworkOrOfflineError } from './apiReachability';
-import { openrouterPipelineOptions } from './llmClientOptions';
+import { describeNetworkOrOfflineError } from './apiReachability';
 import {
   getRuntimeSettings,
-  effectiveMaxMetacognitionReruns,
   effectiveMetacognitionRerunDelayMinutes,
   resolveMetacognitionRerunDelayMinutesFromSnapshot,
   runtimeSettingsForPersistence,
 } from './runtimeSettings';
 import { getExecutionPlan } from './cognitiveModules';
 import { consumePipelineSseWithMetacognitionContinuations } from './pipelineSse';
-import { slimSharedMemoryForPipelinePost } from './slimSharedMemory';
+import { slimSharedMemoryForGraphCheckpoint, slimSharedMemoryForPipelinePost } from './slimSharedMemory';
 import { safeJsonStringifyPipelineBody } from './safeJsonStringify.js';
-import { buildPriorPredictionAuditPayload } from './priorPredictionAudit';
 import { rowsToRecentDialogue } from './pipelineDialogueContext';
 import { resolvePipelineVoiceText } from './pipelineVoiceGate';
+import { MIND_PHASE_OPTIONS, persistMindAfterPipeline } from './mindPersistence';
 import {
-  MIND_PHASE_OPTIONS,
-  persistMindAfterPipeline,
-  loadStructuralSelfForPipeline,
-  buildWorkingMemorySeed,
-} from './mindPersistence';
-import { ConversationMessage, PipelineRun, TemporalEvent } from './data';
-import { fetchPersistedMindStoresForPipeline } from './persistedMindStoresForPipeline';
-import { loadDmnCarryoverTextForPhase } from './mindDmnContext';
+  getActiveMindEntityProfile,
+  getMindEntityStores,
+  getMindEntityStoresForProfile,
+  normalizeScheduledTaskMindStorageProfile,
+  setActiveMindEntityProfile,
+} from './mindEntityContext';
+import {
+  buildPipelineIntegrationOptions,
+  fetchPipelineIntegrationPersistedSlices,
+  mergePersistedSlicesIntoPipelineOptionsSnapshot,
+} from './pipelineIntegrationOptions';
+import { normalizeExecutionResume } from '../../shared/pipelineExecutionResume.mjs';
 import { clipTextComplete } from '../../shared/textClip.mjs';
-import { temporalEventsExcludingPauseNoise } from '../../shared/temporalTimelinePauseFilter.mjs';
 import { splitVoiceOutputBeliefRevisionsAppendix } from '../../shared/beliefRevisionsVoice.mjs';
 import {
   enqueueMetacognitionPipelineRerunSchedule,
@@ -33,6 +34,7 @@ import {
 import { beginBackgroundCognitiveWork, endBackgroundCognitiveWork } from './pipelineBusyGate';
 import { pickContinuationSharedMemoryFromFetched } from './pipelineContinuationSeed';
 import { pickLatestNonCheckpointPipelineRun } from './pipelineRunCheckpoint';
+import { pursuitPipelineRunIdPatch } from './pipelinePursuitResume';
 import {
   registerPipelinePauseToken,
   unregisterPipelinePauseToken,
@@ -41,7 +43,15 @@ import { createPipelinePauseToken } from './pipelinePauseToken';
 import { mergePersistedGraphPipelineUiForSession } from './graphPipelineCrossSessionPeek';
 import { getGraphSessionIdForPersistence } from './graphPipelineSessionScope';
 import { upsertGraphPipelineSession } from './graphPipelineSessionRegistry';
-import { scheduleIncrementalModuleCheckpointPersist } from './incrementalModuleCheckpointPersist';
+import {
+  awaitIncrementalCheckpointChain,
+  scheduleIncrementalModuleCheckpointPersist,
+} from './incrementalModuleCheckpointPersist';
+import {
+  applyGraphSessionSupervisorRerunSseEvent,
+  beginGraphSessionSupervisorRerunUi,
+  endGraphSessionSupervisorRerunUi,
+} from './graphPipelineScheduledRerunUiMirror';
 
 async function fetchOneShot(url, init) {
   try {
@@ -85,19 +95,30 @@ export async function persistGraphPipelineStreamResult({
   goalPursuitContext,
   finalOutputForRunRow,
   graphSessionIdForPipelineRun = null,
+  mindStorageProfile: mindStorageProfileOpt,
+  scheduledTaskId = null,
 }) {
+  const effectiveProfile = normalizeScheduledTaskMindStorageProfile(
+    mindStorageProfileOpt ?? getActiveMindEntityProfile()
+  );
+  setActiveMindEntityProfile(effectiveProfile);
   const graphSidPatch =
     graphSessionIdForPipelineRun != null && String(graphSessionIdForPipelineRun).trim()
       ? { graph_session_id: String(graphSessionIdForPipelineRun).trim() }
       : {};
+  const pursuitPatch = pursuitPipelineRunIdPatch(curiosityPursuitContext, goalPursuitContext);
+  const stores = getMindEntityStores();
+
+  await awaitIncrementalCheckpointChain();
+
   if (streamResult?.pipelinePaused) {
     const smP = streamResult.sharedMemory && typeof streamResult.sharedMemory === 'object' ? streamResult.sharedMemory : {};
     const ec = streamResult.executionCursor || {};
     const rawOutputs = smP.moduleOutputs || {};
-    const runRow = await PipelineRun.create({
+    const runRow = await stores.PipelineRun.create({
       input: promptText,
       module_outputs: rawOutputs,
-      shared_memory: smP,
+      shared_memory: slimSharedMemoryForGraphCheckpoint(smP),
       execution_plan: executionPlan,
       loop_count: Number(streamResult.rerunsUsed) || 0,
       final_output: `(Paused before ${ec.nextModuleName || 'next module'})`,
@@ -113,6 +134,7 @@ export async function persistGraphPipelineStreamResult({
       pipeline_checkpoint: true,
       ...(ec && typeof ec === 'object' && Number(ec.v) === 1 ? { execution_resume: ec } : {}),
       ...graphSidPatch,
+      ...pursuitPatch,
     });
     await persistMindAfterPipeline({
       sharedMemory: smP,
@@ -121,9 +143,11 @@ export async function persistGraphPipelineStreamResult({
       runtimeSettings,
       source,
       pipelineRunId: runRow?.id,
+      scheduledTaskId,
       curiosityPursuitContext,
       goalPursuitContext,
       pipelinePartialCheckpoint: true,
+      mindStorageProfile: effectiveProfile,
     });
     return {
       summary: `Paused at ${ec.nextModuleName || 'checkpoint'}.`,
@@ -146,7 +170,8 @@ export async function persistGraphPipelineStreamResult({
   const { displayText: voiceText } = splitVoiceOutputBeliefRevisionsAppendix(voiceTextRaw);
   const finalOutput = finalOutputForRunRow ?? (voiceText || '(no Voice output)');
 
-  const runRow = await PipelineRun.create({
+  setActiveMindEntityProfile(effectiveProfile);
+  const runRow = await stores.PipelineRun.create({
     input: promptText,
     module_outputs: rawOutputs,
     shared_memory: smComplete,
@@ -162,6 +187,7 @@ export async function persistGraphPipelineStreamResult({
     phenomenal_now: smComplete?.phenomenalNow || null,
     cognitive_policy: smComplete?.cognitivePolicy || null,
     ...graphSidPatch,
+    ...pursuitPatch,
   });
 
   await persistMindAfterPipeline({
@@ -171,8 +197,10 @@ export async function persistGraphPipelineStreamResult({
     runtimeSettings,
     source,
     pipelineRunId: runRow?.id,
+    scheduledTaskId,
     curiosityPursuitContext,
     goalPursuitContext,
+    mindStorageProfile: effectiveProfile,
   });
 
   return {
@@ -221,27 +249,39 @@ function mergeMetacognitionOverridesForPrep(task, opt) {
  * @param {number} [opts.mindArousal]
  * @param {object|null|undefined} [opts.initialFullSharedMemory] — when key is present, use as continuation seed instead of the default (freshest of latest PipelineRun vs latest assistant ConversationMessage with shared_memory)
  * @param {{ maxMetacognitionReruns?: number|null, metacognitionRerunDelayMinutes?: number|null }} [opts.metacognitionOverrides] — null = use global runtime defaults
+ * @param {string} [opts.mindStorageProfile] primary vs mirror — also read from `task.mind_storage_profile` when omitted
  */
 export async function prepareGraphPipelineSseInputs(opts = {}) {
-  const { inputText, task = null, mindPhase, mindArousal, initialFullSharedMemory, metacognitionOverrides } = opts;
+  const {
+    inputText,
+    task = null,
+    mindPhase,
+    mindArousal,
+    initialFullSharedMemory,
+    metacognitionOverrides,
+    mindStorageProfile: mindStorageProfileOpt,
+  } = opts;
+  const mindStorageProfile = normalizeScheduledTaskMindStorageProfile(
+    mindStorageProfileOpt ?? task?.mind_storage_profile
+  );
   const hasExplicitMemory = Object.prototype.hasOwnProperty.call(opts, 'initialFullSharedMemory');
   const runtimeSettings = getRuntimeSettings();
-  const maxTokens = Number(runtimeSettings.pipelineMaxTokens) || 800;
   let { phase, arousal } = resolveMindOptionsForOneShot(task || {});
   if (typeof mindPhase === 'string' && SCHEDULER_PHASE_IDS.has(mindPhase)) phase = mindPhase;
   if (typeof mindArousal === 'number' && Number.isFinite(mindArousal)) {
     arousal = Math.min(1, Math.max(0, mindArousal));
   }
 
+  const stores = getMindEntityStoresForProfile(mindStorageProfile);
   let lastSm;
   let dialogueRows;
   if (hasExplicitMemory) {
     lastSm = initialFullSharedMemory ?? null;
-    dialogueRows = await ConversationMessage.list('-created_date', 16);
+    dialogueRows = await stores.ConversationMessage.list('-created_date', 16);
   } else {
     const [runs, msgs] = await Promise.all([
-      PipelineRun.list('-created_date', 12),
-      ConversationMessage.list('-created_date', 16),
+      stores.PipelineRun.list('-created_date', 12),
+      stores.ConversationMessage.list('-created_date', 16),
     ]);
     lastSm = pickContinuationSharedMemoryFromFetched({
       latestPipelineRun: pickLatestNonCheckpointPipelineRun(runs),
@@ -250,66 +290,23 @@ export async function prepareGraphPipelineSseInputs(opts = {}) {
     dialogueRows = msgs;
   }
 
-  const structuralSelf = await loadStructuralSelfForPipeline({ maxItems: 12 });
   const promptText = String(inputText || '').trim() || 'Pipeline run.';
-  const wmSeed = buildWorkingMemorySeed(promptText, runtimeSettings.pinnedWorkingMemory || []);
   const recentDialogue = rowsToRecentDialogue(dialogueRows, 16);
-  let recentTemporalEvents = [];
-  try {
-    recentTemporalEvents = temporalEventsExcludingPauseNoise(await TemporalEvent.list('-created_date', 24));
-  } catch {
-    recentTemporalEvents = [];
-  }
-  let mindStores = {
-    persistedLongTermMemories: [],
-    persistedBeliefRows: [],
-    persistedAffectHistory: [],
-    persistedBiographyExcerpt: '',
-  };
-  try {
-    mindStores = await fetchPersistedMindStoresForPipeline(promptText);
-  } catch {
-    /* keep defaults */
-  }
-  const dmnCarryover = await loadDmnCarryoverTextForPhase(phase);
-  const priorPredictionAudit = buildPriorPredictionAuditPayload(lastSm, promptText);
 
   const mo = mergeMetacognitionOverridesForPrep(task, metacognitionOverrides);
   const delayMin = effectiveMetacognitionRerunDelayMinutes(runtimeSettings, mo.metacognitionRerunDelayMinutes);
-  const effMaxReruns = effectiveMaxMetacognitionReruns(runtimeSettings, mo.maxMetacognitionReruns);
 
-  const pipelineOptionsSnapshot = {
-    max_tokens: maxTokens,
-    temperature: 0.55,
-    phase,
+  const pipelineOptionsSnapshot = await buildPipelineIntegrationOptions({
+    userInput: promptText,
+    runtimeSettings,
+    mindPhase: phase,
     arousal,
     intent: '',
-    constitution: runtimeSettings.mindConstitution || '',
-    userModel: runtimeSettings.userModel || {},
-    personalityProfile: runtimeSettings.personalityProfile || {
-      version: 0,
-      facets: [],
-      relationalStance: null,
-      systemTreatmentNotes: '',
-    },
-    modulePromptOverrides: runtimeSettings.modulePromptOverrides || {},
-    structuralSelf,
-    workingMemorySeed: wmSeed,
     recentDialogue,
-    maxMetacognitionReruns: effMaxReruns,
-    metacognitionRerunDelayMinutes: delayMin,
-    ...(runtimeSettings.preserveModuleTrace === true ? { preserveModuleTrace: true } : {}),
-    ...(runtimeSettings.strictGlobalWorkspaceBroadcast === true
-      ? { strictGlobalWorkspaceBroadcast: true }
-      : {}),
-    ...(dmnCarryover ? { dmnCarryover } : {}),
-    ...(priorPredictionAudit ? { priorPredictionAudit } : {}),
-    mindDisplayName: String(runtimeSettings.mindDisplayName || '').trim(),
-    recentTemporalEvents,
-    ...mindStores,
-    ...openrouterPipelineOptions(runtimeSettings),
-    incrementalModuleCheckpoint: true,
-  };
+    continueMemory: lastSm,
+    metacognitionOverrides: mo,
+    mindStorageProfile,
+  });
 
   return {
     promptText,
@@ -338,7 +335,18 @@ export async function streamGraphPipelineSseLegs({
   executionResume = null,
   pauseSupport = false,
   pauseToken = null,
+  /** When true (default), re-fetch persisted-store slices before each continuation leg so other pipelines' writes are visible. */
+  refreshIntegrationSlicesBetweenLegs = true,
+  mindStorageProfile: mindStorageProfileForSlices = undefined,
 }) {
+  const integrationProfile =
+    mindStorageProfileForSlices !== undefined
+      ? normalizeScheduledTaskMindStorageProfile(mindStorageProfileForSlices)
+      : getActiveMindEntityProfile();
+  let optionsSnapshot =
+    pipelineOptionsSnapshot && typeof pipelineOptionsSnapshot === 'object'
+      ? { ...pipelineOptionsSnapshot }
+      : {};
   return consumePipelineSseWithMetacognitionContinuations({
     fetchImpl,
     treatFirstLegAsContinuation,
@@ -346,23 +354,35 @@ export async function streamGraphPipelineSseLegs({
     initialSlimSharedMemory: slimSharedMemoryForPipelinePost(lastSm, {
       continuation: treatFirstLegAsContinuation === true,
     }),
-    buildFetchInit: ({ slimSharedMemory, pipelineMetacognitionContinuation, leg }) => ({
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-      body: safeJsonStringifyPipelineBody({
-        input: promptText,
-        attachmentIds,
-        sharedMemory: slimSharedMemory,
-        ...(pauseSupport && pauseToken ? { pauseToken, pauseSupport: true } : {}),
-        options: {
-          ...pipelineOptionsSnapshot,
-          ...(pipelineMetacognitionContinuation ? { pipelineMetacognitionContinuation: true } : {}),
-          ...(!pipelineMetacognitionContinuation ? { deferMetacognitionRerun: true } : {}),
-          ...(leg === 1 && executionResume && !pipelineMetacognitionContinuation ? { executionResume } : {}),
-          ...(pauseSupport && pauseToken ? { pauseSupport: true, pauseToken } : {}),
-        },
-      }),
-    }),
+    buildFetchInit: async ({ slimSharedMemory, pipelineMetacognitionContinuation, leg }) => {
+      if (refreshIntegrationSlicesBetweenLegs && leg > 1 && String(promptText || '').trim()) {
+        try {
+          const slices = await fetchPipelineIntegrationPersistedSlices(promptText, {
+            mindStorageProfile: integrationProfile,
+          });
+          optionsSnapshot = mergePersistedSlicesIntoPipelineOptionsSnapshot(optionsSnapshot, slices);
+        } catch (e) {
+          console.warn('[streamGraphPipelineSseLegs] integration slice refresh failed', e);
+        }
+      }
+      return {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: safeJsonStringifyPipelineBody({
+          input: promptText,
+          attachmentIds,
+          sharedMemory: slimSharedMemory,
+          ...(pauseSupport && pauseToken ? { pauseToken, pauseSupport: true } : {}),
+          options: {
+            ...optionsSnapshot,
+            ...(pipelineMetacognitionContinuation ? { pipelineMetacognitionContinuation: true } : {}),
+            ...(!pipelineMetacognitionContinuation ? { deferMetacognitionRerun: true } : {}),
+            ...(leg === 1 && executionResume && !pipelineMetacognitionContinuation ? { executionResume } : {}),
+            ...(pauseSupport && pauseToken ? { pauseSupport: true, pauseToken } : {}),
+          },
+        }),
+      };
+    },
     onEvent: (evt) => {
       try {
         onSseEvent?.(evt);
@@ -402,6 +422,7 @@ export async function executePreparedGraphPipelineSse({
   pauseToken = null,
   pipelineSource = 'graph-one-shot',
   graphSessionIdForPipelineRun = null,
+  mindStorageProfile: mindStorageProfileOpt,
 }) {
   const rt = prep.runtimeSettings || getRuntimeSettings();
   const wrappedOnSseEvent = (evt) => {
@@ -420,6 +441,7 @@ export async function executePreparedGraphPipelineSse({
         curiosityPursuitContext,
         goalPursuitContext,
         graphSessionIdForPipelineRun,
+        mindStorageProfile: mindStorageProfileOpt,
       });
     }
   };
@@ -436,7 +458,15 @@ export async function executePreparedGraphPipelineSse({
     executionResume,
     pauseSupport,
     pauseToken,
+    mindStorageProfile: normalizeScheduledTaskMindStorageProfile(
+      mindStorageProfileOpt ?? getActiveMindEntityProfile()
+    ),
   });
+
+  const resolvedProfile = normalizeScheduledTaskMindStorageProfile(
+    mindStorageProfileOpt ?? getActiveMindEntityProfile()
+  );
+  setActiveMindEntityProfile(resolvedProfile);
 
   const pending = streamResult.metacognitionRerunPending;
   await maybeEnqueueMetacognitionRerun({
@@ -450,6 +480,8 @@ export async function executePreparedGraphPipelineSse({
     arousal: prep.arousal,
     curiosityPursuitContext,
     goalPursuitContext,
+    mindStorageProfile: resolvedProfile,
+    graphSessionId: graphSessionIdForPipelineRun,
   });
 
   const effectiveDelay = Math.max(1, prep.delayMin || 0);
@@ -471,6 +503,8 @@ async function maybeEnqueueMetacognitionRerun({
   arousal,
   curiosityPursuitContext,
   goalPursuitContext,
+  mindStorageProfile,
+  graphSessionId,
 }) {
   if (!pending) return;
   const effectiveDelay = Math.max(1, delayMin || 0);
@@ -485,6 +519,8 @@ async function maybeEnqueueMetacognitionRerun({
     mindArousal: arousal,
     curiosityPursuitContext,
     goalPursuitContext,
+    mindStorageProfile,
+    graphSessionId,
   });
 }
 
@@ -506,10 +542,11 @@ async function maybeEnqueueMetacognitionRerun({
  * @param {object|null} [opts.executionResume] — server {@link normalizeExecutionResume} cursor for leg 1
  * @param {string} [opts.pauseToken] — cooperative pause token (auto-generated if omitted and cooperativePause is true)
  * @param {boolean} [opts.cooperativePause=true] — register pause token on `/api/pipeline/pause-request` (registered before heavy prep so Dashboard “Pause & save” sees goal/curiosity one-shots immediately)
- * @param {boolean} [opts.skipApiReachabilityProbe=false] — when true, skip GET /api/ping (e.g. caller already ran {@link ensureApiReachable})
+ * @param {boolean} [opts.skipApiReachabilityProbe] — ignored (legacy); pipeline reachability is determined by POST /api/pipeline/stream, not GET /api/ping
  * @param {{ maxMetacognitionReruns?: number|null, metacognitionRerunDelayMinutes?: number|null }} [opts.metacognitionOverrides]
  * @param {string|null} [opts.graphSessionIdForPipelineRun] - stored on {@link PipelineRun} as `graph_session_id` (dialogue / transcript linkage).
  * @param {boolean} [opts.mirrorCooperativePauseToGraphSession=true] - when false, still registers pause tokens but does not write graph session KV/registry (use for headless scheduler runs so Dashboard does not show a ghost graph workspace row).
+ * @param {string} [opts.mindStorageProfile] `primary` or `playgroundMirror`; falls back to `task.mind_storage_profile` for scheduled rows.
  * @returns {Promise<object & { voiceText: string, pipelineRunId: string|null, voiceDeferredToScheduledSupervisor?: boolean }>}
  *   `voiceDeferredToScheduledSupervisor` is true when Voice was deferred to a `supervisor_pipeline_rerun` task (positive delay); callers should skip `finalizePursued*AfterGraph` until that task completes.
  */
@@ -530,15 +567,14 @@ export async function runGraphPipelineOneShot(params = {}) {
     executionResume = null,
     pauseToken: pauseTokenOpt = null,
     cooperativePause = true,
-    skipApiReachabilityProbe = false,
     metacognitionOverrides,
     graphSessionIdForPipelineRun = null,
     mirrorCooperativePauseToGraphSession = true,
+    mindStorageProfile: mindStorageProfileParam,
   } = params;
-  if (!skipApiReachabilityProbe) {
-    await ensureApiReachable({ timeoutMs: 8000 });
-  }
-
+  const normalizedMindProfile = normalizeScheduledTaskMindStorageProfile(
+    mindStorageProfileParam ?? task?.mind_storage_profile
+  );
   const pauseToken =
     cooperativePause === false ? null : pauseTokenOpt || createPipelinePauseToken();
   const regId =
@@ -563,7 +599,7 @@ export async function runGraphPipelineOneShot(params = {}) {
     }
   }
 
-  const prepOpts = { inputText, task, mindPhase, mindArousal };
+  const prepOpts = { inputText, task, mindPhase, mindArousal, mindStorageProfile: normalizedMindProfile };
   if (Object.prototype.hasOwnProperty.call(params, 'initialFullSharedMemory')) {
     prepOpts.initialFullSharedMemory = initialFullSharedMemory;
   }
@@ -571,6 +607,12 @@ export async function runGraphPipelineOneShot(params = {}) {
     prepOpts.metacognitionOverrides = metacognitionOverrides;
   }
 
+  const previousMindProfile = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(normalizedMindProfile);
+  const executionResumeForRun =
+    executionResume && typeof executionResume === 'object'
+      ? normalizeExecutionResume(executionResume) || null
+      : null;
   try {
     const prep = await prepareGraphPipelineSseInputs(prepOpts);
 
@@ -583,11 +625,12 @@ export async function runGraphPipelineOneShot(params = {}) {
         curiosityPursuitContext,
         goalPursuitContext,
         abortSignal,
-        executionResume,
+        executionResume: executionResumeForRun,
         pauseSupport: Boolean(pauseToken),
         pauseToken,
         pipelineSource: source,
         graphSessionIdForPipelineRun,
+        mindStorageProfile: normalizedMindProfile,
       });
 
       const persisted = await persistGraphPipelineStreamResult({
@@ -600,6 +643,8 @@ export async function runGraphPipelineOneShot(params = {}) {
         goalPursuitContext,
         finalOutputForRunRow: finalNote,
         graphSessionIdForPipelineRun,
+        mindStorageProfile: normalizedMindProfile,
+        scheduledTaskId: task?.id ?? null,
       });
       const voiceDeferredToScheduledSupervisor = Boolean(pending && prep.delayMin > 0);
       return { ...persisted, voiceDeferredToScheduledSupervisor };
@@ -615,6 +660,7 @@ export async function runGraphPipelineOneShot(params = {}) {
     }
     return await runInner();
   } finally {
+    setActiveMindEntityProfile(previousMindProfile);
     if (pauseToken) unregisterPipelinePauseToken(pauseToken);
     if (pursuitPauseSid) {
       mergePersistedGraphPipelineUiForSession(pursuitPauseSid, {
@@ -656,10 +702,33 @@ export async function runGraphPipelineFromScheduledMetacognitionRerun(params = {
   const attachmentIds = Array.isArray(task.metacognition_rerun_attachment_ids)
     ? task.metacognition_rerun_attachment_ids
     : [];
-  const snapRaw = task.metacognition_rerun_pipeline_options;
-  if (!snapRaw || typeof snapRaw !== 'object') throw new Error('supervisor_pipeline_rerun: missing options snapshot');
+  const slimStart =
+    task.pipeline_checkpoint_shared_memory && typeof task.pipeline_checkpoint_shared_memory === 'object'
+      ? task.pipeline_checkpoint_shared_memory
+      : task.metacognition_rerun_slim_shared_memory ?? null;
+  const normalizedProfile = normalizeScheduledTaskMindStorageProfile(task?.mind_storage_profile);
+  const previousMindProfile = getActiveMindEntityProfile();
+  setActiveMindEntityProfile(normalizedProfile);
+  try {
+  let snapRaw = task.metacognition_rerun_pipeline_options;
+  if (!snapRaw || typeof snapRaw !== 'object') {
+    const prepFallback = await prepareGraphPipelineSseInputs({
+      inputText: promptText,
+      task,
+      mindStorageProfile: normalizedProfile,
+      ...(slimStart != null ? { initialFullSharedMemory: slimStart } : {}),
+    });
+    snapRaw = prepFallback.pipelineOptionsSnapshot;
+    try {
+      console.warn(
+        '[scheduler] supervisor_pipeline_rerun: rebuilt missing/corrupt options snapshot from current settings + memory seed',
+        { taskId: task?.id }
+      );
+    } catch {
+      /* ignore */
+    }
+  }
   const snap = sanitizeMetacognitionPipelineOptionsSnapshot(snapRaw);
-  const slimStart = task.metacognition_rerun_slim_shared_memory ?? null;
   const delayMin = resolveMetacognitionRerunDelayMinutesFromSnapshot(snap, runtimeSettings);
 
   const storedCuriosity =
@@ -673,6 +742,18 @@ export async function runGraphPipelineFromScheduledMetacognitionRerun(params = {
   const effCuriosity = curiosityPursuitContext ?? storedCuriosity;
   const effGoal = goalPursuitContext ?? storedGoal;
 
+  const executionResumeForStream =
+    executionResume && typeof executionResume === 'object'
+      ? normalizeExecutionResume(executionResume) || executionResume
+      : task?.pipeline_checkpoint_execution_resume && typeof task.pipeline_checkpoint_execution_resume === 'object'
+        ? normalizeExecutionResume(task.pipeline_checkpoint_execution_resume) ||
+          task.pipeline_checkpoint_execution_resume
+        : null;
+
+  const graphSidRaw = task?.metacognition_rerun_graph_session_id;
+  const graphSid =
+    graphSidRaw != null && String(graphSidRaw).trim() ? String(graphSidRaw).trim() : null;
+
   const runInner = async () => {
     const prepLike = {
       promptText,
@@ -684,25 +765,43 @@ export async function runGraphPipelineFromScheduledMetacognitionRerun(params = {
       runtimeSettings,
     };
 
+    if (graphSid) beginGraphSessionSupervisorRerunUi(graphSid, {});
+    let clearCheckpointOnEnd = false;
     const pauseToken = createPipelinePauseToken();
     registerPipelinePauseToken(pauseToken, { kind: 'metacognition-rerun', id: String(task?.id || '') });
     try {
+      const wrappedOnSse = (evt) => {
+        onSseEvent?.(evt);
+        if (graphSid) {
+          applyGraphSessionSupervisorRerunSseEvent(graphSid, evt, {
+            promptText,
+            attachmentIds,
+            runtimeSettings,
+            mindStorageProfile: normalizedProfile,
+            pipelineOptionsSnapshot: snap,
+            curiosityPursuitContext: effCuriosity,
+            goalPursuitContext: effGoal,
+          });
+        }
+      };
       const { streamResult, pending, finalNote } = await executePreparedGraphPipelineSse({
         prep: prepLike,
         fetchImpl: fetchOneShot,
         attachmentIds,
-        onSseEvent,
+        onSseEvent: wrappedOnSse,
         curiosityPursuitContext: effCuriosity,
         goalPursuitContext: effGoal,
         treatFirstLegAsContinuation: true,
         abortSignal,
-        executionResume,
+        executionResume: executionResumeForStream,
         pauseSupport: true,
         pauseToken,
         pipelineSource: source,
-        graphSessionIdForPipelineRun: null,
+        graphSessionIdForPipelineRun: graphSid,
+        mindStorageProfile: normalizedProfile,
       });
 
+      clearCheckpointOnEnd = !streamResult?.pipelinePaused;
       const persisted = await persistGraphPipelineStreamResult({
         streamResult,
         promptText,
@@ -712,7 +811,9 @@ export async function runGraphPipelineFromScheduledMetacognitionRerun(params = {
         curiosityPursuitContext: effCuriosity,
         goalPursuitContext: effGoal,
         finalOutputForRunRow: finalNote,
-        graphSessionIdForPipelineRun: null,
+        graphSessionIdForPipelineRun: graphSid,
+        mindStorageProfile: normalizedProfile,
+        scheduledTaskId: task?.id ?? null,
       });
       return {
         ...persisted,
@@ -720,6 +821,9 @@ export async function runGraphPipelineFromScheduledMetacognitionRerun(params = {
       };
     } finally {
       unregisterPipelinePauseToken(pauseToken);
+      if (graphSid) {
+        endGraphSessionSupervisorRerunUi(graphSid, { clearCheckpoint: clearCheckpointOnEnd });
+      }
     }
   };
 
@@ -732,4 +836,7 @@ export async function runGraphPipelineFromScheduledMetacognitionRerun(params = {
     }
   }
   return runInner();
+  } finally {
+    setActiveMindEntityProfile(previousMindProfile);
+  }
 }

@@ -1,4 +1,4 @@
-import { MODULES, PIPELINE_LAYER_KEYS, PIPELINE_LAYERS } from './pipelineModules.mjs';
+import { MODULES, PIPELINE_LAYER_KEYS, PIPELINE_LAYERS, PIPELINE_SCHEMA_VERSION } from './pipelineModules.mjs';
 
 /**
  * Flatten canonical pipeline order (matches {@link runPipeline} forward path without metacognition surprises).
@@ -32,5 +32,5 @@ export function getIncrementalCheckpointCursorAfter(completedModuleName) {
   const layer = MODULES.find((m) => m.name === next)?.layer;
   const phase =
     layer === 'layer5' ? 'layer5' : layer === 'layer6' ? 'layer6' : 'layer14';
-  return { v: 1, phase, nextModuleName: next };
+  return { v: PIPELINE_SCHEMA_VERSION, phase, nextModuleName: next };
 }

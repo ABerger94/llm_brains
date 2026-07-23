@@ -1,9 +1,4 @@
-import { CuriosityItem, GoalItem, PipelineRun, ScheduledTask } from './data';
-import {
-  inferExecutionResumeFromPausedPipelineRun,
-  isCheckpointPipelineRun,
-} from './pipelineRunCheckpoint';
-import { normalizeExecutionResume } from '../../shared/pipelineExecutionResume.mjs';
+import { CuriosityItem, GoalItem, ScheduledTask } from './data';
 import {
   flushCuriosityPursuitsPersistNow,
   reloadCuriosityPursuitsFromPersistedDisk,
@@ -33,6 +28,8 @@ import { notifyMindStorageChanged } from './mindStorageEvents';
 import { runCuriosityDeepPursuitChain } from './curiosityPursuit';
 import { runGoalDeepPursuitChain } from './goalPursuit';
 import {
+  abortRegisteredCuriosityPursuitGraph,
+  abortRegisteredGoalPursuitGraph,
   clearCuriosityPursuitGraphAbort,
   clearGoalPursuitGraphAbort,
   registerCuriosityPursuitGraphAbort,
@@ -42,74 +39,60 @@ import { initialCuriosityPipelineUi, reduceCuriosityPipelineSse } from './curios
 import { initialGoalPipelineUi, reduceGoalPipelineSse } from './goalPipelineSseUi';
 import { healGraphRegistryWhenPersistSaysIdle } from './graphSessionStaleRunningHeal';
 import { syncDashboardScheduledRunningFromDb } from './dashboardScheduledRunningSync';
+import { resolvePursuitResumeFromLastPipelineRun } from './pipelinePursuitResume';
+import { MIND_STORAGE_PROFILE_PRIMARY } from './mindEntityContext';
+import { toast } from '../components/ui';
 
-async function collectCuriosityIdsWithPausedLastGraphRun() {
-  let items = [];
-  try {
-    items = await CuriosityItem.list('-created_date', 200);
-  } catch {
-    return [];
-  }
+/**
+ * Every idle cooperative-pause slot shown on the Dashboard must be eligible for per-card Resume.
+ * The prior implementation required `last_pursuit_pipeline_run_id` to point at a checkpoint-shaped
+ * PipelineRun; after import/reload that pointer can be stale while the slot still shows paused.
+ * {@link resolvePursuitResumeFromLastPipelineRun} can still find a resumable run via scan.
+ */
+function collectCuriosityIdsCooperativePausedIdle() {
+  const snap = getCuriosityPagePursuitSnapshot();
   const ids = [];
-  for (const item of items) {
-    const rid = item.last_pursuit_pipeline_run_id;
-    if (!rid) continue;
-    let run;
-    try {
-      run = await PipelineRun.retrieve(String(rid));
-    } catch {
-      continue;
-    }
-    if (!run || !isCheckpointPipelineRun(run)) continue;
-    const er =
-      normalizeExecutionResume(run.execution_resume) || inferExecutionResumeFromPausedPipelineRun(run);
-    if (!er) continue;
-    ids.push(String(item.id));
+  for (const [id, e] of Object.entries(snap.pursuits || {})) {
+    if (!e?.cooperativePaused || e?.running) continue;
+    ids.push(id);
   }
-  return ids;
+  return ids.sort();
 }
 
-async function collectGoalIdsWithPausedLastGraphRun() {
-  let items = [];
-  try {
-    items = await GoalItem.list('-created_date', 200);
-  } catch {
-    return [];
-  }
+function collectGoalIdsCooperativePausedIdle() {
+  const snap = getGoalPagePursuitSnapshot();
   const ids = [];
-  for (const item of items) {
-    const rid = item.last_pursuit_pipeline_run_id;
-    if (!rid) continue;
-    let run;
-    try {
-      run = await PipelineRun.retrieve(String(rid));
-    } catch {
-      continue;
-    }
-    if (!run || !isCheckpointPipelineRun(run)) continue;
-    const er =
-      normalizeExecutionResume(run.execution_resume) || inferExecutionResumeFromPausedPipelineRun(run);
-    if (!er) continue;
-    ids.push(String(item.id));
+  for (const [id, e] of Object.entries(snap.pursuits || {})) {
+    if (!e?.cooperativePaused || e?.running) continue;
+    ids.push(id);
   }
-  return ids;
+  return ids.sort();
 }
 
 async function rerunInterruptedCuriosityPursuit(item) {
   const cid = item.id;
+  abortRegisteredCuriosityPursuitGraph(cid);
   const ac = new AbortController();
   registerCuriosityPursuitGraphAbort(cid, ac);
+  const resume = await resolvePursuitResumeFromLastPipelineRun(item);
+  const nm = resume?.executionResume?.nextModuleName;
+  const progressLabel =
+    typeof nm === 'string' && nm.trim() ? `Resuming before ${nm.trim()}…` : 'Starting…';
+  const prevCuriosityEntry = getCuriosityPagePursuitSnapshot().pursuits[cid];
+  const curiosityReloadProfile = prevCuriosityEntry?.mindStorageProfile || MIND_STORAGE_PROFILE_PRIMARY;
   upsertCuriosityPursuit(cid, {
     running: true,
     interruptedByReload: false,
     cooperativePaused: false,
-    pursuitProgress: 'Starting…',
+    pursuitProgress: progressLabel,
     curiosityPipelineUi: initialCuriosityPipelineUi(),
     question: String(item.question || '').trim() || undefined,
+    mindStorageProfile: curiosityReloadProfile,
   });
   let pipelinePaused = false;
   try {
     const { pipelinePaused: didPause } = await runCuriosityDeepPursuitChain(item, {
+      mindStorageProfile: curiosityReloadProfile,
       signal: ac.signal,
       onProgress: (label) => {
         patchCuriosityPursuitEntry(cid, { pursuitProgress: label });
@@ -119,7 +102,7 @@ async function rerunInterruptedCuriosityPursuit(item) {
           moduleOutputs: {},
           loopCount: 0,
           finalOutput: '',
-          executionLog: [...prev.executionLog, { time: Date.now(), msg: `── ${label} ──` }],
+          executionLog: [...(prev.executionLog || []), { time: Date.now(), msg: `── ${label} ──` }].slice(-40),
         }));
       },
       onPipelineSse: (evt) => {
@@ -159,19 +142,28 @@ async function rerunInterruptedCuriosityPursuit(item) {
 
 async function rerunInterruptedGoalPursuit(item) {
   const gid = item.id;
+  abortRegisteredGoalPursuitGraph(gid);
   const ac = new AbortController();
   registerGoalPursuitGraphAbort(gid, ac);
+  const resume = await resolvePursuitResumeFromLastPipelineRun(item);
+  const nm = resume?.executionResume?.nextModuleName;
+  const progressLabel =
+    typeof nm === 'string' && nm.trim() ? `Resuming before ${nm.trim()}…` : 'Starting…';
+  const prevGoalEntry = getGoalPagePursuitSnapshot().pursuits[gid];
+  const goalReloadProfile = prevGoalEntry?.mindStorageProfile || MIND_STORAGE_PROFILE_PRIMARY;
   upsertGoalPursuit(gid, {
     running: true,
     interruptedByReload: false,
     cooperativePaused: false,
-    pursuitProgress: 'Starting…',
+    pursuitProgress: progressLabel,
     goalPipelineUi: initialGoalPipelineUi(),
     goalStatement: String(item.goal_statement || '').trim() || undefined,
+    mindStorageProfile: goalReloadProfile,
   });
   let pipelinePaused = false;
   try {
     const { pipelinePaused: didPause } = await runGoalDeepPursuitChain(item, {
+      mindStorageProfile: goalReloadProfile,
       signal: ac.signal,
       onProgress: (label) => {
         patchGoalPagePursuitEntry(gid, { pursuitProgress: label });
@@ -181,7 +173,7 @@ async function rerunInterruptedGoalPursuit(item) {
           moduleOutputs: {},
           loopCount: 0,
           finalOutput: '',
-          executionLog: [...prev.executionLog, { time: Date.now(), msg: `── ${label} ──` }],
+          executionLog: [...(prev.executionLog || []), { time: Date.now(), msg: `── ${label} ──` }].slice(-40),
         }));
       },
       onPipelineSse: (evt) => {
@@ -219,7 +211,7 @@ async function rerunInterruptedGoalPursuit(item) {
   }
 }
 
-async function runOneInterruptedCuriosityRerun(id) {
+export async function runOneInterruptedCuriosityRerun(id) {
   let item;
   try {
     item = await CuriosityItem.retrieve(id);
@@ -241,7 +233,7 @@ async function runOneInterruptedCuriosityRerun(id) {
   }
 }
 
-async function runOneInterruptedGoalRerun(id) {
+export async function runOneInterruptedGoalRerun(id) {
   let item;
   try {
     item = await GoalItem.retrieve(id);
@@ -264,19 +256,36 @@ async function runOneInterruptedGoalRerun(id) {
 }
 
 /**
+ * Merge curiosity/goal pursuit slots from persisted storage, heal graph registry flags, and refresh
+ * Dashboard scheduled-task caches so cooperative-pause rows appear — without starting pipelines.
+ *
+ * Use after a reload or when “Load saved” should surface paused work from disk.
+ */
+export async function loadSavedPausedPipelineStateFromDashboard() {
+  healGraphRegistryWhenPersistSaysIdle();
+  const curiosityMerged = reloadCuriosityPursuitsFromPersistedDisk();
+  const goalMerged = reloadGoalPursuitsFromPersistedDisk();
+  await syncDashboardScheduledRunningFromDb();
+  notifyMindStorageChanged({ source: 'dashboard-load-saved' });
+  return { curiosityMerged, goalMerged };
+}
+
+/**
  * @typedef {'resume_all' | 'rerun_interrupted'} ReloadInterruptedPipelineMode
  */
 
 /**
  * Dashboard recovery: clears the pause hold, merges pursuit slots from disk, then either:
  *
- * - **`resume_all`** (default): {@link resumeInterruptedGraphPipelineManual} for the interactive graph/stream
- *   (cooperative checkpoints + reconnect resume), then resumes paused **scheduler** graph tasks, then reruns
- *   interrupted / paused-checkpoint curiosity and goal pursuits in parallel.
+ * - **`resume_all`** (default): resumes paused **scheduler** graph tasks and flushes the due queue **first**,
+ *   then reruns interrupted / paused-checkpoint **curiosity and goal** pursuits (so they are not blocked
+ *   behind a long interactive graph run), then {@link resumeInterruptedGraphPipelineManual} for the
+ *   interactive graph/stream (all cooperative checkpoints sequentially, then reconnect resume when eligible).
  *
- * - **`rerun_interrupted`**: **does not** start the interactive graph — use **Resume all** for that saved state.
- *   Still resumes every paused scheduler graph task, reruns the same curiosity/goal interrupted set, and runs
- *   {@link flushSchedulerDueTasksNow} so **due queued** pending tasks start without waiting for the poll interval.
+ * - **`rerun_interrupted`**: **does not** start the interactive graph, **does not** resume scheduler paused
+ *   tasks or flush the due-task queue — use **Resume all** for that. Reloads pursuit KV and reruns
+ *   interrupted / paused-checkpoint curiosity and goal pursuits, continuing from the latest saved
+ *   {@link PipelineRun} checkpoint ({@link resolvePursuitResumeFromLastPipelineRun}) instead of restarting from Perception when possible.
  *
  * Clears the cross-tab “Pause & save all” scheduler hold first. Does not wait for already in-flight background jobs.
  *
@@ -290,95 +299,128 @@ export async function reloadInterruptedPipelineWorkFromDashboard(opts = {}) {
   const curiosityMerged = reloadCuriosityPursuitsFromPersistedDisk();
   const goalMerged = reloadGoalPursuitsFromPersistedDisk();
 
-  const graph =
+  let graph =
     mode === 'resume_all'
-      ? await resumeInterruptedGraphPipelineManual()
+      ? null
       : {
           graphStarted: false,
           graphReason: 'skipped_rerun_interrupted_mode',
           otherGraphCheckpointSessions: 0,
         };
 
-  /** @type {{ id: string, ok: boolean, error?: string }[]} */
+  /** @type {{ id: string, ok: boolean, error?: string, background?: boolean }[]} */
   let scheduledPausedResumes = [];
-  try {
-    const pausedRows = await listPausedScheduledGraphTasks();
-    for (const t of pausedRows) {
-      const id = String(t?.id || '').trim();
-      if (!id) {
-        scheduledPausedResumes.push({ id: '?', ok: false, error: 'missing id' });
-        continue;
-      }
+  /** @type {Promise<{ id: string, ok: boolean, error?: string }>[]} */
+  const backgroundSchedulerResumes = [];
+  if (mode === 'resume_all') {
+    try {
+      const pausedRows = await listPausedScheduledGraphTasks();
+      for (const t of pausedRows) {
+        const id = String(t?.id || '').trim();
+        if (!id) {
+          scheduledPausedResumes.push({ id: '?', ok: false, error: 'missing id' });
+          continue;
+        }
 
-      const hasCk =
-        t.pipeline_checkpoint_shared_memory &&
-        typeof t.pipeline_checkpoint_shared_memory === 'object' &&
-        t.pipeline_checkpoint_execution_resume &&
-        typeof t.pipeline_checkpoint_execution_resume === 'object';
+        const hasCk =
+          t.pipeline_checkpoint_shared_memory &&
+          typeof t.pipeline_checkpoint_shared_memory === 'object' &&
+          t.pipeline_checkpoint_execution_resume &&
+          typeof t.pipeline_checkpoint_execution_resume === 'object';
 
-      if (hasCk) {
-        // Fire-and-forget: resumePausedScheduledPipelineTask runs the full pipeline
-        // inline (SSE stream + persist), which can take minutes. Don't block the
-        // rest of the resume-all flow waiting for it.
-        void resumePausedScheduledPipelineTask(id).catch((e) => {
-          console.warn('[reload-interrupted] background resume paused task error', id, e);
-        });
-        scheduledPausedResumes.push({ id, ok: true });
-        continue;
-      }
+        if (hasCk) {
+          // resumePausedScheduledPipelineTask runs the full pipeline (SSE + persist); do not block
+          // pursuits / graph. Aggregate failures when all background runs settle.
+          backgroundSchedulerResumes.push(
+            resumePausedScheduledPipelineTask(id).then(
+              () => ({ id, ok: true }),
+              (e) => ({
+                id,
+                ok: false,
+                error: e instanceof Error ? e.message : String(e),
+              })
+            )
+          );
+          scheduledPausedResumes.push({ id, ok: true, background: true });
+          continue;
+        }
 
-      // No checkpoint — re-queue as pending so the scheduler picks it up on the next tick.
-      try {
-        await ScheduledTask.update(id, {
-          status: 'pending',
-          scheduled_at: new Date().toISOString(),
-          pipeline_checkpoint_shared_memory: null,
-          pipeline_checkpoint_execution_resume: null,
-          pipeline_checkpoint_pipeline_run_id: null,
-        });
-        scheduledPausedResumes.push({ id, ok: true });
-      } catch (e) {
-        scheduledPausedResumes.push({ id, ok: false, error: e instanceof Error ? e.message : String(e) });
+        // No checkpoint — re-queue as pending so the scheduler picks it up on the next tick.
+        try {
+          await ScheduledTask.update(id, {
+            status: 'pending',
+            scheduled_at: new Date().toISOString(),
+            pipeline_checkpoint_shared_memory: null,
+            pipeline_checkpoint_execution_resume: null,
+            pipeline_checkpoint_pipeline_run_id: null,
+          });
+          scheduledPausedResumes.push({ id, ok: true });
+        } catch (e) {
+          scheduledPausedResumes.push({ id, ok: false, error: e instanceof Error ? e.message : String(e) });
+        }
       }
+    } catch (e) {
+      console.warn('[reload-interrupted] scheduled paused batch', e);
     }
-  } catch (e) {
-    console.warn('[reload-interrupted] scheduled paused batch', e);
-  }
 
-  // Flush due scheduler tasks immediately so they don't wait for the next poll interval.
-  try {
-    await flushSchedulerDueTasksNow();
-  } catch (e) {
-    console.warn('[reload-interrupted] scheduler due flush', e);
+    if (backgroundSchedulerResumes.length > 0) {
+      void Promise.all(backgroundSchedulerResumes).then((results) => {
+        const bad = results.filter((r) => !r.ok);
+        if (bad.length === 0) return;
+        const head = bad
+          .slice(0, 4)
+          .map((r) => `${r.id}: ${r.error || 'failed'}`)
+          .join(' · ');
+        console.warn('[reload-interrupted] scheduler resume failures', bad);
+        toast({
+          title: 'Some scheduler resumes failed',
+          description:
+            bad.length > 4
+              ? `${head} · +${bad.length - 4} more (see console)`
+              : head,
+          variant: 'destructive',
+        });
+      });
+    }
+
+    try {
+      await flushSchedulerDueTasksNow();
+    } catch (e) {
+      console.warn('[reload-interrupted] scheduler due flush', e);
+    }
   }
 
   const snapC = getCuriosityPagePursuitSnapshot();
   const curiosityFromReload = Object.keys(snapC.pursuits).filter((id) => snapC.pursuits[id]?.interruptedByReload);
-  const curiosityFromPaused = await collectCuriosityIdsWithPausedLastGraphRun();
+  const curiosityFromPaused = collectCuriosityIdsCooperativePausedIdle();
   const curiosityIds = [...new Set([...curiosityFromReload, ...curiosityFromPaused])].sort();
 
   const snapG = getGoalPagePursuitSnapshot();
   const goalFromReload = Object.keys(snapG.pursuits).filter((id) => snapG.pursuits[id]?.interruptedByReload);
-  const goalFromPaused = await collectGoalIdsWithPausedLastGraphRun();
+  const goalFromPaused = collectGoalIdsCooperativePausedIdle();
   const goalIds = [...new Set([...goalFromReload, ...goalFromPaused])].sort();
 
-  const curiosityWave =
-    curiosityIds.length === 0
-      ? Promise.resolve([])
-      : Promise.all(curiosityIds.map((id) => runOneInterruptedCuriosityRerun(id)));
+  /** @type {{ id: string, ok: boolean, error?: string, permanent?: boolean }[]} */
+  const curiosityReruns = [];
+  for (const id of curiosityIds) {
+    curiosityReruns.push(await runOneInterruptedCuriosityRerun(id));
+  }
 
-  const goalWave =
-    goalIds.length === 0
-      ? Promise.resolve([])
-      : Promise.all(goalIds.map((id) => runOneInterruptedGoalRerun(id)));
-
-  const [curiosityReruns, goalReruns] = await Promise.all([curiosityWave, goalWave]);
+  /** @type {{ id: string, ok: boolean, error?: string, permanent?: boolean }[]} */
+  const goalReruns = [];
+  for (const id of goalIds) {
+    goalReruns.push(await runOneInterruptedGoalRerun(id));
+  }
 
   for (const r of curiosityReruns) {
     if (!r.ok && r.permanent) removeCuriosityPursuit(r.id);
   }
   for (const r of goalReruns) {
     if (!r.ok && r.permanent) removeGoalPursuit(r.id);
+  }
+
+  if (mode === 'resume_all') {
+    graph = await resumeInterruptedGraphPipelineManual();
   }
 
   // Clear stale graph session flags (isRunning stuck in KV, registry isProcessing stuck)

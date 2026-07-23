@@ -1,11 +1,13 @@
 import { clipTextComplete } from '../../shared/textClip.mjs';
-import { CuriosityItem, GoalItem, LongTermMemory, MindBiography, TemporalEvent } from './data';
+import { getActiveMindEntityProfile, getMindEntityStores } from './mindEntityContext';
 import {
   composeMindBiographyUserPrompt,
   completeMindBiographyViaJson,
 } from './mindBiographyContext';
 import { llmService } from '../services/llmService';
 import { notifyMindStorageChanged } from './mindStorageEvents';
+
+const E = () => getMindEntityStores();
 
 /** True if saved narrative would be prompt echo / JSON continuation rather than prose. */
 export function isLikelyBiographyEcho(text) {
@@ -69,6 +71,8 @@ export function isParsedBiographyUsable(parsed, rawResponse) {
 
 /**
  * Builds the THIS_PIPELINE_RUN block for pipeline-triggered biography (same clip budgets as legacy touch).
+ * @param {object} opts
+ * @param {ReturnType<typeof getMindEntityStores>} [opts.stores] — captured stores to avoid global-profile races across `await` boundaries.
  */
 export async function formatPipelineRunContextForBiography({
   sm,
@@ -78,7 +82,9 @@ export async function formatPipelineRunContextForBiography({
   source,
   curiosityPursuitContext,
   goalPursuitContext,
+  stores: storesOverride,
 }) {
+  const S = storesOverride || E();
   const voice = clipTextComplete(String(voiceOutput || ''), 12000, { ellipsis: false });
   const narrative = clipTextComplete(String(narrativeText || ''), 16000, { ellipsis: false });
   const phen = clipTextComplete(String(sm?.phenomenalNow?.line || ''), 1200, { ellipsis: false });
@@ -93,7 +99,7 @@ export async function formatPipelineRunContextForBiography({
   const cid = curiosityPursuitContext?.parentCuriosityId;
   if (cid) {
     try {
-      const c = await CuriosityItem.retrieve(cid);
+      const c = await S.CuriosityItem.retrieve(cid);
       if (c) {
         lines.push(
           `This run was framed as curiosity pursuit for question id ${cid}: ${clipTextComplete(String(c.question || c.title || ''), 400, { ellipsis: false })}`
@@ -109,7 +115,7 @@ export async function formatPipelineRunContextForBiography({
   const gid = goalPursuitContext?.goalId ?? goalPursuitContext?.parentGoalId;
   if (gid) {
     try {
-      const g = await GoalItem.retrieve(gid);
+      const g = await S.GoalItem.retrieve(gid);
       if (g) {
         lines.push(
           `This run was framed as goal pursuit for goal id ${gid}: ${clipTextComplete(String(g.goal_statement || g.title || ''), 400, { ellipsis: false })}`
@@ -131,14 +137,17 @@ export async function formatPipelineRunContextForBiography({
 /**
  * Same LLM + parsing path as Mind Biography "Write New Version"; does not persist.
  * @param {object|undefined} prevBio — latest biography row, or omit and load from DB
- * @param {{ pipelineRunContextBlock?: string, prevBioOverride?: object }} [options]
+ * @param {{ pipelineRunContextBlock?: string, prevBioOverride?: object, stores?: ReturnType<typeof getMindEntityStores> }} [options]
  */
 export async function generateMindBiographyViaLlm(prevBio, options = {}) {
-  const prevBioList = await MindBiography.list('-created_date', 1);
+  const stores = options.stores || E();
+  const profile = getActiveMindEntityProfile();
+  const snap = { profile, stores };
+  const prevBioList = await stores.MindBiography.list('-created_date', 1);
   const effectivePrev = options.prevBioOverride ?? prevBio ?? prevBioList[0];
   const sessionNumber = (Number(effectivePrev?.session_number ?? effectivePrev?.version) || 0) + 1;
 
-  const composeOpts = { pipelineRunContextBlock: options.pipelineRunContextBlock };
+  const composeOpts = { pipelineRunContextBlock: options.pipelineRunContextBlock, snap };
 
   const { prompt, systemPrompt, memoriesCount, beliefCount, runs } = await composeMindBiographyUserPrompt(
     sessionNumber,
@@ -169,6 +178,7 @@ export async function generateMindBiographyViaLlm(prevBio, options = {}) {
   if (!isParsedBiographyUsable(parsed, result)) {
     const j = await completeMindBiographyViaJson(sessionNumber, effectivePrev, {
       pipelineRunContextBlock: options.pipelineRunContextBlock,
+      snap,
     });
     parsed = {
       fullText: j.fullText,
@@ -198,7 +208,7 @@ export async function generateMindBiographyViaLlm(prevBio, options = {}) {
 }
 
 /**
- * @param {{ sessionNumber: number, fullText: string, summary: string, keywords: string[], values: string[], changes: string, memoriesCount: number, beliefCount: number, sessionId: string, source: 'biography' | 'pipeline-biography' | 'scheduled-biography' }} args
+ * @param {{ sessionNumber: number, fullText: string, summary: string, keywords: string[], values: string[], changes: string, memoriesCount: number, beliefCount: number, sessionId: string, source: 'biography' | 'pipeline-biography' | 'scheduled-biography', stores?: ReturnType<typeof getMindEntityStores> }} args
  */
 export async function persistMindBiographyVersion({
   sessionNumber,
@@ -211,11 +221,13 @@ export async function persistMindBiographyVersion({
   beliefCount,
   sessionId,
   source,
+  stores: storesOverride,
 }) {
+  const S = storesOverride || E();
   const ltmSource = source === 'biography' ? 'biography' : source;
   const temporalSource = source === 'biography' ? 'biography' : source;
 
-  await MindBiography.create({
+  await S.MindBiography.create({
     version: sessionNumber,
     session_number: sessionNumber,
     session_id: sessionId,
@@ -228,14 +240,14 @@ export async function persistMindBiographyVersion({
     memory_count: memoriesCount,
   });
 
-  await LongTermMemory.create({
+  await S.LongTermMemory.create({
     title: `Mind biography v${sessionNumber}`,
     content: fullText,
     memory_type: 'semantic',
     source: ltmSource,
   });
 
-  await TemporalEvent.create({
+  await S.TemporalEvent.create({
     title: 'identity_shift',
     details: `Biography v${sessionNumber} written. Notable: ${clipTextComplete(changes, 280, { ellipsis: true })}`,
     source: temporalSource,

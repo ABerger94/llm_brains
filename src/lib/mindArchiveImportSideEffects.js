@@ -4,8 +4,14 @@
 
 import { syncDashboardScheduledRunningFromDb } from './dashboardScheduledRunningSync';
 import { consciousnessStreamStore } from './consciousnessStreamStore';
-import { replaceCuriosityPursuitsSnapshotFromImportedKv } from './curiosityPagePursuitStore';
-import { replaceGoalPursuitsSnapshotFromImportedKv } from './goalPagePursuitStore';
+import {
+  replaceCuriosityPursuitsSnapshotFromImportedKv,
+  sanitizeCuriosityPursuitsReloadFlagsAfterMindImport,
+} from './curiosityPagePursuitStore';
+import {
+  replaceGoalPursuitsSnapshotFromImportedKv,
+  sanitizeGoalPursuitsReloadFlagsAfterMindImport,
+} from './goalPagePursuitStore';
 import { graphPipelineStore } from './graphPipelineStore';
 import { clearCooperativePauseRegistryAndMirror } from './pipelineActiveRunRegistry';
 import { resetSchedulerPipelineUiAfterImport } from './schedulerPipelineUiStore';
@@ -16,6 +22,8 @@ export function afterMindArchiveImport() {
   consciousnessStreamStore.rehydrateFromPersisted();
   replaceCuriosityPursuitsSnapshotFromImportedKv();
   replaceGoalPursuitsSnapshotFromImportedKv();
+  sanitizeCuriosityPursuitsReloadFlagsAfterMindImport();
+  sanitizeGoalPursuitsReloadFlagsAfterMindImport();
   resetSchedulerPipelineUiAfterImport();
   clearCooperativePauseRegistryAndMirror();
   void syncDashboardScheduledRunningFromDb();

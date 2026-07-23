@@ -1,8 +1,16 @@
 import moment from 'moment';
 import { emergenceReviewState } from './emergenceReviewState';
+import { countCuriosityItemsByUiStatus } from './curiosityQueueMetrics';
+import { countGoalItemsByUiStatus } from './goalQueueMetrics';
 
 /** Pipeline post-processing may add a new MindBiography row after this many runs since the latest row’s created_date (see touchMindBiographyAfterPipeline). */
 export const PIPELINE_BIOGRAPHY_SNAPSHOT_EVERY_N_RUNS = 5;
+
+/**
+ * Beliefs/memories/etc. are often persisted milliseconds after the PipelineRun row is created. Without this grace,
+ * cumulative counts at each run’s timestamp stay at zero until a later run — especially visible on System B with few runs.
+ */
+export const HEALTH_GROWTH_RUN_ARTIFACT_GRACE_MS = 120_000;
 
 export const HEALTH_CHART = {
   axis: 'hsl(0 0% 50%)',
@@ -101,6 +109,65 @@ export function healthIdentityStabilityScore(biographies) {
   return 0.45 * kw + 0.35 * cv + 0.2 * sum;
 }
 
+function recordTimeMs(rec, field = 'created_date') {
+  const n = new Date(rec?.[field]).getTime();
+  return Number.isFinite(n) ? n : NaN;
+}
+
+/**
+ * Cumulative store counts as of `cutoffMs` (inclusive), matching per-run growth chart semantics.
+ */
+function growthCountsAtCutoffMs(
+  cutoffMs,
+  beliefs,
+  curiosities,
+  memories,
+  emergences,
+  biographies,
+  goals
+) {
+  if (!Number.isFinite(cutoffMs)) {
+    return {
+      beliefs: 0,
+      curiosity: 0,
+      memories: 0,
+      contradictionResolution: 0,
+      identity: 0,
+      emergence: 0,
+      goals: 0,
+    };
+  }
+  const beforeCutoff = (rec, field = 'created_date') => {
+    const t = recordTimeMs(rec, field);
+    return Number.isFinite(t) && t <= cutoffMs;
+  };
+  return {
+    beliefs: beliefs.filter((b) => beforeCutoff(b, 'created_date')).length,
+    curiosity: curiosities.filter((c) => beforeCutoff(c, 'created_date')).length,
+    memories: memories.filter((mem) => beforeCutoff(mem, 'created_date')).length,
+    contradictionResolution: beliefs.filter((b) => {
+      if ((b.status || '') !== 'resolved') return false;
+      const tr = recordTimeMs(b, 'updated_date') || recordTimeMs(b, 'created_date');
+      return Number.isFinite(tr) && tr <= cutoffMs;
+    }).length,
+    identity: biographies.filter((b) => beforeCutoff(b, 'created_date')).length,
+    emergence: emergences.filter((e) => beforeCutoff(e, 'created_date')).length,
+    goals: (goals || []).filter((g) => beforeCutoff(g, 'created_date')).length,
+  };
+}
+
+function growthRowCountsEqual(a, b) {
+  return (
+    a.beliefs === b.beliefs &&
+    a.curiosity === b.curiosity &&
+    a.memories === b.memories &&
+    a.contradictionResolution === b.contradictionResolution &&
+    a.identity === b.identity &&
+    a.emergence === b.emergence &&
+    a.goals === b.goals
+  );
+}
+
 export function healthBuildGrowthOverRuns(
   runs,
   beliefs,
@@ -115,34 +182,90 @@ export function healthBuildGrowthOverRuns(
     (x, y) => new Date(x.created_date).getTime() - new Date(y.created_date).getTime()
   );
   const n = sorted.length;
-  if (n === 0) return [];
+  const g = goals || [];
+
+  /** No pipeline runs: still chart store growth if anything exists (e.g. manual biography with no runs yet). */
+  if (n === 0) {
+    const nowMs = Date.now();
+    const counts = growthCountsAtCutoffMs(
+      nowMs,
+      beliefs,
+      curiosities,
+      memories,
+      emergences,
+      biographies,
+      g
+    );
+    const empty =
+      counts.beliefs +
+        counts.curiosity +
+        counts.memories +
+        counts.contradictionResolution +
+        counts.identity +
+        counts.emergence +
+        counts.goals ===
+      0;
+    if (empty) return [];
+    return [
+      {
+        session: 'S1',
+        label: 'Now',
+        runCreatedAt: new Date(nowMs).toISOString(),
+        ...counts,
+      },
+    ];
+  }
+
   const slice =
     typeof limit === 'number' && limit > 0 && limit < n ? sorted.slice(-limit) : sorted;
   let prevDayKey = null;
-  return slice.map((run, i) => {
-    const t = new Date(run.created_date).getTime();
+  const rows = slice.map((run, i) => {
+    const tRun = recordTimeMs(run, 'created_date');
+    const cutoffMs =
+      Number.isFinite(tRun) ? tRun + HEALTH_GROWTH_RUN_ARTIFACT_GRACE_MS : NaN;
     const m = moment(run.created_date);
     const dayKey = m.format('YYYY-MM-DD');
     const label =
       dayKey === prevDayKey ? m.format('h:mm a') : m.format('M/D');
     prevDayKey = dayKey;
+    const counts = growthCountsAtCutoffMs(
+      cutoffMs,
+      beliefs,
+      curiosities,
+      memories,
+      emergences,
+      biographies,
+      g
+    );
     return {
       session: `R${i + 1}`,
       label,
       runCreatedAt: run.created_date,
-      beliefs: beliefs.filter((b) => new Date(b.created_date).getTime() <= t).length,
-      curiosity: curiosities.filter((c) => new Date(c.created_date).getTime() <= t).length,
-      memories: memories.filter((m) => new Date(m.created_date).getTime() <= t).length,
-      contradictionResolution: beliefs.filter((b) => {
-        if ((b.status || '') !== 'resolved') return false;
-        const tr = new Date(b.updated_date || b.created_date).getTime();
-        return tr <= t;
-      }).length,
-      identity: biographies.filter((b) => new Date(b.created_date).getTime() <= t).length,
-      emergence: emergences.filter((e) => new Date(e.created_date).getTime() <= t).length,
-      goals: (goals || []).filter((g) => new Date(g.created_date).getTime() <= t).length,
+      ...counts,
     };
   });
+
+  const nowMs = Date.now();
+  const atNow = growthCountsAtCutoffMs(
+    nowMs,
+    beliefs,
+    curiosities,
+    memories,
+    emergences,
+    biographies,
+    g
+  );
+  const last = rows[rows.length - 1];
+  if (last && !growthRowCountsEqual(last, atNow)) {
+    rows.push({
+      session: `R${rows.length + 1}`,
+      label: 'Now',
+      runCreatedAt: new Date(nowMs).toISOString(),
+      ...atNow,
+    });
+  }
+
+  return rows;
 }
 
 /**
@@ -159,8 +282,10 @@ export function healthBuildGrowthOverRuns(
  *   positiveRatings: number,
  *   negativeRatings: number,
  * }} snapshot
+ * @param {Record<string, { running?: boolean }>} [curiosityPursuits] Live Curiosity pursuit slots (same as Curiosity Queue). When set, status counts match /curiosity (stale DB `pursuing` without a running slot counts as open).
+ * @param {Record<string, { running?: boolean }>} [goalPursuits] Live Goal pursuit slots (same as Goals stack).
  */
-export function computeCognitiveHealthDerived(snapshot) {
+export function computeCognitiveHealthDerived(snapshot, curiosityPursuits = {}, goalPursuits = {}) {
   const { runs, beliefs, memories, curiosities, emergences, biographies, goals = [] } = snapshot;
   const emergencesForHealth = emergences.filter((e) => emergenceReviewState(e) !== 'rejected');
 
@@ -168,6 +293,7 @@ export function computeCognitiveHealthDerived(snapshot) {
   const activeBeliefs = beliefs.filter((b) => (b.status || 'active') === 'active').length;
   const contradictedBeliefs = beliefs.filter((b) => b.status === 'contradicted').length;
   const resolvedBeliefs = beliefs.filter((b) => b.status === 'resolved').length;
+  const deprecatedBeliefs = beliefs.filter((b) => b.status === 'deprecated').length;
   const tensionDenom = resolvedBeliefs + contradictedBeliefs;
   const contradictionResolutionRate = tensionDenom > 0 ? resolvedBeliefs / tensionDenom : null;
 
@@ -186,12 +312,23 @@ export function computeCognitiveHealthDerived(snapshot) {
       : 0;
   const beliefVolatility = Math.sqrt(variance);
 
-  const openOrPursuing = curiosities.filter((c) => {
-    const s = c.status || 'open';
-    return s === 'open' || s === 'pursuing';
-  }).length;
-  const resolvedCuriosity = curiosities.filter((c) => (c.status || '') === 'resolved').length;
-  const curiosityTotal = curiosities.length;
+  const {
+    open: curiosityOpen,
+    pursuing: curiosityPursuing,
+    resolved: resolvedCuriosity,
+    dormant: curiosityDormant,
+    total: curiosityTotal,
+  } = countCuriosityItemsByUiStatus(curiosities, curiosityPursuits);
+  const openOrPursuing = curiosityOpen + curiosityPursuing;
+
+  const {
+    open: goalOpen,
+    pursuing: goalPursuing,
+    resolved: goalResolved,
+    dormant: goalDormant,
+    total: goalTotal,
+  } = countGoalItemsByUiStatus(goals, goalPursuits);
+  const goalOpenOrPursuing = goalOpen + goalPursuing;
 
   const identityStability = healthIdentityStabilityScore(biographies);
 
@@ -222,12 +359,14 @@ export function computeCognitiveHealthDerived(snapshot) {
       : []),
     { subject: 'Identity', value: Math.round(identityStability * 100) },
     { subject: 'Curiosity', value: Math.min(100, openOrPursuing * 10 + curiosityTotal * 2) },
+    { subject: 'Goals', value: Math.min(100, goalOpenOrPursuing * 10 + goalTotal * 2) },
     { subject: 'Memory', value: Math.min(100, memories.length * 2) },
     { subject: 'Emergence', value: Math.min(100, emergencesForHealth.length * 12) },
   ];
 
   const beliefTrend = healthWeekOverWeekTrend(beliefs);
   const curiosityTrend = healthWeekOverWeekTrend(curiosities);
+  const goalTrend = healthWeekOverWeekTrend(goals);
   const memoryTrend = healthWeekOverWeekTrend(memories);
   const emergenceTrend = healthWeekOverWeekTrend(emergencesForHealth);
   const runTrend = healthWeekOverWeekTrend(runs);
@@ -241,8 +380,18 @@ export function computeCognitiveHealthDerived(snapshot) {
     avgConfidence,
     beliefVolatility,
     openOrPursuing,
+    curiosityOpen,
+    curiosityPursuing,
+    curiosityDormant,
     resolvedCuriosity,
     curiosityTotal,
+    goalOpen,
+    goalPursuing,
+    goalDormant,
+    goalResolved,
+    goalTotal,
+    goalOpenOrPursuing,
+    deprecatedBeliefs,
     identityStability,
     growthData,
     radarData,
@@ -254,6 +403,7 @@ export function computeCognitiveHealthDerived(snapshot) {
     feedbackBalance: `${snapshot.positiveRatings} / ${snapshot.negativeRatings}`,
     beliefTrend,
     curiosityTrend,
+    goalTrend,
     memoryTrend,
     emergenceTrend,
     runTrend,

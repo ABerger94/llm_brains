@@ -2,7 +2,6 @@ import { useMemo } from 'react';
 import {
   getServerExecutionLayers,
   PIPELINE_LAYER_COLORS,
-  PIPELINE_METACOGNITION_END_IN_LAYER5_FRACTION,
   PIPELINE_STAGE_LABELS,
 } from '../../lib/cognitiveModules';
 import { PIPELINE_MINIMAP_STRIP_LABEL } from '../../lib/activePipelineStatusLabels';
@@ -100,9 +99,8 @@ export function PipelineStageMinimap({
             <div key={layerKey} title={segmentTitle} className="relative h-2 min-w-[2.5rem] flex-1">
               <div className={cn('absolute inset-0', segmentFillClass)} style={style} />
               <div
-                className="pointer-events-none absolute bottom-0 top-0 z-[2] w-px -translate-x-1/2 bg-foreground/40 shadow-[0_0_0_1px_hsl(var(--background)/0.85)] dark:bg-foreground/50"
-                style={{ left: `${PIPELINE_METACOGNITION_END_IN_LAYER5_FRACTION * 100}%` }}
-                title="End of Metacognition — Integration & workspace modules follow"
+                className="pointer-events-none absolute bottom-0 right-0 top-0 z-[2] w-px bg-foreground/40 shadow-[0_0_0_1px_hsl(var(--background)/0.85)] dark:bg-foreground/50"
+                title="End of Supervisors & workspace (layer 5) — Articulation follows"
                 aria-hidden
               />
             </div>

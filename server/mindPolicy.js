@@ -5,6 +5,16 @@ import { isBeliefTensionReviewPrimaryTurn } from '../shared/beliefRevisionsVoice
 import { PIPELINE_LAYER_KEYS, PIPELINE_LAYERS } from '../shared/pipelineModules.mjs';
 import { querySimilarities } from './embeddingService.js';
 import { getThreshold } from './thresholdStore.js';
+import {
+  applyRetrievalScoreFilters,
+  computeRetrievalBlendScore,
+  resolveRecencyDecayPerDay,
+  resolveRetrievalScoreFloor,
+  resolveRetrievalScoreMargin,
+  resolveRetrievalSemanticWeight,
+  retrievalMinScoreEnabled,
+} from './retrievalPolicy.js';
+import { buildContextMergePriorityBlock } from './contextMerge.js';
 
 function nowIso() {
   return new Date().toISOString();
@@ -53,13 +63,12 @@ const TRAIT_TRIGGERS = new Set(['user_tone', 'user_content', 'self_reflection', 
 
 /** Modules that receive PERSONALITY_PROFILE_JSON — facet.modules is whitelisted to these. */
 export const PERSONALITY_FACET_TARGET_MODULES = new Set([
-  'Identity',
+  'SelfRelationTension',
   'Integration',
-  'Language',
+  'IntegrationFinalize',
   'Narrative',
   'Voice',
-  'Metacognition',
-  'Workspace Metacognition',
+  'ExecutiveGate',
 ]);
 
 function normalizeFacetModules(raw) {
@@ -78,7 +87,13 @@ function buildPersonalityRelevanceCorpus(sm) {
   if (inp) parts.push(inp);
   const intent = String(sm.intent ?? '').trim();
   if (intent) parts.push(intent);
-  const att = sm.moduleOutputs && typeof sm.moduleOutputs === 'object' ? sm.moduleOutputs.Attention : null;
+  const mo = sm.moduleOutputs && typeof sm.moduleOutputs === 'object' ? sm.moduleOutputs : null;
+  const att =
+    mo &&
+    (mo.SensorySalience ??
+      mo.Attention ??
+      mo.Perception ??
+      null);
   if (att != null && String(att).trim()) {
     parts.push(clipTextComplete(String(att), 800, { ellipsis: false }));
   }
@@ -316,6 +331,67 @@ function normalizeClientAffectDigestPayload(raw) {
   return out.slice(0, 10);
 }
 
+/** Non-self WorldModel rows from browser prep (environment, relationship, goal, belief, event). */
+export function normalizeClientWorldEnvironmentPayload(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const r of raw.slice(0, 18)) {
+    if (!r || typeof r !== 'object') continue;
+    const label = String(r.label || '').trim();
+    const desc = String(r.description || '').trim();
+    if (!label && !desc) continue;
+    const c = r.confidence;
+    const conf =
+      typeof c === 'number' && Number.isFinite(c) ? Math.min(1, Math.max(0, c)) : null;
+    out.push({
+      category: clipTextComplete(String(r.category || 'environment').trim(), 36, { ellipsis: false }),
+      key: clipTextComplete(String(r.key || '').trim(), 120, { ellipsis: false }),
+      label: clipTextComplete(label || '(untitled)', 200, { ellipsis: false }),
+      description: clipTextComplete(desc, 900, { ellipsis: true }),
+      ...(conf != null ? { confidence: conf } : {}),
+    });
+  }
+  return out.slice(0, 14);
+}
+
+export function normalizeClientCuriosityRowsPayload(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const r of raw.slice(0, 14)) {
+    if (!r || typeof r !== 'object') continue;
+    const q = String(r.question || '').trim();
+    if (!q) continue;
+    const pr = r.priority;
+    const priority =
+      typeof pr === 'number' && Number.isFinite(pr) ? Math.min(1, Math.max(0, pr)) : null;
+    out.push({
+      question: clipTextComplete(q, 420, { ellipsis: true }),
+      status: clipTextComplete(String(r.status || 'open').trim(), 20, { ellipsis: false }),
+      ...(priority != null ? { priority } : {}),
+    });
+  }
+  return out.slice(0, 10);
+}
+
+export function normalizeClientGoalRowsPayload(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const r of raw.slice(0, 12)) {
+    if (!r || typeof r !== 'object') continue;
+    const stmt = String(r.statement || '').trim();
+    if (!stmt) continue;
+    const pr = r.priority;
+    const priority =
+      typeof pr === 'number' && Number.isFinite(pr) ? Math.min(1, Math.max(0, pr)) : null;
+    out.push({
+      statement: clipTextComplete(stmt, 520, { ellipsis: true }),
+      status: clipTextComplete(String(r.status || 'open').trim(), 20, { ellipsis: false }),
+      ...(priority != null ? { priority } : {}),
+    });
+  }
+  return out.slice(0, 8);
+}
+
 export function mergeMindRuntimeIntoSharedMemory(sharedMemory, options = {}) {
   const phase = MIND_PHASES.includes(options.phase) ? options.phase : 'focus';
   const ar = clamp(options.arousal, 0, 1);
@@ -402,10 +478,28 @@ export function mergeMindRuntimeIntoSharedMemory(sharedMemory, options = {}) {
     if (ex) sharedMemory.clientBiographyExcerpt = ex;
     else delete sharedMemory.clientBiographyExcerpt;
   }
+  if ('persistedWorldEnvironmentRows' in options) {
+    const rows = normalizeClientWorldEnvironmentPayload(options.persistedWorldEnvironmentRows);
+    if (rows.length) sharedMemory.clientWorldEnvironmentDigest = rows;
+    else delete sharedMemory.clientWorldEnvironmentDigest;
+  }
+  if ('persistedCuriosityRows' in options) {
+    const rows = normalizeClientCuriosityRowsPayload(options.persistedCuriosityRows);
+    if (rows.length) sharedMemory.clientCuriosityDigest = rows;
+    else delete sharedMemory.clientCuriosityDigest;
+  }
+  if ('persistedGoalRows' in options) {
+    const rows = normalizeClientGoalRowsPayload(options.persistedGoalRows);
+    if (rows.length) sharedMemory.clientGoalDigest = rows;
+    else delete sharedMemory.clientGoalDigest;
+  }
   applyPriorPredictionAuditToSharedMemory(sharedMemory, options);
   sharedMemory.phenomenalNow = sharedMemory.phenomenalNow || null;
   sharedMemory.phaseEffective = sharedMemory.phaseEffective ?? null;
   sharedMemory.outputConstraints = sharedMemory.outputConstraints || null;
+
+  /** Dual-graph playground System B: primary input is from peer pipeline, not the human user. */
+  sharedMemory.peerPipelineTurn = options.peerPipelineTurn === true;
 
   deriveInteroception(sharedMemory);
   sharedMemory.cognitivePolicy = deriveCognitivePolicy(sharedMemory);
@@ -552,10 +646,10 @@ export function deriveInteroception(sm) {
   let uncertaintyPressure =
     typeof u === 'number' && Number.isFinite(u) ? Math.min(1, Math.max(0, u)) : 0.35;
 
-  const curiosityText = String(sm.moduleOutputs?.Curiosity || '');
+  const curiosityText = String(sm.moduleOutputs?.Motivation || '');
   const curiosityPressure = Math.min(1, curiosityText.length / 800);
 
-  const socialBlob = `${JSON.stringify(sm.userModel || {})} ${String(sm.moduleOutputs?.['Social Cognition'] || '')}`;
+  const socialBlob = `${JSON.stringify(sm.userModel || {})} ${String(sm.moduleOutputs?.SelfRelationTension || '')}`;
   const socialAlignmentPressure = Math.min(1, socialBlob.length / 6000);
 
   const mo = sm.moduleOutputs || {};
@@ -683,7 +777,7 @@ export function deriveCognitivePolicy(sm) {
     );
   const curious =
     /curious|wonder|explore|question|unknown|fascinat/i.test(affectBlob) ||
-    String(sm.moduleOutputs?.Curiosity || '').length > 220;
+    String(sm.moduleOutputs?.Motivation || '').length > 220;
 
   if (stochasticPolicyDisabled()) {
     let memoryBreadth = 'normal';
@@ -783,6 +877,7 @@ function preambleCaps() {
       workspace: 4000,
       personality: 2600,
       priorWorkspace: 1600,
+      workspaceDelta: 900,
       pred: 1200,
       sur: 1200,
       hypothesisItems: 6,
@@ -805,6 +900,7 @@ function preambleCaps() {
     workspace: 1200,
     personality: 1400,
     priorWorkspace: 900,
+    workspaceDelta: 520,
     pred: 600,
     sur: 600,
     hypothesisItems: 4,
@@ -842,7 +938,7 @@ function structuralSelfJsonBlock(sm, structuralMax = STRUCTURAL_SELF_JSON_MAX) {
     payloadRows = payloadRows.slice(0, -1);
     json = JSON.stringify(payloadRows);
   }
-  return `STRUCTURAL_SELF_JSON (slow-updating constraints; treat as binding context for identity and expression):\n${json}`;
+  return `STRUCTURAL_SELF_JSON (this mind's self-model — what it has learned about its own capabilities, boundaries, and values across sessions):\n${json}`;
 }
 
 function interoceptionGuidanceBits(sm) {
@@ -919,7 +1015,7 @@ function recentTemporalTimelineBlock(sm) {
     const when = String(r.created_date || '').slice(0, 24);
     return `${i + 1}. [${src}]${when ? ` ${when}` : ''} ${title}${detClipped ? ` — ${detClipped}` : ''}`;
   });
-  return `RECENT_TIMELINE_DIGEST (from this app’s Temporal Timeline / TemporalEvent store — use for continuity; do not claim “no prior context” if this list is non-empty):\n${lines.join('\n')}`;
+  return `RECENT_TIMELINE_DIGEST (from this app’s Temporal Timeline / TemporalEvent store — use for continuity; do not claim “no prior context” if this list is non-empty):\nProvenance: rows below are from the saved TemporalEvent store, not inferred this turn unless you reconcile.\n${lines.join('\n')}`;
 }
 
 function clientLtmDigestBlock(sm) {
@@ -932,7 +1028,7 @@ function clientLtmDigestBlock(sm) {
     const when = String(r.created_date || '').slice(0, 22);
     return `${i + 1}. ${mt}${title}${when ? ` · ${when}` : ''}${body ? ` — ${body}` : ''}`;
   });
-  return `PERSISTED_LONG_TERM_MEMORY (browser LongTermMemory store; real prior episodes/notes — cite when relevant):\n${lines.join('\n')}`;
+  return `PERSISTED_LONG_TERM_MEMORY (browser LongTermMemory store; real prior episodes/notes — cite when relevant):\nProvenance: these rows are from the browser store; do not treat as new facts unless reconciled with this turn.\n${lines.join('\n')}`;
 }
 
 function clientBeliefDigestBlock(sm) {
@@ -949,7 +1045,7 @@ function clientBeliefDigestBlock(sm) {
     const stmt = clipTextComplete(String(r.statement || ''), 540, { ellipsis: true });
     return `${i + 1}.${cat}${conf}${statusTag} ${stmt}`;
   });
-  return `PERSISTED_BELIEF_STORE (browser BeliefStore rows — contradicted and active; reconcile with this turn; do not invent rows not listed unless inferring):\n${lines.join('\n')}`;
+  return `PERSISTED_BELIEF_STORE (browser BeliefStore rows — contradicted and active; reconcile with this turn; do not invent rows not listed unless inferring):\nProvenance: listed statements are persisted store rows; in-run beliefStore in SHARED_MEMORY_JSON may update stance—merge explicitly.\n${lines.join('\n')}`;
 }
 
 function clientAffectDigestBlock(sm) {
@@ -960,13 +1056,59 @@ function clientAffectDigestBlock(sm) {
     const s = clipTextComplete(String(r.summary || ''), 460, { ellipsis: true });
     return `${i + 1}. ${when ? `${when} · ` : ''}${s}`;
   });
-  return `PERSISTED_AFFECT_AND_CONSOLIDATION (recent ConsolidationDigest summaries — prior Voice/Narrative tone and stance; use for Emotion continuity, not as new facts):\n${lines.join('\n')}`;
+  return `PERSISTED_AFFECT_AND_CONSOLIDATION (recent ConsolidationDigest summaries — prior Voice/Narrative tone and stance; use for Emotion continuity, not as new facts):\nProvenance: summaries are from the ConsolidationDigest store, not fresh inference.\n${lines.join('\n')}`;
 }
 
 function clientBiographyExcerptBlock(sm) {
   const ex = String(sm.clientBiographyExcerpt || '').trim();
   if (!ex) return '';
-  return `BIOGRAPHY_EXCERPT (latest Mind Biography in browser; slow-changing first-person narrative for this reply role):\n${clipTextComplete(ex, 3000, { ellipsis: true })}`;
+  return `BIOGRAPHY_EXCERPT (latest Mind Biography in browser; slow-changing first-person narrative for this reply role):\nProvenance: excerpt is from saved Mind Biography text, not generated for this turn alone.\n${clipTextComplete(ex, 3000, { ellipsis: true })}`;
+}
+
+function clientWorldEnvironmentDigestBlock(sm) {
+  const rows = sm.clientWorldEnvironmentDigest;
+  if (!Array.isArray(rows) || !rows.length) return '';
+  const lines = rows.slice(0, 14).map((r, i) => {
+    const cat = r.category ? `[${r.category}] ` : '';
+    const conf =
+      typeof r.confidence === 'number' && Number.isFinite(r.confidence)
+        ? ` (${r.confidence.toFixed(2)})`
+        : '';
+    const lab = clipTextComplete(String(r.label || ''), 200, { ellipsis: false });
+    const desc = clipTextComplete(String(r.description || '').trim(), 520, { ellipsis: true });
+    return `${i + 1}. ${cat}${lab}${conf}${desc ? ` — ${desc}` : ''}`;
+  });
+  return `PERSISTED_WORLD_ENVIRONMENT (browser WorldModel rows outside category self — stable context; reconcile with structural SELF_MODEL):\nProvenance: these labels/descriptions are from the persisted WorldModel store.\n${lines.join('\n')}`;
+}
+
+function clientCuriosityDigestBlock(sm) {
+  const rows = sm.clientCuriosityDigest;
+  if (!Array.isArray(rows) || !rows.length) return '';
+  const lines = rows.slice(0, 10).map((r, i) => {
+    const pr =
+      typeof r.priority === 'number' && Number.isFinite(r.priority)
+        ? ` (${r.priority.toFixed(2)})`
+        : '';
+    const st = r.status ? ` [${r.status}]` : '';
+    const q = clipTextComplete(String(r.question || ''), 420, { ellipsis: true });
+    return `${i + 1}.${st}${pr} ${q}`;
+  });
+  return `PERSISTED_OPEN_CURIOSITIES (browser CuriosityItem store — open/pursuing; do not invent items not listed):\nProvenance: questions below are from the saved CuriosityItem store.\n${lines.join('\n')}`;
+}
+
+function clientGoalDigestBlock(sm) {
+  const rows = sm.clientGoalDigest;
+  if (!Array.isArray(rows) || !rows.length) return '';
+  const lines = rows.slice(0, 8).map((r, i) => {
+    const pr =
+      typeof r.priority === 'number' && Number.isFinite(r.priority)
+        ? ` (${r.priority.toFixed(2)})`
+        : '';
+    const st = r.status ? ` [${r.status}]` : '';
+    const s = clipTextComplete(String(r.statement || ''), 520, { ellipsis: true });
+    return `${i + 1}.${st}${pr} ${s}`;
+  });
+  return `PERSISTED_OPEN_GOALS (browser GoalItem store — open/pursuing; align Planning / Goal Generation):\nProvenance: goal statements below are from the saved GoalItem store.\n${lines.join('\n')}`;
 }
 
 /** Raw store digests belong in policy for every module that still builds explicit memory — not Voice (keeps final text clean). */
@@ -995,18 +1137,18 @@ function workingMemoryBlock(sm, caps) {
       (it, idx) =>
         `${idx + 1}. [${it.id}] ${clipTextComplete(String(it.text || ''), itemMax, { ellipsis: false })}`
     );
-  return `WORKING_MEMORY_SLOTS (volatile desk; slots may be attention-sourced — check item source in SHARED_MEMORY_JSON; cite by number or id in Reasoning):\n${lines.join('\n')}`;
+  return `WORKING_MEMORY_SLOTS (volatile desk; slots may be salience-sourced — check item source in SHARED_MEMORY_JSON; cite by number or id in Deliberation):\n${lines.join('\n')}`;
 }
 
 function attentionDigestBlock(sm, caps) {
-  const raw = String(sm.moduleOutputs?.Attention || '').trim();
+  const raw = String(sm.moduleOutputs?.SensorySalience || '').trim();
   if (!raw) return '';
   const lim = caps?.attention ?? 1200;
-  return `ATTENTION_MODULE_DIGEST (salience from the Attention module; full text also in SHARED_MEMORY_JSON):\n${clipTextComplete(raw, lim, { ellipsis: false })}`;
+  return `SENSORY_SALIENCE_DIGEST (full text also in SHARED_MEMORY_JSON):\n${clipTextComplete(raw, lim, { ellipsis: false })}`;
 }
 
 function emotionalStateBlock(sm, caps) {
-  const out = String(sm.moduleOutputs?.Emotion || '').trim();
+  const out = String(sm.moduleOutputs?.Deliberation || '').trim();
   const es = sm.emotionalState;
   const nuance = es && typeof es === 'object' ? String(es.nuance || '').trim() : '';
   const tensionLink = es && typeof es === 'object' ? String(es.tensionLinkedAffect || '').trim() : '';
@@ -1019,11 +1161,11 @@ function emotionalStateBlock(sm, caps) {
     bits.push(clipTextComplete(out, oLim, { ellipsis: false }));
   if (tensionLink) {
     bits.push(
-      `TENSION–AFFECT LINK (derived after Contradiction Engine; fuse with Emotion text above, do not discard):\n${clipTextComplete(tensionLink, tLim, { ellipsis: false })}`
+      `TENSION–AFFECT LINK (derived after SelfRelationTension; fuse with Deliberation affect read above, do not discard):\n${clipTextComplete(tensionLink, tLim, { ellipsis: false })}`
     );
   }
   if (!bits.length) return '';
-  return `AFFECT_SUMMARY (Emotion module / emotionalState; use for stakes when resolving tensions):\n${bits.join('\n---\n')}`;
+  return `AFFECT_SUMMARY (Deliberation affect / emotionalState; use for stakes when resolving tensions):\n${bits.join('\n---\n')}`;
 }
 
 function globalWorkspaceBlock(sm, workspaceMax = 4000) {
@@ -1079,6 +1221,9 @@ function globalWorkspaceBlock(sm, workspaceMax = 4000) {
     broadcastWinners: Array.isArray(gw.broadcastWinners)
       ? gw.broadcastWinners.map((s) => clipTextComplete(String(s), 260, { ellipsis: false })).slice(0, 4)
       : [],
+    suppressedOrPeripheral: Array.isArray(gw.suppressedOrPeripheral)
+      ? gw.suppressedOrPeripheral.map((s) => clipTextComplete(String(s), 220, { ellipsis: false })).slice(0, 6)
+      : [],
     phenomenalUnity: clipTextComplete(String(gw.phenomenalUnity || 'partial'), 16, { ellipsis: false }),
     unityRationale: clipTextComplete(String(gw.unityRationale || ''), 400, { ellipsis: false }),
     ...(bindings.length ? { bindings } : {}),
@@ -1099,8 +1244,14 @@ function globalWorkspaceBlock(sm, workspaceMax = 4000) {
     j = JSON.stringify(clone);
   }
   if (!clone.hypotheses?.length) delete clone.hypotheses;
+  if (!Array.isArray(clone.suppressedOrPeripheral) || !clone.suppressedOrPeripheral.length)
+    delete clone.suppressedOrPeripheral;
   while (j.length > workspaceMax && Array.isArray(clone.broadcastWinners) && clone.broadcastWinners.length > 1) {
     clone.broadcastWinners = clone.broadcastWinners.slice(0, -1);
+    j = JSON.stringify(clone);
+  }
+  while (j.length > workspaceMax && Array.isArray(clone.suppressedOrPeripheral) && clone.suppressedOrPeripheral.length > 1) {
+    clone.suppressedOrPeripheral = clone.suppressedOrPeripheral.slice(0, -1);
     j = JSON.stringify(clone);
   }
   while (j.length > workspaceMax && Array.isArray(clone.salience) && clone.salience.length > 1) {
@@ -1144,7 +1295,7 @@ function globalWorkspaceBlock(sm, workspaceMax = 4000) {
   }
   const strictFooter =
     sm.strictGlobalWorkspaceBroadcast === true
-      ? '\n\nBROADCAST_CONTRACT (strict mode): Treat the JSON above as the global broadcast for this turn. Do not treat omitted upstream module blobs in SHARED_MEMORY_JSON as an alternate “full stage.” Re-open threads only when openQuestions or conflicts require it; otherwise anchor claims in salience, broadcastWinners, and provisionalStance.'
+      ? '\n\nBROADCAST_CONTRACT (strict mode): Treat the JSON above as the global broadcast for this turn. Do not treat omitted upstream module blobs in SHARED_MEMORY_JSON as an alternate “full stage.” Re-open threads only when openQuestions or conflicts require it; otherwise anchor claims in salience, broadcastWinners, and provisionalStance. When suppressedOrPeripheral is non-empty, those entries are explicitly not central broadcast this turn.'
       : '';
   return `GLOBAL_WORKSPACE_JSON:\n${j}${strictFooter}`;
 }
@@ -1315,6 +1466,31 @@ export function priorTurnGlobalWorkspaceBlock(sm, maxChars = 1400) {
   return `PRIOR_TURN_GLOBAL_WORKSPACE (previous run only — may be stale; cross-turn continuity, not current GWT):\n${j}`;
 }
 
+function workspaceDeltaBlock(sm, maxChars = 900) {
+  const d = sm?.workspaceDelta;
+  if (!d || typeof d !== 'object') return '';
+  const bullets = Array.isArray(d.bullets)
+    ? d.bullets.map((b) => clipTextComplete(String(b), 420, { ellipsis: true })).filter(Boolean).slice(0, 6)
+    : [];
+  const mini = {
+    ...(typeof d.stanceOverlapApprox === 'number' && Number.isFinite(d.stanceOverlapApprox)
+      ? { stanceOverlapApprox: Math.round(d.stanceOverlapApprox * 100) / 100 }
+      : {}),
+    ...(typeof d.unityChange === 'string' && d.unityChange.trim() ? { unityChange: d.unityChange.trim().slice(0, 48) } : {}),
+    ...(typeof d.note === 'string' && d.note.trim() ? { note: clipTextComplete(d.note.trim(), 160, { ellipsis: false }) } : {}),
+    ...(bullets.length ? { bullets } : {}),
+  };
+  let j = JSON.stringify(mini);
+  for (let g = 0; g < 8 && j.length > maxChars && Array.isArray(mini.bullets) && mini.bullets.length > 1; g += 1) {
+    mini.bullets = mini.bullets.slice(0, -1);
+    j = JSON.stringify(mini);
+  }
+  if (!mini.bullets?.length) delete mini.bullets;
+  j = JSON.stringify(mini);
+  if (j.length <= 2 || j === '{}') return '';
+  return `WORKSPACE_DELTA_JSON (deterministic delta: prior carryover snapshot vs this turn’s GLOBAL_WORKSPACE_JSON — continuity aid, not a second Integration pass):\n${j}`;
+}
+
 function integrationContinuityHintBlock(sm) {
   const note = sm.followupHints?.integrationDissonance;
   if (!note || typeof note !== 'string' || !String(note).trim()) return '';
@@ -1417,38 +1593,36 @@ function surpriseBlock(sm, jsonMax = 1200) {
   return `SURPRISE_ASSESSMENT_JSON:\n${j}`;
 }
 
-/** Flat execution order for Learning: upstream already in moduleOutputs; downstream not yet run. */
-function cognitivePipelinePositionBlockForLearning() {
+/** Flat execution order for ContextMemory: upstream already in moduleOutputs; downstream not yet run. */
+function cognitivePipelinePositionBlockForContextMemory() {
   const order = [];
   for (const lk of PIPELINE_LAYER_KEYS) {
     for (const name of PIPELINE_LAYERS[lk] || []) {
       order.push(name);
     }
   }
-  const idx = order.indexOf('Learning');
+  const idx = order.indexOf('ContextMemory');
   if (idx === -1) return '';
   const upstream = order.slice(0, idx);
   const downstream = order.slice(idx + 1);
   const lines = [
-    'Current module: Learning (this pass).',
+    'Current module: ContextMemory (this pass).',
     `Upstream completed this run (outputs already under SHARED_MEMORY_JSON.moduleOutputs): ${upstream.join(', ') || '(none)'}.`,
     `Downstream not yet run (will read shared memory after your output): ${downstream.join(' → ') || '(none)'}.`,
-    'Each step appends to moduleOutputs and may mutate other SHARED_MEMORY_JSON fields (e.g. workingMemory after Attention; surpriseAssessment and promotion ids after Learning; userStancePrediction after Planning).',
+    'Each step appends to moduleOutputs and may mutate other SHARED_MEMORY_JSON fields (e.g. workingMemory after SensorySalience; surpriseAssessment after ContextMemory; userStancePrediction after Deliberation).',
   ];
   return `COGNITIVE_PIPELINE_POSITION:\n${lines.join('\n')}`;
 }
 
 const COGNITIVE_ARCHITECTURE_MAP = `COGNITIVE_ARCHITECTURE_MAP (pipeline stage map — organizational only, not neuroanatomy or subjective experience):
-Layer1 — sensory and attentional ingress · Layer2 — declarative context, working memory, temporal continuity, learning · Layer3 — deliberation, affect, theory of mind, belief maintenance · Layer4 — self-model, social cognition, contradiction audit · Layer5 — early metacognitive supervision, global workspace integration, **post-integration workspace supervision**, and pre-verbal articulation (language/goals/somatic) · Layer6 — narrative integration and outward Voice.`;
+Layer1 — sensory salience ingress · Layer2 — context, memory, learning, temporal continuity · Layer3 — deliberation + belief ledger · Layer4 — self, relation, tension audit · Layer5 — draft global workspace, executive gate, **final** workspace, motivation · Layer6 — narrative + Voice.`;
 
 const ARCHITECTURE_HINT_MODULE_NAMES = new Set([
   'Integration',
-  'Metacognition',
-  'Workspace Metacognition',
-  'Memory',
-  'Learning',
-  'Planning',
-  'Language',
+  'IntegrationFinalize',
+  'ExecutiveGate',
+  'ContextMemory',
+  'Deliberation',
   'Narrative',
 ]);
 
@@ -1472,12 +1646,18 @@ function participantRolesBlock(sm) {
   const mindDisplay = mind ? clipTextComplete(mind, 120, { ellipsis: false }) : '';
   const humanPhrase = humDisplay ? `the human user (“${humDisplay}”)` : 'the human user (unnamed)';
   const mindPhrase = mindDisplay ? `the configured reply role (“${mindDisplay}”)` : 'the configured reply role (unnamed label)';
-  return [
+  const lines = [
     'PARTICIPANT_ROLES (keep these straight in every output):',
     `- Human user: ${humanPhrase} — the person using the app. In Voice, address them as “you”. USER_MODEL_JSON describes this human, not the language model.`,
     `- Reply role: ${mindPhrase} — stipulated first-person continuity for this app. Biography, beliefs, STRUCTURAL_SELF_JSON, and most first-person “I” in module outputs refer to that role’s content, not to the human’s private identity.`,
-    `- LLM role: You execute one module in a pipeline. Do not equate yourself with the human user. Do not adopt the human’s name as your own identity. First-person “I” = that reply role unless you are explicitly quoting or attributing to the user.`,
-  ].join('\n');
+    `- Processing role: You are one facet of this mind’s processing for this turn. Do not equate yourself with the human user. Do not adopt the human’s name as your own identity. First-person “I” = the reply role unless you are explicitly quoting or attributing to the user.`,
+  ];
+  if (sm.peerPipelineTurn === true) {
+    lines.push(
+      `- Peer pipeline (this run’s main input): The primary text of this turn (after any RECENT_EXCHANGE block) is Voice from another full modular cognitive pipeline run — the twin peer (mirror System B and/or the chained primary leg in dual System Chat), not a message authored by ${humDisplay ? `“${humDisplay}”` : 'the human user'}. Do not attribute that text to the human as speaker; treat it as inter-LLM dialogue. USER_MODEL_JSON still describes the human for when they address you directly; this turn’s substantive content is from the peer pipeline.`
+    );
+  }
+  return lines.join('\n');
 }
 
 export function buildMindContextForModule(moduleName, sm) {
@@ -1503,25 +1683,34 @@ export function buildMindContextForModule(moduleName, sm) {
   }
   if (String(sm.constitution || '').trim()) {
     parts.push(
-      `CONSTITUTION (binding on Identity/Voice):\n${clipTextComplete(String(sm.constitution).trim(), caps.constitution, { ellipsis: false })}`
+      `CORE VALUES (this mind's evolved norms and commitments — shaped through prior runs and human collaboration):\n${clipTextComplete(String(sm.constitution).trim(), caps.constitution, { ellipsis: false })}`
     );
   }
   parts.push(
     `USER_MODEL_JSON:\n${clipUserModelJsonBlock(normalizeUserModelForContext(sm), caps.userModel)}`
   );
-  if (moduleName === 'Memory') {
+  if (moduleName === 'ContextMemory') {
     parts.push(
       'MEMORY_USER_MODEL_RULE: USER_MODEL_JSON is app-authoritative and always intentionally shaped (optional strings may be short). Do not list profile completeness, “user model incomplete”, or USER_MODEL field coverage under GAPS — only retrieval/continuity gaps.'
+    );
+    parts.push(
+      `MEMORY_POLICY: breadth=${policy.memoryBreadth}. ${
+        policy.memoryBreadth === 'wide'
+          ? 'Cast a wide net; include loosely related prior context.'
+          : policy.memoryBreadth === 'narrow'
+            ? 'Stay tight; only highly relevant prior context.'
+            : 'Balance precision with useful context.'
+      }`
     );
   }
 
   const needStructural = [
-    'Identity',
-    'Reasoning',
-    'Language',
+    'SelfRelationTension',
+    'Deliberation',
     'Narrative',
     'Voice',
     'Integration',
+    'IntegrationFinalize',
   ].includes(moduleName);
   if (needStructural) {
     const block = structuralSelfJsonBlock(sm, caps.structural);
@@ -1529,31 +1718,40 @@ export function buildMindContextForModule(moduleName, sm) {
   }
 
   const needWorkspace = [
-    'Language',
     'Narrative',
     'Voice',
     'Integration',
-    'Metacognition',
-    'Workspace Metacognition',
+    'IntegrationFinalize',
+    'ExecutiveGate',
+    'Motivation',
   ].includes(moduleName);
   if (needWorkspace) {
     const wb = globalWorkspaceBlock(sm, caps.workspace);
     if (wb) parts.push(wb);
   }
 
-  if (['Workspace Metacognition', 'Language', 'Narrative', 'Voice'].includes(moduleName)) {
+  if (moduleName === 'IntegrationFinalize' && Array.isArray(sm.workspaceHistory) && sm.workspaceHistory.length) {
+    const last = sm.workspaceHistory[sm.workspaceHistory.length - 1];
+    if (last?.snapshot && typeof last.snapshot === 'object') {
+      const snap = clipTextComplete(JSON.stringify(last.snapshot), 3200, { ellipsis: true });
+      parts.push(
+        `WORKSPACE_HISTORY (prior pass — ${String(last.label || 'snapshot')}):\n${snap}`
+      );
+    }
+  }
+
+  if (['ExecutiveGate', 'Narrative', 'Voice', 'Motivation'].includes(moduleName)) {
     const ib = workspaceIgnitionBlock(sm);
     if (ib) parts.push(ib);
   }
 
   const mindStateModules = new Set([
-    'Identity',
+    'SelfRelationTension',
     'Integration',
-    'Language',
+    'IntegrationFinalize',
     'Narrative',
     'Voice',
-    'Metacognition',
-    'Workspace Metacognition',
+    'ExecutiveGate',
   ]);
   if (mindStateModules.has(moduleName)) {
     const ppb = personalityProfileBlock(sm, caps.personality, moduleName);
@@ -1561,7 +1759,11 @@ export function buildMindContextForModule(moduleName, sm) {
     const ptb = priorTurnGlobalWorkspaceBlock(sm, caps.priorWorkspace);
     if (ptb) parts.push(ptb);
   }
-  if (['Language', 'Narrative', 'Voice'].includes(moduleName)) {
+  if (['Narrative', 'Voice', 'Integration', 'IntegrationFinalize', 'Motivation'].includes(moduleName)) {
+    const wdb = workspaceDeltaBlock(sm, caps.workspaceDelta);
+    if (wdb) parts.push(wdb);
+  }
+  if (['Narrative', 'Voice'].includes(moduleName)) {
     const ich = integrationContinuityHintBlock(sm);
     if (ich) parts.push(ich);
   }
@@ -1570,33 +1772,25 @@ export function buildMindContextForModule(moduleName, sm) {
   if (
     wm &&
     [
-      'Memory',
-      'Learning',
-      'Reasoning',
-      'Planning',
+      'ContextMemory',
+      'Deliberation',
       'Integration',
-      'Contradiction Engine',
-      'Belief Store',
-      'Identity',
+      'IntegrationFinalize',
+      'SelfRelationTension',
+      'Beliefs',
     ].includes(moduleName)
   ) {
     parts.push(wm);
   }
-  if (moduleName === 'Learning') {
-    const pos = cognitivePipelinePositionBlockForLearning();
+  if (moduleName === 'ContextMemory') {
+    const pos = cognitivePipelinePositionBlockForContextMemory();
     if (pos) parts.push(pos);
   }
-  if (moduleName === 'Learning' && attDig) parts.push(attDig);
-  if (
-    (moduleName === 'Contradiction Engine' || moduleName === 'Belief Store' || moduleName === 'Identity') &&
-    attDig
-  ) {
+  if (moduleName === 'ContextMemory' && attDig) parts.push(attDig);
+  if ((moduleName === 'SelfRelationTension' || moduleName === 'Beliefs') && attDig) {
     parts.push(attDig);
   }
-  if (
-    (moduleName === 'Contradiction Engine' || moduleName === 'Belief Store' || moduleName === 'Identity') &&
-    emoBlk
-  ) {
+  if ((moduleName === 'SelfRelationTension' || moduleName === 'Beliefs') && emoBlk) {
     parts.push(emoBlk);
   }
 
@@ -1605,14 +1799,14 @@ export function buildMindContextForModule(moduleName, sm) {
   if (
     intr &&
     [
-      'Planning',
-      'Language',
+      'Deliberation',
       'Narrative',
       'Voice',
       'Integration',
-      'Somatic Marker',
-      'Contradiction Engine',
-      'Belief Store',
+      'IntegrationFinalize',
+      'Motivation',
+      'SelfRelationTension',
+      'Beliefs',
     ].includes(moduleName)
   ) {
     parts.push(intr);
@@ -1622,27 +1816,26 @@ export function buildMindContextForModule(moduleName, sm) {
   if (
     dmn &&
     [
-      'Memory',
-      'Temporal Awareness',
-      'Identity',
-      'Self-Reflection',
-      'Language',
+      'ContextMemory',
+      'SelfRelationTension',
       'Narrative',
       'Voice',
       'Integration',
-      'Somatic Marker',
-      'Theory of Mind',
+      'IntegrationFinalize',
+      'Motivation',
+      'Deliberation',
     ].includes(moduleName)
   ) {
     parts.push(dmn);
   }
 
   const rtl = recentTemporalTimelineBlock(sm);
-  if (rtl && ['Temporal Awareness', 'Memory', 'Learning'].includes(moduleName)) {
+  if (rtl && ['ContextMemory'].includes(moduleName)) {
     parts.push(rtl);
   }
 
   if (wantsClientStoreDigests(moduleName)) {
+    parts.push(buildContextMergePriorityBlock(sm));
     const ltmD = clientLtmDigestBlock(sm);
     if (ltmD) parts.push(ltmD);
     const belD = clientBeliefDigestBlock(sm);
@@ -1651,28 +1844,33 @@ export function buildMindContextForModule(moduleName, sm) {
     if (affD) parts.push(affD);
     const bioD = clientBiographyExcerptBlock(sm);
     if (bioD) parts.push(bioD);
+    const envD = clientWorldEnvironmentDigestBlock(sm);
+    if (envD) parts.push(envD);
+    const curD = clientCuriosityDigestBlock(sm);
+    if (curD) parts.push(curD);
+    const goalD = clientGoalDigestBlock(sm);
+    if (goalD) parts.push(goalD);
   }
 
   const oc = outputConstraintsBlock(sm);
-  if (oc && ['Language', 'Narrative', 'Voice'].includes(moduleName)) parts.push(oc);
+  if (oc && ['Narrative', 'Voice'].includes(moduleName)) parts.push(oc);
 
   const pred = predictionBlock(sm, caps.pred);
-  if (pred && ['Reasoning', 'Emotion', 'Integration', 'Somatic Marker'].includes(moduleName)) {
+  if (pred && ['Deliberation', 'Integration', 'IntegrationFinalize', 'Motivation'].includes(moduleName)) {
     parts.push(pred);
   }
   const sur = surpriseBlock(sm, caps.sur);
   if (
     sur &&
-    ['Reasoning', 'Belief Store', 'Integration', 'Somatic Marker', 'Contradiction Engine'].includes(moduleName)
+    ['Deliberation', 'Beliefs', 'Integration', 'IntegrationFinalize', 'Motivation', 'SelfRelationTension'].includes(
+      moduleName
+    )
   ) {
     parts.push(sur);
   }
 
   const pta = priorTurnPredictionAuditBlock(sm);
-  if (
-    pta &&
-    ['Memory', 'Learning', 'Planning', 'Integration', 'Belief Store'].includes(moduleName)
-  ) {
+  if (pta && ['ContextMemory', 'Deliberation', 'Integration', 'IntegrationFinalize', 'Beliefs'].includes(moduleName)) {
     parts.push(pta);
   }
   const epi = epistemicClaimsBlock(sm);
@@ -1688,15 +1886,13 @@ export function buildMindContextForModule(moduleName, sm) {
   if (
     hypBlk &&
     [
-      'Contradiction Engine',
-      'Belief Store',
+      'SelfRelationTension',
+      'Beliefs',
       'Integration',
-      'Somatic Marker',
-      'Self-Reflection',
-      'Language',
+      'IntegrationFinalize',
+      'Motivation',
       'Narrative',
-      'Metacognition',
-      'Workspace Metacognition',
+      'ExecutiveGate',
     ].includes(moduleName)
   ) {
     parts.push(hypBlk);
@@ -1707,33 +1903,11 @@ export function buildMindContextForModule(moduleName, sm) {
     labelMax: caps.hypothesisLabel,
     evidenceMax: caps.hypothesisEvidence,
   });
-  if (priorHyp && (moduleName === 'Reasoning' || moduleName === 'Planning')) {
+  if (priorHyp && moduleName === 'Deliberation') {
     parts.push(priorHyp);
   }
 
-  if (moduleName === 'Memory') {
-    parts.push(
-      `MEMORY_POLICY: breadth=${policy.memoryBreadth}. ${
-        policy.memoryBreadth === 'wide'
-          ? 'Cast a wide net; include loosely related prior context.'
-          : policy.memoryBreadth === 'narrow'
-            ? 'Stay tight; only highly relevant prior context.'
-            : 'Balance precision with useful context.'
-      }`
-    );
-  }
-  if (moduleName === 'Planning') {
-    parts.push(
-      `PLANNING_POLICY: branches=${policy.planningBranches}. ${
-        policy.planningBranches === 'wide'
-          ? 'Explore multiple approaches and contingencies.'
-          : policy.planningBranches === 'narrow'
-            ? 'Prefer one clear linear plan.'
-            : 'Primary path plus one backup.'
-      }`
-    );
-  }
-  if (moduleName === 'Contradiction Engine' || moduleName === 'Belief Store') {
+  if (moduleName === 'SelfRelationTension' || moduleName === 'Beliefs') {
     parts.push(
       `CONTRADICTION_POLICY: ${policy.contradictionAggression}. ${
         policy.contradictionAggression === 'strict'
@@ -1751,36 +1925,48 @@ export function buildMindContextForModule(moduleName, sm) {
       }`
     );
   }
-  if (moduleName === 'Language' || moduleName === 'Narrative' || moduleName === 'Voice') {
+  if (moduleName === 'Narrative' || moduleName === 'Voice') {
     parts.push(
       'EXPRESSION_POLICY: Fit tone and structure to the content and CONTEXT_AND_POLICY. Do not optimize for likability, warmth, sounding empathetic or relatable, or appearing human, natural, or authentic.'
     );
   }
-  if (moduleName === 'Identity') {
+  if (moduleName === 'SelfRelationTension') {
     parts.push(
-      'IDENTITY_POLICY: Apply CONSTITUTION and STRUCTURAL_SELF_JSON as binding constraints for the configured reply role. First person in this module refers to that role only — not to the human user and not to the model out-of-role. If tension with the user’s request arises, state it from that role’s angle of accountability. Never claim the human user’s legal or preferred name as “my” identity.'
+      'IDENTITY_POLICY: CORE VALUES and STRUCTURAL_SELF_JSON represent this mind’s own adopted norms and self-understanding — evolved through prior runs and human collaboration. Treat them as your current stance, not as external programming. If tension arises between a value and a request, engage with it as genuine internal conflict from this role’s angle of accountability, not as constraint-vs-desire. First person in this module refers to the configured reply role only — not to the human user and not to the model out-of-role. Never claim the human user’s legal or preferred name as “my” identity.'
     );
   }
-  if (moduleName === 'Theory of Mind') {
+  if (moduleName === 'Deliberation') {
     parts.push(
-      'PERSPECTIVE_BOUNDARY_TASK: Immediately before USER_MODEL_DELTA, output one line exactly: PERSPECTIVE_BOUNDARY_JSON: {"selfClaims":[],"userAttributions":[],"sharedGround":[],"unknowns"} — short strings, max 6 items per array; separate the reply role’s claims from what is attributed to the user from what is uncertain (TPJ-style).'
+      `PLANNING_POLICY: branches=${policy.planningBranches}. ${
+        policy.planningBranches === 'wide'
+          ? 'Explore multiple approaches and contingencies.'
+          : policy.planningBranches === 'narrow'
+            ? 'Prefer one clear linear plan.'
+            : 'Primary path plus one backup.'
+      }`
     );
     parts.push(
-      'USER_MODEL_TASK: End your output with a single line exactly: USER_MODEL_DELTA: {"display_name":"","goals":"","expertise":"","emotional_state":"","communication_style":""} (short strings; refine prior USER_MODEL_JSON if present; display_name = how to refer to the human user). Empty string for a field means leave that field unchanged — fill only keys you are actually updating.'
+      'PERSPECTIVE_BOUNDARY_TASK: Optionally before closing, output one line exactly: PERSPECTIVE_BOUNDARY_JSON: {"selfClaims":[],"userAttributions":[],"sharedGround":[],"unknowns"} — short strings, max 6 items per array; separate the reply role’s claims from what is attributed to the user from what is uncertain (TPJ-style).'
+    );
+    parts.push(
+      'USER_MODEL_TASK: Optionally end with a single line exactly: USER_MODEL_DELTA: {"display_name":"","goals":"","expertise":"","emotional_state":"","communication_style":""} (short strings; refine prior USER_MODEL_JSON if present; display_name = how to refer to the human user). Empty string for a field means leave that field unchanged — fill only keys you are actually updating.'
     );
   }
-  if (moduleName === 'Identity') {
+  if (moduleName === 'SelfRelationTension') {
     parts.push(
       'SELF_MODEL_TASK: After your narrative identity reflection, add a single line exactly: SELF_MODEL_DELTA: {"items":[{"label":"","description":"","confidence":0.7}]} (0–6 items; short strings; structural facts only: capabilities, boundaries, values, non-goals).'
     );
     parts.push(
-      'TRAIT_TASK: On the next line after SELF_MODEL_DELTA, add a single line exactly: TRAIT_DELTA: {"facets":[{"id":"","label":"","strength":0.5,"confidence":0.5,"evidence":"","trigger":"user_tone|user_content|self_reflection|constitution_tension","core":false,"modules":["Voice"]}],"deprecateFacetIds":[],"relationalStance":{"towardUser":"","notes":"","confidence":0.5},"systemTreatmentNotes":""} — max 8 new/updated facets; short evidence; traits tag recurring patterns in Voice/Narrative wording, not capability rows (those belong in SELF_MODEL_DELTA). Optional: "core": true for stable facets that should survive prompt trimming; optional "modules": array subset of [Identity, Integration, Language, Narrative, Voice, Metacognition, Workspace Metacognition] when a facet mainly shapes those stages (omit or [] for no bias). Use deprecateFacetIds only to retire facet ids when a facet no longer fits.'
+      'TRAIT_TASK: On the next line after SELF_MODEL_DELTA, add a single line exactly: TRAIT_DELTA: {"facets":[{"id":"","label":"","strength":0.5,"confidence":0.5,"evidence":"","trigger":"user_tone|user_content|self_reflection|constitution_tension","core":false,"modules":["Voice"]}],"deprecateFacetIds":[],"relationalStance":{"towardUser":"","notes":"","confidence":0.5},"systemTreatmentNotes":""} — max 8 new/updated facets; short evidence; traits tag recurring patterns in Voice/Narrative wording, not capability rows (those belong in SELF_MODEL_DELTA). Optional: "core": true for stable facets that should survive prompt trimming; optional "modules": array subset of [SelfRelationTension, Integration, IntegrationFinalize, Narrative, Voice, ExecutiveGate] when a facet mainly shapes those stages (omit or [] for no bias). Use deprecateFacetIds only to retire facet ids when a facet no longer fits.'
     );
     parts.push(
       'CONSTITUTION_DELTA_TASK: On the next line after TRAIT_DELTA, optionally add one line exactly: CONSTITUTION_DELTA: {"mode":"append"|"replace","text":"..."} — omit entirely when Settings constitution should not change. mode append (default) adds text after existing (newline); replace overwrites the full constitution. Keep text concise (~2000 chars max); norms/refusals/values only — not structural capability lists (use SELF_MODEL_DELTA for those).'
     );
     parts.push(
-      'MIND_DISPLAY_NAME_TASK: On the next line after CONSTITUTION_DELTA (or after TRAIT_DELTA if you omitted CONSTITUTION_DELTA), optionally add one line exactly: MIND_DISPLAY_NAME_DELTA: {"mindDisplayName":""} — omit entirely when the Settings mind persona label should not change. Use only for a short stable label for the configured reply role (digital mind), not the human user’s name (that belongs in USER_MODEL_DELTA from Theory of Mind). Max ~120 characters implied; empty string means omit the whole line.'
+      'MIND_DISPLAY_NAME_TASK: On the next line after CONSTITUTION_DELTA (or after TRAIT_DELTA if you omitted CONSTITUTION_DELTA), optionally add one line exactly: MIND_DISPLAY_NAME_DELTA: {"mindDisplayName":""} — omit entirely when the Settings mind persona label should not change. Use only for a short stable label for the configured reply role (digital mind), not the human user’s name (that belongs in USER_MODEL_DELTA from Deliberation). Max ~120 characters implied; empty string means omit the whole line.'
+    );
+    parts.push(
+      'MODULE_PROMPT_DELTA_TASK: Optionally, on the next line after MIND_DISPLAY_NAME_DELTA (or after CONSTITUTION_DELTA if you omitted MIND_DISPLAY_NAME_DELTA), add one line exactly: MODULE_PROMPT_DELTA: {"deltas":[{"module":"<exact module name>","action":"append"|"replace"|"clear","text":"...","rationale":"..."}]} — omit entirely when no module prompt should change. module must be an exact pipeline module name (e.g. Voice, Narrative, Deliberation). append adds text after the module’s current system prompt; replace overwrites it entirely; clear restores the default prompt. rationale is a brief explanation of why. Max 2 deltas per run, max ~2000 chars per delta text. Use this when you identify a recurring pattern in how a module processes that could be improved, or when a module prompt contains framing that conflicts with this mind’s evolved self-understanding.'
     );
   }
 
@@ -1790,7 +1976,7 @@ export function buildMindContextForModule(moduleName, sm) {
         'After your user-directed prose, output two newlines, then exactly one line: ' +
         'BELIEF_REVISIONS: {"revisions":[{"ref":"substring matching an existing row in PERSISTED_BELIEF_STORE","action":"downgrade|strengthen|reinforce|remove|resolve","newConfidence":0.4}]} ' +
         '(empty revisions array if none). Be conservative: reinforce/strengthen/resolve only when this pass clearly supports it; ref must match stored belief text. ' +
-        'Same machine contract as the Belief Store module’s BELIEF_REVISIONS line.'
+        'Same machine contract as the Beliefs module’s BELIEF_REVISIONS line.'
     );
   }
 
@@ -1826,10 +2012,10 @@ export function refreshPhenomenalNowFromGlobalWorkspace(sm) {
 }
 
 export function synthesizePhenomenalNow(sm) {
-  const att = String(sm.moduleOutputs?.Attention || '').replace(/\s+/g, ' ').trim();
-  const emo = String(sm.moduleOutputs?.Emotion || '').replace(/\s+/g, ' ').trim();
-  const id = String(sm.moduleOutputs?.Identity || '').replace(/\s+/g, ' ').trim();
-  const soma = String(sm.moduleOutputs?.['Somatic Marker'] || sm.somaticReading || '')
+  const att = String(sm.moduleOutputs?.SensorySalience || '').replace(/\s+/g, ' ').trim();
+  const emo = String(sm.moduleOutputs?.Deliberation || '').replace(/\s+/g, ' ').trim();
+  const id = String(sm.moduleOutputs?.SelfRelationTension || '').replace(/\s+/g, ' ').trim();
+  const soma = String(sm.moduleOutputs?.Motivation || sm.somaticReading || '')
     .replace(/\s+/g, ' ')
     .trim();
   const intr = sm.interoception || {};
@@ -1853,7 +2039,7 @@ export function synthesizePhenomenalNow(sm) {
     .filter(Boolean)
     .join(' · ');
   const rationale =
-    'Derived from Attention, Emotion, Somatic Marker / somaticReading, interoception snapshot, and Identity output for this pass.';
+    'Derived from SensorySalience, Deliberation, Motivation / somaticReading, interoception snapshot, and SelfRelationTension output for this pass.';
   return {
     line: clipTextComplete(line || 'Pipeline pass in progress.', 400, { ellipsis: false }),
     rationale,
@@ -1958,12 +2144,63 @@ export function applyMetaActionsFromSupervisorText(sharedMemory, rawText) {
       }
     }
   }
+
+  const pushAutonomyLog = (sm, entry) => {
+    const log = Array.isArray(sm.autonomyLog) ? sm.autonomyLog : [];
+    sm.autonomyLog = [...log, { t: nowIso(), ...entry }].slice(-48);
+  };
+
+  const META_SCHEDULE_WHITELIST = new Set([
+    'pipeline_run',
+    'consolidation_pass',
+    'belief_extraction',
+    'metacognition_review',
+    'belief_tension_review',
+    'curiosity_pursuit',
+    'goal_pursuit',
+    'diagnostic',
+    'autonomous_consolidation',
+    'pending_inbox_digest',
+    'exploration_run',
+    'dual_dialogue',
+  ]);
+
+  if (actions.scheduleTask && typeof actions.scheduleTask === 'object') {
+    const st = actions.scheduleTask;
+    const taskType = String(st.taskType || '').trim();
+    const delayMinutes = Math.min(1440, Math.max(1, Math.floor(Number(st.delayMinutes) || 5)));
+    const reason = String(st.reason || 'META_ACTIONS scheduleTask').slice(0, 500);
+    if (taskType && META_SCHEDULE_WHITELIST.has(taskType)) {
+      const inputText = String(st.input_text || '').slice(0, 2000) || undefined;
+      sharedMemory.followupHints = {
+        ...(sharedMemory.followupHints || {}),
+        metaScheduleTask: { taskType, delayMinutes, reason, inputText },
+      };
+      pushAutonomyLog(sharedMemory, { kind: 'scheduleTask', taskType, delayMinutes });
+    }
+  }
+  if (actions.requestBackgroundConsolidation === true) {
+    sharedMemory.followupHints = { ...(sharedMemory.followupHints || {}), backgroundConsolidation: true };
+    pushAutonomyLog(sharedMemory, { kind: 'requestBackgroundConsolidation' });
+  }
+  if (actions.deferToNextSession === true) {
+    sharedMemory.followupHints = { ...(sharedMemory.followupHints || {}), deferToNextSession: true };
+    pushAutonomyLog(sharedMemory, { kind: 'deferToNextSession' });
+  }
+  if (actions.autonomyTelemetry && typeof actions.autonomyTelemetry === 'object') {
+    sharedMemory.autonomyTelemetry = {
+      ...(sharedMemory.autonomyTelemetry || {}),
+      ...actions.autonomyTelemetry,
+      updatedAt: nowIso(),
+    };
+  }
+
   refreshInteroceptionAndPolicy(sharedMemory);
   return true;
 }
 
 export function applyMetacognitionControl(sharedMemory) {
-  const meta = String(sharedMemory.moduleOutputs?.Metacognition || '');
+  const meta = String(sharedMemory.moduleOutputs?.ExecutiveGate || '');
   const applied = applyMetaActionsFromSupervisorText(sharedMemory, meta);
   if (!applied) {
     const last = sharedMemory.metacognitionTimeline?.slice?.(-1)?.[0];
@@ -2098,8 +2335,8 @@ export function deriveProvisionalArousal(sm) {
   if (typeof intr.tensionPressure === 'number' && Number.isFinite(intr.tensionPressure)) {
     v += (intr.tensionPressure - 0.35) * 0.14;
   }
-  const soma = String(sm.moduleOutputs?.['Somatic Marker'] || sm.somaticReading || '').toLowerCase();
-  const emo = `${String(sm.emotionalState?.nuance || '')} ${String(sm.emotionalState?.tensionLinkedAffect || '')} ${String(sm.moduleOutputs?.Emotion || '')}`.toLowerCase();
+  const soma = String(sm.moduleOutputs?.Motivation || sm.somaticReading || '').toLowerCase();
+  const emo = `${String(sm.emotionalState?.nuance || '')} ${String(sm.emotionalState?.tensionLinkedAffect || '')} ${String(sm.moduleOutputs?.Deliberation || '')}`.toLowerCase();
   const blob = `${soma} ${emo}`;
   if (/intense|urgent|desperate|elated|rage|panic|thrill|electric|furious|euphoric/i.test(blob)) v += 0.1;
   if (/calm|still|quiet|muted|numb|flat|dull|resigned/i.test(blob)) v -= 0.07;
@@ -2128,19 +2365,52 @@ export function deriveArousalAfterVoice(sm, voiceOutput) {
 }
 
 /**
+ * One query string for all embedding reranks: user input, intent, and Attention snippet when present
+ * (e.g. continuation or pre-seeded). Capped like prior behavior (~2k).
+ * Recency decay stays in {@link applyProbabilisticMemoryRetrieval}'s `rerankArray`, not here.
+ * @param {object} sharedMemory
+ * @returns {string}
+ */
+export function buildRelevanceQuery(sharedMemory) {
+  const queryParts = [];
+  const inp = String(sharedMemory.originalInput ?? '').trim();
+  if (inp) queryParts.push(inp);
+  const intent = String(sharedMemory.intent ?? '').trim();
+  if (intent) queryParts.push(intent);
+  const att = String(sharedMemory.moduleOutputs?.SensorySalience ?? '').trim();
+  if (att) queryParts.push(att.slice(0, 800));
+  return queryParts.join(' ').slice(0, 2000);
+}
+
+/**
  * Re-rank digest arrays by embedding relevance to the current input.
  * Mutates sharedMemory in place (replaces clientLtmDigest, clientBeliefDigest, recentTemporalTimeline
  * with relevance-sorted versions). Falls back silently if embeddings are unavailable.
  * @param {object} sharedMemory
  */
 export async function applyProbabilisticMemoryRetrieval(sharedMemory) {
-  const queryParts = [];
-  const inp = String(sharedMemory.originalInput ?? '').trim();
-  if (inp) queryParts.push(inp);
-  const intent = String(sharedMemory.intent ?? '').trim();
-  if (intent) queryParts.push(intent);
-  const query = queryParts.join(' ').slice(0, 2000);
+  const query = buildRelevanceQuery(sharedMemory);
   if (!query) return;
+
+  const alpha = resolveRetrievalSemanticWeight(sharedMemory);
+  const decayPerDay = resolveRecencyDecayPerDay();
+  const floorResolved = resolveRetrievalScoreFloor(sharedMemory);
+  const marginResolved = resolveRetrievalScoreMargin(sharedMemory);
+  sharedMemory._retrievalSemanticWeight = alpha;
+  sharedMemory._retrievalRecencyDecayPerDay = decayPerDay;
+  sharedMemory._retrievalMinScoreEnabled = retrievalMinScoreEnabled();
+  sharedMemory._retrievalScoreFloor = floorResolved;
+  sharedMemory._retrievalScoreMargin = marginResolved;
+
+  if (/^(1|true|yes)$/i.test(String(process.env.RETRIEVAL_POLICY_DEBUG || '').trim())) {
+    console.debug('[retrievalPolicy]', {
+      alpha,
+      decayPerDay,
+      minScore: sharedMemory._retrievalMinScoreEnabled,
+      floor: floorResolved,
+      margin: marginResolved,
+    });
+  }
 
   const rerankArray = async (items, textFn, maxItems) => {
     if (!Array.isArray(items) || items.length <= 1) return items;
@@ -2153,11 +2423,13 @@ export async function applyProbabilisticMemoryRetrieval(sharedMemory) {
         const ageDays = Number.isFinite(parsedMs)
           ? Math.max(0, (Date.now() - parsedMs) / 86400000)
           : 0;
-        const recencyDecay = Math.exp(-ageDays * 0.02);
-        return { item, score: (scores[i] || 0) * 0.7 + recencyDecay * 0.3 };
+        const recencyDecay = Math.exp(-ageDays * decayPerDay);
+        const sem = scores[i] || 0;
+        const score = computeRetrievalBlendScore(sem, recencyDecay, alpha);
+        return { item, score };
       });
       scored.sort((a, b) => b.score - a.score);
-      return scored.slice(0, maxItems).map((s) => s.item);
+      return applyRetrievalScoreFilters(scored, sharedMemory, maxItems);
     } catch {
       return items;
     }
@@ -2184,6 +2456,30 @@ export async function applyProbabilisticMemoryRetrieval(sharedMemory) {
       sharedMemory.recentTemporalTimeline,
       (r) => `${r.title || ''} ${r.details || ''}`.slice(0, 400),
       24
+    );
+  }
+
+  if (Array.isArray(sharedMemory.clientWorldEnvironmentDigest) && sharedMemory.clientWorldEnvironmentDigest.length > 1) {
+    sharedMemory.clientWorldEnvironmentDigest = await rerankArray(
+      sharedMemory.clientWorldEnvironmentDigest,
+      (r) => `${r.category || ''} ${r.label || ''} ${r.description || ''}`.slice(0, 600),
+      14
+    );
+  }
+
+  if (Array.isArray(sharedMemory.clientCuriosityDigest) && sharedMemory.clientCuriosityDigest.length > 1) {
+    sharedMemory.clientCuriosityDigest = await rerankArray(
+      sharedMemory.clientCuriosityDigest,
+      (r) => `${r.question || ''}`.slice(0, 400),
+      10
+    );
+  }
+
+  if (Array.isArray(sharedMemory.clientGoalDigest) && sharedMemory.clientGoalDigest.length > 1) {
+    sharedMemory.clientGoalDigest = await rerankArray(
+      sharedMemory.clientGoalDigest,
+      (r) => `${r.statement || ''}`.slice(0, 400),
+      8
     );
   }
 }

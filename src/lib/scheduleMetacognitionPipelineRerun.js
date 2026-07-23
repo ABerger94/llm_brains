@@ -27,6 +27,8 @@ export function sanitizeMetacognitionPipelineOptionsSnapshot(snapshot) {
  * @param {number} [p.mindArousal]
  * @param {{ parentCuriosityId: string, rootCuriosityId: string } | null} [p.curiosityPursuitContext]
  * @param {{ parentGoalId: string, rootGoalId: string } | null} [p.goalPursuitContext]
+ * @param {string} [p.mindStorageProfile] - `primary` or `playgroundMirror`; persisted on the task so scheduled reruns use the correct mind store
+ * @param {string} [p.graphSessionId] - graph workspace session id so the scheduled leg updates the same minimap / KV as the interactive run
  */
 export async function enqueueMetacognitionPipelineRerunSchedule({
   delayMinutes,
@@ -39,9 +41,13 @@ export async function enqueueMetacognitionPipelineRerunSchedule({
   mindArousal,
   curiosityPursuitContext = null,
   goalPursuitContext = null,
+  mindStorageProfile,
+  graphSessionId,
 }) {
   const cctx = curiosityPursuitContext && typeof curiosityPursuitContext === 'object' ? curiosityPursuitContext : null;
   const gctx = goalPursuitContext && typeof goalPursuitContext === 'object' ? goalPursuitContext : null;
+  const graphSid =
+    graphSessionId != null && String(graphSessionId).trim() ? String(graphSessionId).trim() : undefined;
 
   await scheduleTask('supervisor_pipeline_rerun', delayMinutes, {
     scheduled_by: 'pipeline',
@@ -49,6 +55,7 @@ export async function enqueueMetacognitionPipelineRerunSchedule({
     input_text: inputText,
     mind_phase: mindPhase,
     mind_arousal: mindArousal,
+    mind_storage_profile: mindStorageProfile || undefined,
     target_curiosity_id: cctx?.parentCuriosityId || undefined,
     target_goal_id: gctx?.parentGoalId || undefined,
     metacognition_rerun_attachment_ids: attachmentIds,
@@ -56,6 +63,7 @@ export async function enqueueMetacognitionPipelineRerunSchedule({
     metacognition_rerun_pipeline_options: sanitizeMetacognitionPipelineOptionsSnapshot(pipelineOptionsSnapshot),
     metacognition_rerun_curiosity_pursuit_context: cctx || undefined,
     metacognition_rerun_goal_pursuit_context: gctx || undefined,
+    metacognition_rerun_graph_session_id: graphSid,
   });
   notifyMindStorageChanged({ source: 'scheduled-tasks' });
 }

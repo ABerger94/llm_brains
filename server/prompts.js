@@ -1,6 +1,6 @@
-import { MODULES, PIPELINE_LAYERS } from '../shared/pipelineModules.mjs';
+import { MODULES, PIPELINE_LAYERS, PIPELINE_SCHEMA_VERSION } from '../shared/pipelineModules.mjs';
 
-export { MODULES };
+export { MODULES, PIPELINE_SCHEMA_VERSION };
 
 /** Module names per stage, in strict server execution order (derived from MODULES). */
 export const LAYERS = PIPELINE_LAYERS;

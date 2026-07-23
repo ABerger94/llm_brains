@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 import { FlaskConical, GitBranch } from 'lucide-react';
 import { cn } from '../lib/utils';
+import PageDescriptionCollapsible from '../components/PageDescriptionCollapsible';
 
 const linkBtn =
   'inline-flex w-full items-center gap-3 rounded-md px-4 py-4 text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2';
@@ -11,17 +12,17 @@ const linkBtn =
  */
 export default function MultiMindRedirectPage() {
   return (
-    <div className="min-h-screen p-4 sm:p-6">
+    <div className="flex w-full min-h-0 flex-1 flex-col bg-background p-4 sm:p-6">
       <div className="mx-auto max-w-lg">
         <h1 className="text-2xl font-bold text-foreground">Multi-Mind is retired</h1>
-        <p className="mt-3 text-sm text-muted-foreground">
+        <PageDescriptionCollapsible className="mt-3" maxWidthClass="max-w-none">
           This app no longer runs the separate advocate / skeptic / synthesizer flow. Use Graph Pipeline for full pipeline
-          runs, or Playground for ad-hoc modules. For a complete list of URLs (including this legacy path), open{' '}
+          runs, or System Chat for ad-hoc modules. For a complete list of URLs (including this legacy path), open{' '}
           <Link to="/user-manual" className="text-primary underline-offset-2 hover:underline">
             User Manual
           </Link>{' '}
           → Site index.
-        </p>
+        </PageDescriptionCollapsible>
         <div className="mt-8 flex flex-col gap-3">
           <Link
             to="/graph-pipeline"
@@ -44,9 +45,9 @@ export default function MultiMindRedirectPage() {
           >
             <FlaskConical className="h-5 w-5 shrink-0 text-primary" />
             <span className="text-left">
-              <span className="block font-semibold">Playground</span>
+              <span className="block font-semibold">System Chat</span>
               <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
-                Ad-hoc sequential modules on one prompt
+                Dual sequential graph pipelines (primary + mirror mind), not the old single-prompt module loop
               </span>
             </span>
           </Link>

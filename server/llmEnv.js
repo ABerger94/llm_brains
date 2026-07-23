@@ -1,5 +1,10 @@
 /**
  * Shared env helpers for local LM Studio / Ollama (read in pipeline + HTTP server).
+ *
+ * Long unattended runs: each pipeline module is one (or more) LLM HTTP calls bounded by {@link resolveDefaultLlmTimeoutMs}.
+ * If calls hit the cap, the stream fails with `Timeout after ${cap}ms` — raise `LOCAL_LLM_TIMEOUT_MS` (max 2h) and/or enable
+ * soft timeout via `LOCAL_LLM_SOFT_TIMEOUT_MS` / buffer so the pipeline records partial output and continues. The browser
+ * scheduler’s “stale running” threshold (Settings) should exceed worst-case (modules × timeout) for a single scheduled task.
  */
 
 function requiredEnv(name) {

@@ -1,5 +1,5 @@
 import { clipTextComplete } from '../../shared/textClip.mjs';
-import { initialGoalPipelineUi } from './goalPipelineSseUi';
+import { freshPursuitPipelineUiForNewGraphRun, initialGoalPipelineUi } from './goalPipelineSseUi';
 import { getKvSync, removeKvSync, setKvSync } from './browserStorage';
 
 const STORAGE_KEY = 'mybrain_goal_page_pursuits_v1';
@@ -13,6 +13,7 @@ const listeners = new Set();
  *   goalStatement?: string,
  *   interruptedByReload?: boolean,
  *   cooperativePaused?: boolean,
+ *   mindStorageProfile?: string,
  * }} GoalPursuitEntry
  */
 
@@ -24,6 +25,7 @@ function emptyEntry() {
     goalStatement: undefined,
     interruptedByReload: false,
     cooperativePaused: false,
+    mindStorageProfile: undefined,
   };
 }
 
@@ -70,6 +72,7 @@ function normalizeLoadedEntry(e) {
     goalStatement: typeof e.goalStatement === 'string' ? e.goalStatement : undefined,
     interruptedByReload: Boolean(e.interruptedByReload),
     cooperativePaused: coopPause,
+    mindStorageProfile: typeof e.mindStorageProfile === 'string' ? e.mindStorageProfile : undefined,
   };
 
   if (running) {
@@ -84,6 +87,10 @@ function normalizeLoadedEntry(e) {
       out.cooperativePaused = false;
       if (!out.pursuitProgress) out.pursuitProgress = 'Interrupted by page reload';
     }
+  }
+
+  if (!out.cooperativePaused && !out.interruptedByReload) {
+    out.goalPipelineUi = freshPursuitPipelineUiForNewGraphRun(out.goalPipelineUi);
   }
   return out;
 }
@@ -122,6 +129,7 @@ function persistGoalPursuitsNow() {
         cooperativePaused: Boolean(e.cooperativePaused),
         pursuitProgress: e.pursuitProgress,
         goalStatement: e.goalStatement,
+        mindStorageProfile: e.mindStorageProfile || undefined,
         goalPipelineUi: {
           executionLog: Array.isArray(ui.executionLog) ? ui.executionLog.slice(-40) : [],
           moduleStatuses: ui.moduleStatuses || {},
@@ -210,7 +218,9 @@ export function reloadGoalPursuitsFromPersistedDisk() {
       !String(e.goalPipelineUi?.finalOutput || '').trim()
     )
       continue;
-    next[id] = e;
+    const normalized = normalizeLoadedEntry(e);
+    if (!normalized) continue;
+    next[id] = normalized;
     n += 1;
   }
   snapshot = { pursuits: next };
@@ -229,6 +239,24 @@ export function replaceGoalPursuitsSnapshotFromImportedKv() {
 }
 
 /**
+ * See {@link sanitizeCuriosityPursuitsReloadFlagsAfterMindImport} — same for goals.
+ */
+export function sanitizeGoalPursuitsReloadFlagsAfterMindImport() {
+  const next = { ...snapshot.pursuits };
+  let changed = false;
+  for (const [id, e] of Object.entries(next)) {
+    if (e?.interruptedByReload && !e?.cooperativePaused) {
+      next[id] = { ...e, interruptedByReload: false };
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  snapshot = { pursuits: next };
+  emit();
+  flushGoalPursuitsPersistNow();
+}
+
+/**
  * Merge fields into one pursuit slot (creates slot if missing).
  * @param {string} goalId
  * @param {Partial<GoalPursuitEntry>} patch
@@ -237,7 +265,13 @@ export function upsertGoalPursuit(goalId, patch) {
   const id = String(goalId || '');
   if (!id) return;
   const prev = snapshot.pursuits[id] || emptyEntry();
-  const nextEntry = { ...prev, ...patch };
+  let nextEntry = { ...prev, ...patch };
+  if (nextEntry.running === false && !nextEntry.cooperativePaused && !nextEntry.interruptedByReload) {
+    nextEntry = {
+      ...nextEntry,
+      goalPipelineUi: freshPursuitPipelineUiForNewGraphRun(nextEntry.goalPipelineUi),
+    };
+  }
   snapshot = {
     ...snapshot,
     pursuits: { ...snapshot.pursuits, [id]: nextEntry },
@@ -252,11 +286,18 @@ export function upsertGoalPursuit(goalId, patch) {
 export function patchGoalPagePursuitEntry(goalId, patch) {
   const id = String(goalId || '');
   if (!id || !snapshot.pursuits[id]) return;
+  let merged = { ...snapshot.pursuits[id], ...patch };
+  if (merged.running === false && !merged.cooperativePaused && !merged.interruptedByReload) {
+    merged = {
+      ...merged,
+      goalPipelineUi: freshPursuitPipelineUiForNewGraphRun(merged.goalPipelineUi),
+    };
+  }
   snapshot = {
     ...snapshot,
     pursuits: {
       ...snapshot.pursuits,
-      [id]: { ...snapshot.pursuits[id], ...patch },
+      [id]: merged,
     },
   };
   emit();
@@ -279,6 +320,31 @@ export function updateGoalPagePursuitPipelineUiForId(goalId, updater) {
       [id]: { ...entry, goalPipelineUi: next },
     },
   };
+  emit();
+}
+
+/**
+ * Append one execution log line to every running pursuit in a single emit (see curiosity batch helper).
+ * @param {{ time: number, msg: string }} line
+ */
+export function appendGoalPursuitExecutionLogLineAllRunning(line) {
+  const pursuits = snapshot.pursuits;
+  const next = { ...pursuits };
+  let changed = false;
+  for (const [id, e] of Object.entries(pursuits)) {
+    if (!e?.running) continue;
+    const prev = e.goalPipelineUi || initialGoalPipelineUi();
+    next[id] = {
+      ...e,
+      goalPipelineUi: {
+        ...prev,
+        executionLog: [...(prev.executionLog || []), line].slice(-40),
+      },
+    };
+    changed = true;
+  }
+  if (!changed) return;
+  snapshot = { pursuits: next };
   emit();
 }
 

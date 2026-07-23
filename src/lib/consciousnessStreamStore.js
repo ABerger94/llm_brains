@@ -4,8 +4,24 @@ import { streamTimeLabel } from './conversationStreamEntries';
 import { graphPipelineStore } from './graphPipelineStore';
 import { getKvSync, removeKvSync, setKvSync } from './browserStorage';
 import { consciousnessStreamDraftKey, consciousnessStreamUiKey } from './graphPipelineSessionScope';
+import { clearInterruptedRunGraphSessionId } from './graphInterruptedResumeSession';
 
 const listeners = new Set();
+
+/** In-memory transcript during SSE — was unbounded and could OOM WebKit on long runs. Aligns with draft persist (~280). */
+const MAX_LIVE_STREAM_ENTRIES = 320;
+
+function clipStreamEntryRow(row) {
+  if (!row || typeof row !== 'object') return row;
+  const out = { ...row };
+  if (typeof out.content === 'string') {
+    out.content = clipTextComplete(out.content, 12_000, { ellipsis: false });
+  }
+  if (typeof out.detail === 'string') {
+    out.detail = clipTextComplete(out.detail, 8000, { ellipsis: false });
+  }
+  return out;
+}
 
 export function subscribeConsciousnessStream(listener) {
   listeners.add(listener);
@@ -129,11 +145,13 @@ let state = {
 
 /**
  * Call after loading messages from DB. Merges interrupted draft tail.
- * Pass `{ force: true }` to replace state while a run is in flight (e.g. explicit reload).
+ * `force` is ignored for API compatibility — hydration never runs while `isProcessing` (avoids clobbering a live SSE run).
  * Optional `conversationRows`: role/content/shared_memory message rows — last assistant `arousal` updates the live bar.
  */
-export function hydrateConsciousnessStreamFromDb(dbEntries, { force = false, conversationRows = null } = {}) {
-  if (!force && state.isProcessing) {
+export function hydrateConsciousnessStreamFromDb(dbEntries, { force: _force = false, conversationRows = null } = {}) {
+  void _force; // kept for call-site compatibility; hydration never runs during `isProcessing` (see guard below).
+  /** Never replace stream state mid-run — `force` used to mean "replace draft"; it must not clear `isProcessing`. */
+  if (state.isProcessing) {
     return;
   }
   const draft = readDraft();
@@ -146,6 +164,9 @@ export function hydrateConsciousnessStreamFromDb(dbEntries, { force = false, con
         ids.add(e.id);
       }
     }
+  }
+  if (merged.length > MAX_LIVE_STREAM_ENTRIES) {
+    merged = merged.slice(-MAX_LIVE_STREAM_ENTRIES);
   }
   let arousalFromSession = null;
   if (Array.isArray(conversationRows) && conversationRows.length) {
@@ -179,6 +200,9 @@ export const consciousnessStreamStore = {
   },
   setState(partial) {
     state = { ...state, ...partial };
+    if (Array.isArray(state.entries) && state.entries.length > MAX_LIVE_STREAM_ENTRIES) {
+      state = { ...state, entries: state.entries.slice(-MAX_LIVE_STREAM_ENTRIES) };
+    }
     emit();
     persistUiPrefs(state);
     if (state.isProcessing) {
@@ -187,6 +211,9 @@ export const consciousnessStreamStore = {
   },
   patch(partial) {
     state = { ...state, ...partial };
+    if (Array.isArray(state.entries) && state.entries.length > MAX_LIVE_STREAM_ENTRIES) {
+      state = { ...state, entries: state.entries.slice(-MAX_LIVE_STREAM_ENTRIES) };
+    }
     emit();
     persistUiPrefs(state);
     if (state.isProcessing) {
@@ -197,7 +224,7 @@ export const consciousnessStreamStore = {
     const { bypassPause, ...restExtra } = extra;
     if (state.paused && !bypassPause) return;
     const mod = moduleId ? COGNITIVE_MODULES.find((m) => m.id === moduleId) : null;
-    const row = {
+    const row = clipStreamEntryRow({
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
       type,
       content,
@@ -207,8 +234,8 @@ export const consciousnessStreamStore = {
       moduleGlyph: mod?.name ? mod.name.charAt(0) : '·',
       time: streamTimeLabel(),
       ...restExtra,
-    };
-    state = { ...state, entries: [...state.entries, row] };
+    });
+    state = { ...state, entries: [...state.entries, row].slice(-MAX_LIVE_STREAM_ENTRIES) };
     emit();
     if (state.isProcessing) {
       scheduleDraftPersist(state.entries, true);
@@ -221,6 +248,7 @@ export const consciousnessStreamStore = {
     }
   },
   dismissInterrupted() {
+    clearInterruptedRunGraphSessionId();
     state = { ...state, runInterrupted: false };
     emit();
     graphPipelineStore.dismissRunInterrupted();
