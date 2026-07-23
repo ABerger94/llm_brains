@@ -83,6 +83,53 @@ function dynamicApiProxyPlugin(env) {
 const DEV_PORT = Number(process.env.VITE_DEV_PORT) || 5174;
 const PREVIEW_PORT = Number(process.env.VITE_PREVIEW_PORT) || 3001;
 
+/**
+ * The main server-driven pipeline (server/pipeline.js + server/mindPolicy.js and their
+ * pure-JS dependency chain) can also run directly in the browser — via a Settings toggle
+ * locally, or forced on the backend-free Vercel build (VITE_BROWSER_ONLY=1) — see
+ * src/lib/localPipeline/. Reached only through a dynamic import() from
+ * consciousnessStreamRunner.js, but Rollup still needs to resolve that chunk's module
+ * graph in *every* build (whether or not a given build ever actually calls it), so these
+ * aliases are registered unconditionally rather than gated on VITE_BROWSER_ONLY — they
+ * only affect what the browser bundle resolves to; server/index.js (run directly by
+ * Node/nodemon, never by Vite) is completely unaffected and keeps using the real files.
+ *
+ * `node:crypto` is aliased since pipeline.js's only use (`randomUUID()`) has a native
+ * Web Crypto equivalent. `process.env.*` reads (env-driven feature flags/tuning, all with
+ * `|| default` fallbacks) are handled at runtime instead, via a `globalThis.process`
+ * polyfill in localPipeline/processPolyfill.js — not here, to avoid clobbering Vite's own
+ * `process.env.NODE_ENV` replacement. The four remaining aliases replace dependencies that
+ * need a *secret* (HF embeddings, Brave search, calibration/threshold file persistence)
+ * with explicit browser-safe no-ops — see src/lib/localPipeline/shims/ — since shipping
+ * those secrets in a public bundle isn't an option (see the merge plan's scope notes).
+ * This keeps server/pipeline.js and server/mindPolicy.js the single source of truth for
+ * both execution paths — no separate copy to drift out of sync.
+ */
+/** Rollup's resolved module ids use forward slashes even on Windows; path.join() here would use backslashes and silently never match. */
+function posixPath(...segments) {
+  return path.join(...segments).split(path.sep).join('/');
+}
+
+/**
+ * Alias `find` is matched against the raw specifier text as written in the
+ * importing file — NOT the resolved absolute path — so these must be the
+ * literal relative specifiers (`./thresholdStore.js` etc.) that
+ * server/pipeline.js and server/mindPolicy.js actually use, not absolute
+ * paths (which never match). Safe as a plain, non-scoped string match: only
+ * files under server/ import these four relative specifiers anywhere in the
+ * app (verified — no collisions under src/).
+ */
+function localPipelineAliases() {
+  const shimDir = (name) => posixPath(repoRoot, 'src/lib/localPipeline/shims', name);
+  return [
+    { find: 'node:crypto', replacement: shimDir('nodeCrypto.browser.js') },
+    { find: './embeddingService.js', replacement: shimDir('embeddingService.browser.js') },
+    { find: './webEnrichment.js', replacement: shimDir('webEnrichment.browser.js') },
+    { find: './thresholdStore.js', replacement: shimDir('thresholdStore.browser.js') },
+    { find: './calibration.js', replacement: shimDir('calibration.browser.js') },
+  ];
+}
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const lanHost = String(env.DEV_LAN_HOST || '').trim();
@@ -116,6 +163,9 @@ export default defineConfig(({ mode }) => {
      * Workbox precache / navigateFallback has caused blank standalone PWAs with large SPA bundles on iOS WebKit.
      */
     plugins: [react(), dynamicApiProxyPlugin(env)],
+    resolve: {
+      alias: localPipelineAliases(),
+    },
     server: {
       port: DEV_PORT,
       strictPort: viteStrictPort,

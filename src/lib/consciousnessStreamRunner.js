@@ -6,6 +6,7 @@ import {
   setActiveMindEntityProfile,
 } from './mindEntityContext';
 import { consumePipelineSseWithMetacognitionContinuations, appendRateLimitRecoveryHint } from './pipelineSse';
+import { getPipelineExecutionBackend, EXECUTION_BACKEND_BROWSER } from './localPipeline/executionBackend';
 import { stringifyUnknownError } from './pipelineRunErrorFormat';
 import {
   effectiveMaxMetacognitionReruns,
@@ -630,7 +631,17 @@ export async function startConsciousnessStreamRun(opts = {}) {
     let sawWouldRerunEvent = false;
     let sawSupervisorCapExceeded = false;
 
-    streamResult = await consumePipelineSseWithMetacognitionContinuations({
+    /**
+     * Dynamic import: localPipelineRunner.js pulls in server/pipeline.js, which should
+     * stay out of the eagerly-loaded main bundle for the (default) server-backed path —
+     * only fetched as its own chunk when browser execution is actually selected.
+     */
+    const runPipelineLeg =
+      getPipelineExecutionBackend() === EXECUTION_BACKEND_BROWSER
+        ? (await import('./localPipeline/localPipelineRunner')).runLocalPipelineWithMetacognitionContinuations
+        : consumePipelineSseWithMetacognitionContinuations;
+
+    streamResult = await runPipelineLeg({
       fetchImpl: fetchWithNetworkMessage,
       abortSignal: streamAbortController?.signal,
       initialSlimSharedMemory: slimSharedMemoryForPipelinePost(continueMemory, {

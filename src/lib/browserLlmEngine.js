@@ -64,6 +64,21 @@ export function unloadEngine() {
   loadedModelId = null;
 }
 
+/** Id of the model currently loaded/loading, or null if none has been requested yet. */
+export function getLoadedModelId() {
+  return loadedModelId;
+}
+
+/**
+ * Resolves to the currently loading/loaded engine, or null if `loadEngine()`
+ * has never been called. Awaiting this while a model is still downloading
+ * simply waits for that load to finish — callers (e.g. the local pipeline's
+ * callLLM adapter) don't need to track engine-ready state themselves.
+ */
+export function getLoadedEngine() {
+  return enginePromise;
+}
+
 /**
  * Runs one chained prompt stage against an already-loaded engine, streaming tokens.
  * @param {import('@mlc-ai/web-llm').MLCEngineInterface} engine

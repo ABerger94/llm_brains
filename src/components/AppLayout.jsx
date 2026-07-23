@@ -38,6 +38,14 @@ class OutletErrorBoundary extends Component {
   }
 }
 
+/**
+ * The backend-free Vercel build (see vite.config.js / vercel.json) has no Express
+ * server, so nothing below that talks to /api/* (scheduler polling, reconnect
+ * probes, mind-snapshot sync, cross-tab pause broadcast) can do anything useful
+ * there — skip mounting them entirely rather than let them fail/retry forever.
+ */
+const BROWSER_ONLY = import.meta.env.VITE_BROWSER_ONLY === '1';
+
 export default function AppLayout() {
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -45,22 +53,26 @@ export default function AppLayout() {
   const prevPathnameRef = useRef(location.pathname);
 
   useEffect(() => {
+    if (BROWSER_ONLY) return;
     startScheduledTaskRunner();
     startReconnectRecoveryLoop();
   }, []);
 
   /** Auto-push mind snapshot every 10m when Dashboard sync token is set (tab must stay open). */
   useEffect(() => {
+    if (BROWSER_ONLY) return undefined;
     return startMindSnapshotAutoPush();
   }, []);
 
   /** Poll server snapshot; auto-pull + reload when another device pushed a newer blob. */
   useEffect(() => {
+    if (BROWSER_ONLY) return undefined;
     return startMindSnapshotRemotePoll();
   }, []);
 
   /** Cross-tab “Pause & save all”: other windows POST pause tokens when they receive the broadcast. */
   useEffect(() => {
+    if (BROWSER_ONLY) return undefined;
     const uninstall = installCooperativePauseBroadcastListener();
     return uninstall;
   }, []);

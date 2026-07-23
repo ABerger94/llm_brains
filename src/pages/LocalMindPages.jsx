@@ -30,6 +30,7 @@ import {
   Fingerprint,
   Gauge,
   Globe,
+  Laptop,
   Layers,
   Loader2,
   Moon,
@@ -51,6 +52,15 @@ import {
 import CognitiveHealthSnapshotPanels from '../components/cognitiveHealth/CognitiveHealthSnapshotPanels';
 import PageShell from '../components/PageShell';
 import { Button, Input, Textarea, toast } from '../components/ui';
+import ModelPicker from '../components/browserMind/ModelPicker';
+import LoadProgress from '../components/browserMind/LoadProgress';
+import { AVAILABLE_MODELS, isWebGPUAvailable, loadEngine, getLoadedModelId } from '../lib/browserLlmEngine';
+import {
+  getPipelineExecutionBackend,
+  setPipelineExecutionBackend,
+  EXECUTION_BACKEND_BROWSER,
+  EXECUTION_BACKEND_SERVER,
+} from '../lib/localPipeline/executionBackend';
 import { computeCognitiveHealthDerived } from '../lib/cognitiveHealthDerived';
 import { curiosityUiStatus } from '../lib/curiosityQueueMetrics';
 import { emergenceReviewState } from '../lib/emergenceReviewState';
@@ -5176,6 +5186,114 @@ function pickMindConstitutionPanelFromRuntime(rs, isMirror) {
   };
 }
 
+/**
+ * Which engine runs the graph pipeline: the Express backend, or a model loaded
+ * directly into this browser via WebGPU (see src/lib/localPipeline/). Kept as
+ * its own panel rather than folded into the big Runtime Settings form below —
+ * this is an execution-transport switch (localPipeline/executionBackend.js),
+ * not a mind/pipeline behavior setting.
+ */
+function LlmExecutionPanel() {
+  const browserOnlyForced = import.meta.env.VITE_BROWSER_ONLY === '1';
+  const [backend, setBackend] = useState(() => getPipelineExecutionBackend());
+  const [webgpuOk, setWebgpuOk] = useState(null);
+  const [selectedModel, setSelectedModel] = useState(AVAILABLE_MODELS[0].id);
+  const [engineStatus, setEngineStatus] = useState(() => (getLoadedModelId() ? 'ready' : 'idle'));
+  const [loadProgress, setLoadProgress] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    setWebgpuOk(isWebGPUAvailable());
+  }, []);
+
+  function handleSelectBackend(next) {
+    setPipelineExecutionBackend(next);
+    setBackend(next);
+  }
+
+  async function handleLoadModel() {
+    setEngineStatus('loading');
+    setError(null);
+    try {
+      await loadEngine(selectedModel, (report) => setLoadProgress(report));
+      setEngineStatus('ready');
+    } catch (e) {
+      setEngineStatus('error');
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  const showModelPicker = browserOnlyForced || backend === EXECUTION_BACKEND_BROWSER;
+
+  return (
+    <Panel className="space-y-4">
+      <div className="flex items-center gap-2 text-sm font-semibold">
+        <Laptop className="h-4 w-4 text-primary" /> LLM execution
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Run the graph pipeline against your local LM Studio/HF/OpenRouter backend, or entirely
+        in this browser via WebGPU — same pipeline, no server or API keys needed. Note:
+        embedding-ranked retrieval, web search enrichment, attachment OCR, and the background
+        scheduler are unavailable in browser execution (they need a secret key or an always-on
+        process); the pipeline falls back to its recency-based defaults for those.
+      </p>
+      {browserOnlyForced ? (
+        <p className="text-xs text-amber-600 dark:text-amber-300">
+          This deployment has no backend — browser execution is always on.
+        </p>
+      ) : (
+        <div className="flex gap-2">
+          <Button
+            type="button"
+            variant={backend === EXECUTION_BACKEND_SERVER ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => handleSelectBackend(EXECUTION_BACKEND_SERVER)}
+          >
+            Local server
+          </Button>
+          <Button
+            type="button"
+            variant={backend === EXECUTION_BACKEND_BROWSER ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => handleSelectBackend(EXECUTION_BACKEND_BROWSER)}
+          >
+            In-browser (WebGPU)
+          </Button>
+        </div>
+      )}
+      {showModelPicker && (
+        <div className="space-y-3 border-t border-border pt-3">
+          {webgpuOk === false && (
+            <p className="text-xs text-red-600 dark:text-red-300">
+              This browser doesn't expose WebGPU — try Chrome/Edge on desktop or Safari 17+ on
+              iOS/macOS.
+            </p>
+          )}
+          <ModelPicker
+            selectedId={selectedModel}
+            disabled={engineStatus === 'loading'}
+            onSelect={setSelectedModel}
+          />
+          <Button
+            type="button"
+            size="sm"
+            disabled={engineStatus === 'loading' || webgpuOk === false}
+            onClick={handleLoadModel}
+          >
+            {engineStatus === 'ready'
+              ? 'Reload model'
+              : engineStatus === 'loading'
+                ? 'Downloading…'
+                : 'Download & load model'}
+          </Button>
+          <LoadProgress status={engineStatus} progress={loadProgress} />
+          {error && <p className="text-xs text-red-600 dark:text-red-300">{error}</p>}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
 export function SettingsPage() {
   const { isMirror } = useMindScope();
   const [settings, setSettings] = useState(DEFAULT_RUNTIME_SETTINGS);
@@ -5496,6 +5614,7 @@ export function SettingsPage() {
             experience, consciousness, or sentience in the philosophical sense—useful metaphors and structured processing only.
           </p>
         </Panel>
+        <LlmExecutionPanel />
         <Panel className="space-y-4">
           <div className="text-sm font-semibold">Runtime Settings</div>
           <div>
